@@ -1,0 +1,34 @@
+{
+  "name": "star-system-simulation",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Simulation of a star system birth and death from a cloud of star dust",
+  "scripts": {
+    "dev": "vite",
+    "wasm:build": "wasm-pack build wasm --target web",
+    "build": "npm run wasm:build && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "format:check": "prettier --check .",
+    "format": "prettier --write .",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@types/three": "^0.170.0",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "eslint": "^8.57.1",
+    "jsdom": "^25.0.1",
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vite-plugin-top-level-await": "^1.4.4",
+    "vite-plugin-wasm": "^3.3.0",
+    "vitest": "^2.1.8"
+  },
+  "dependencies": {
+    "three": "^0.170.0"
+  }
+}

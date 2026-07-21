@@ -1,0 +1,17 @@
+.zenflow/
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Rust / WASM build artifacts
+wasm/target/
+wasm/pkg/
+
+# Logs
+*.log
+
+# Cache
+.cache/
