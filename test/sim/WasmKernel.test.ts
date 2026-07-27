@@ -6,6 +6,7 @@ import {
   createKernel,
   isWasmSupported,
   loadWasmModule,
+  resolveWasmModuleUrl,
   type WasmKernelHandle,
   type WasmModule,
 } from '../../src/sim/WasmKernel';
@@ -144,6 +145,28 @@ describe('createKernel / feature detection', () => {
     expect(kernel.getParticleBuffer().length).toBeLessThanOrEqual(10 * PARTICLE_STRIDE);
     expect(kernel.getParticleBuffer().length).toBeGreaterThan(0);
     kernel.dispose();
+  });
+});
+
+describe('resolveWasmModuleUrl', () => {
+  it('resolves against the document base so a sub-path deployment works', () => {
+    // GitHub Pages project site: the bundle lives under /<repo>/, so the kernel
+    // must be fetched from /<repo>/wasm/pkg/, not from the domain root.
+    expect(resolveWasmModuleUrl('https://user.github.io/star-system-simulation/')).toBe(
+      'https://user.github.io/star-system-simulation/wasm/pkg/star_kernel.js',
+    );
+  });
+
+  it('resolves against the site root when hosted at the top level', () => {
+    expect(resolveWasmModuleUrl('http://localhost:5173/')).toBe(
+      'http://localhost:5173/wasm/pkg/star_kernel.js',
+    );
+  });
+
+  it('falls back to a source-relative path outside a browser', () => {
+    // No document (Node/Vitest): resolved relative to src/sim/, i.e. the
+    // generated package in the repository.
+    expect(resolveWasmModuleUrl()).toBe(wasmJsUrl.href);
   });
 });
 

@@ -1,5 +1,7 @@
 # Star System Simulation
 
+**▶ Try it live: <https://amoilanen.github.io/star-system-simulation/>**
+
 An interactive, browser-based simulation of the **birth and death of a star system** —
 from a collapsing cloud of star dust, through protostar coalescence and the ignition of
 nuclear fusion, across the main sequence and red-giant phases, to a final remnant
@@ -83,6 +85,7 @@ cargo install wasm-pack
 - **`npm run lint`**: Run ESLint (fails on any warning).
 - **`npm run format:check`** / **`npm run format`**: Check / apply Prettier formatting.
 - **`npm test`**: Run the Vitest unit-test suite once.
+- **`npm run deploy`**: Build and publish the site to GitHub Pages (`./scripts/deploy.py`).
 
 ## Production build & preview
 
@@ -92,6 +95,26 @@ npx vite preview       # serve the ./dist/ bundle locally to smoke-test it
 ```
 
 The contents of `./dist/` are fully static and can be served from any static host.
+
+## Deploying
+
+The site is published to **GitHub Pages** at
+<https://amoilanen.github.io/star-system-simulation/> with a single command:
+
+```bash
+python3 scripts/deploy.py            # build, publish, enable Pages, wait until live
+python3 scripts/deploy.py --dry-run  # show the plan without changing anything
+```
+
+The script (`./scripts/deploy.py`, standard library only) checks prerequisites, runs the
+production build, verifies the bundle is complete (including the WASM kernel), pushes
+`./dist/` to the `gh-pages` branch via a temporary git worktree, enables GitHub Pages
+through the API and polls the public URL until it answers.
+
+Requires the [GitHub CLI](https://cli.github.com/) authenticated with the `repo` scope
+(`gh auth login`). See [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) for all flags,
+deployment to other hosts (Netlify, Vercel, Cloudflare Pages, …), troubleshooting and
+rollback.
 
 ## Project structure
 
@@ -111,6 +134,10 @@ wasm/
   src/                 # Rust physics kernel: nbody, stages, bodies, lib
   pkg/                 # wasm-pack output (generated, git-ignored)
 test/                  # Vitest unit tests, mirroring src/
+scripts/
+  deploy.py            # one-command build & deploy to GitHub Pages
+docs/
+  DEPLOYMENT.md        # deployment guide (hosts, flags, troubleshooting)
 ```
 
 See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for development, debugging, and verification

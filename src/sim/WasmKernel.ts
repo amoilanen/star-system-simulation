@@ -159,6 +159,29 @@ function decodeEventData(
 }
 
 /**
+ * Resolve the URL of the generated `wasm-pack` glue module.
+ *
+ * In a browser the module is a *deployed asset*, not a bundled one, so it is
+ * resolved against the document base URL: `wasm/pkg/star_kernel.js` sits next to
+ * the page both in dev (Vite serves the project root) and in a production build
+ * (the `copy-wasm-package` plugin emits `dist/wasm/pkg/`). Using `document.baseURI`
+ * rather than `import.meta.url` keeps this correct when the site is hosted under
+ * a sub-path such as `https://<user>.github.io/<repo>/`, where resolving relative
+ * to the hashed asset chunk would escape the site root.
+ *
+ * Outside a browser (Node, Vitest) there is no document, so the path is resolved
+ * relative to this source file instead.
+ *
+ * @param baseUrl - Document base URL override; defaults to the real `document.baseURI`.
+ */
+export function resolveWasmModuleUrl(baseUrl?: string): string {
+  const base = baseUrl ?? (typeof document !== 'undefined' ? document.baseURI : undefined);
+  return base !== undefined
+    ? new URL('wasm/pkg/star_kernel.js', base).href
+    : new URL('../../wasm/pkg/star_kernel.js', import.meta.url).href;
+}
+
+/**
  * Dynamically import and initialize the generated `wasm-pack` module. The
  * specifier is computed (not a string literal) so neither `tsc` nor the bundler
  * statically resolves the generated artifact. In the browser call with no
@@ -166,7 +189,7 @@ function decodeEventData(
  * `.wasm` bytes directly.
  */
 export async function loadWasmModule(initInput?: unknown): Promise<WasmModule> {
-  const specifier = new URL('../../wasm/pkg/star_kernel.js', import.meta.url).href;
+  const specifier = resolveWasmModuleUrl();
   const mod = (await import(/* @vite-ignore */ specifier)) as unknown as WasmModule;
   await mod.default(initInput);
   return mod;
