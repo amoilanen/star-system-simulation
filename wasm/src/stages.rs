@@ -45,6 +45,7 @@ pub enum SimEventType {
     RemnantFormed = 6,
     BodyCaptured = 7,
     BodyEjected = 8,
+    BodyConsumed = 9,
 }
 
 /// Outcome of a fate determination (spec §4.2).
@@ -129,31 +130,6 @@ pub fn stage_durations(mass: f64, metals: f64) -> [f64; 7] {
     ]
 }
 
-/// The event emitted when the FSM ENTERS a stage, mirroring `STAGE_ENTRY_EVENT`.
-/// `DustCloud` is the initial stage and has no entry event.
-fn stage_entry_event(stage: LifecycleStage) -> Option<SimEventType> {
-    match stage {
-        LifecycleStage::DustCloud => None,
-        LifecycleStage::ProtostarCoalescence => Some(SimEventType::CollapseOnset),
-        LifecycleStage::FusionIgnition => Some(SimEventType::ProtostarFormed),
-        LifecycleStage::MainSequence => Some(SimEventType::FusionIgnition),
-        LifecycleStage::RedGiant => Some(SimEventType::RedGiantOnset),
-        LifecycleStage::Death => Some(SimEventType::DeathEvent),
-        LifecycleStage::Remnant => Some(SimEventType::RemnantFormed),
-    }
-}
-
-/// Ordered stages the FSM walks through, initial → terminal.
-const STAGE_ORDER: [LifecycleStage; 7] = [
-    LifecycleStage::DustCloud,
-    LifecycleStage::ProtostarCoalescence,
-    LifecycleStage::FusionIgnition,
-    LifecycleStage::MainSequence,
-    LifecycleStage::RedGiant,
-    LifecycleStage::Death,
-    LifecycleStage::Remnant,
-];
-
 /// A packed simulation event ready for the linear-memory events buffer. `data_a`
 /// / `data_b` carry type-specific payload (see the kernel's event packing).
 #[derive(Clone, Copy, Debug)]
@@ -162,94 +138,6 @@ pub struct PackedEvent {
     pub sim_time: f64,
     pub data_a: f64,
     pub data_b: f64,
-}
-
-/// Deterministic lifecycle stage machine (mirror of `StageMachine`). Advanced by
-/// sim-time `dt`; emits exactly one entry event per stage transition into the
-/// provided sink, stamped with the machine's internal sim time.
-pub struct StageMachine {
-    stage_index: usize,
-    elapsed_in_stage: f64,
-    sim_time: f64,
-    durations: [f64; 7],
-    fate: FateOutcome,
-}
-
-impl StageMachine {
-    /// Construct for a run with the given mass + metallicity.
-    #[must_use]
-    pub fn new(mass: f64, metals: f64) -> Self {
-        Self {
-            stage_index: 0,
-            elapsed_in_stage: 0.0,
-            sim_time: 0.0,
-            durations: stage_durations(mass, metals),
-            fate: determine_fate(mass, metals),
-        }
-    }
-
-    /// The stage the star system is currently in.
-    #[must_use]
-    pub fn current_stage(&self) -> LifecycleStage {
-        STAGE_ORDER[self.stage_index]
-    }
-
-    /// Advance the FSM by `sim_dt` sim seconds, pushing one correctly-typed,
-    /// correctly-timed entry event per crossed transition into `out`. Mirrors
-    /// `StageMachine.update`. Non-positive / non-finite `dt` is ignored.
-    pub fn update(&mut self, sim_dt: f64, out: &mut Vec<PackedEvent>) {
-        if !sim_dt.is_finite() || sim_dt <= 0.0 {
-            return;
-        }
-        let mut remaining = sim_dt;
-        while remaining > 0.0 && self.current_stage() != LifecycleStage::Remnant {
-            let stage_duration = self.durations[self.stage_index];
-            let remaining_in_stage = stage_duration - self.elapsed_in_stage;
-            if remaining < remaining_in_stage {
-                self.elapsed_in_stage += remaining;
-                self.sim_time += remaining;
-                remaining = 0.0;
-            } else {
-                self.sim_time += remaining_in_stage;
-                remaining -= remaining_in_stage;
-                self.elapsed_in_stage = 0.0;
-                self.advance_stage(out);
-            }
-        }
-        if remaining > 0.0 {
-            self.sim_time += remaining;
-        }
-    }
-
-    fn advance_stage(&mut self, out: &mut Vec<PackedEvent>) {
-        if self.stage_index + 1 >= STAGE_ORDER.len() {
-            return;
-        }
-        self.stage_index += 1;
-        let stage = self.current_stage();
-        if let Some(kind) = stage_entry_event(stage) {
-            let (data_a, data_b) = self.event_data(kind);
-            out.push(PackedEvent {
-                kind,
-                sim_time: self.sim_time,
-                data_a,
-                data_b,
-            });
-        }
-    }
-
-    /// Structured payload for events carrying the selected death path (mirrors
-    /// `StageMachine.eventData`).
-    fn event_data(&self, kind: SimEventType) -> (f64, f64) {
-        match kind {
-            SimEventType::DeathEvent => (bool_f64(self.fate.supernova), 0.0),
-            SimEventType::RemnantFormed => (
-                self.fate.remnant as u32 as f64,
-                bool_f64(self.fate.supernova),
-            ),
-            _ => (0.0, 0.0),
-        }
-    }
 }
 
 /// Encode a bool as the 0.0/1.0 the buffers use.
@@ -291,68 +179,25 @@ mod tests {
     }
 
     #[test]
-    fn stages_advance_in_order_emitting_one_event_each() {
-        let mut m = StageMachine::new(1.0, 0.02);
-        let mut events = Vec::new();
-        // One huge dt crosses every boundary.
-        m.update(1.0e30, &mut events);
-        assert_eq!(m.current_stage(), LifecycleStage::Remnant);
-        let kinds: Vec<SimEventType> = events.iter().map(|e| e.kind).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                SimEventType::CollapseOnset,
-                SimEventType::ProtostarFormed,
-                SimEventType::FusionIgnition,
-                SimEventType::RedGiantOnset,
-                SimEventType::DeathEvent,
-                SimEventType::RemnantFormed,
-            ]
+    fn stage_durations_scale_with_mass_and_are_ordered() {
+        let solar = stage_durations(1.0, 0.02);
+        let heavy = stage_durations(10.0, 0.02);
+        // Main-sequence lifetime falls steeply with mass (massive stars die young).
+        assert!(
+            heavy[LifecycleStage::MainSequence as usize]
+                < solar[LifecycleStage::MainSequence as usize]
         );
-        // Events are monotonically non-decreasing in sim time.
-        for w in events.windows(2) {
-            assert!(w[1].sim_time >= w[0].sim_time);
-        }
+        // The remnant is terminal (lasts forever).
+        assert!(solar[LifecycleStage::Remnant as usize].is_infinite());
+        // Red giant is a fraction of the main-sequence lifetime.
+        assert!(
+            solar[LifecycleStage::RedGiant as usize] < solar[LifecycleStage::MainSequence as usize]
+        );
     }
 
     #[test]
-    fn high_mass_death_path_is_supernova_and_pulsar() {
-        let mut m = StageMachine::new(20.0, 0.02);
-        let mut events = Vec::new();
-        m.update(1.0e30, &mut events);
-        let remnant = events
-            .iter()
-            .find(|e| e.kind == SimEventType::RemnantFormed)
-            .expect("remnant event");
-        assert_eq!(remnant.data_a as u32, RemnantType::Pulsar as u32);
-        assert_eq!(remnant.data_b, 1.0, "supernova flag set");
-    }
-
-    #[test]
-    fn low_mass_death_path_is_white_dwarf_without_supernova() {
-        let mut m = StageMachine::new(1.0, 0.02);
-        let mut events = Vec::new();
-        m.update(1.0e30, &mut events);
-        let death = events
-            .iter()
-            .find(|e| e.kind == SimEventType::DeathEvent)
-            .expect("death event");
-        assert_eq!(death.data_a, 0.0, "no supernova for low mass");
-        let remnant = events
-            .iter()
-            .find(|e| e.kind == SimEventType::RemnantFormed)
-            .expect("remnant event");
-        assert_eq!(remnant.data_a as u32, RemnantType::WhiteDwarf as u32);
-    }
-
-    #[test]
-    fn paused_dt_emits_nothing_and_holds_stage() {
-        let mut m = StageMachine::new(1.0, 0.02);
-        let mut events = Vec::new();
-        m.update(0.0, &mut events);
-        m.update(-5.0, &mut events);
-        m.update(f64::NAN, &mut events);
-        assert!(events.is_empty());
-        assert_eq!(m.current_stage(), LifecycleStage::DustCloud);
+    fn bool_f64_encodes_flags() {
+        assert_eq!(bool_f64(true), 1.0);
+        assert_eq!(bool_f64(false), 0.0);
     }
 }

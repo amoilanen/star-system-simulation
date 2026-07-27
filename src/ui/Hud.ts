@@ -49,10 +49,20 @@ export interface HudOptions {
   initialPace?: number;
   onPaceChange: (pace: number) => void;
   onTogglePause: () => void;
+  /** Toggle rewind (backwards playback); receives the NEW rewinding state. */
+  onToggleRewind?: (rewinding: boolean) => void;
   onReset: () => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onFocusChange: (value: string) => void;
+  /** Toggle the on-screen body labels; receives the NEW enabled state. */
+  onToggleLabels?: (enabled: boolean) => void;
+  /** Toggle the orbital-path overlay; receives the NEW enabled state. */
+  onToggleOrbits?: (enabled: boolean) => void;
+  /** Initial state of the labels checkbox. Default true. */
+  initialLabels?: boolean;
+  /** Initial state of the orbits checkbox. Default false. */
+  initialOrbits?: boolean;
 }
 
 /** Focus values always present regardless of the current bodies. */
@@ -71,6 +81,10 @@ export class Hud {
   private readonly root: HTMLDivElement;
 
   private readonly pauseButton: HTMLButtonElement;
+  private rewindButton: HTMLButtonElement | null = null;
+  private rewinding = false;
+  private labelsInput: HTMLInputElement | null = null;
+  private orbitsInput: HTMLInputElement | null = null;
   private readonly paceInput: HTMLInputElement;
   private readonly focusSelect: HTMLSelectElement;
   private readonly stageLabel: HTMLElement;
@@ -124,9 +138,34 @@ export class Hud {
 
     // Transport + zoom buttons.
     this.pauseButton = this.button('hud.pause', options.onTogglePause);
+    // Rewind toggle: scrub backwards through recorded history, then resume.
+    const onToggleRewind = options.onToggleRewind;
+    if (onToggleRewind !== undefined) {
+      this.rewindButton = this.button('hud.rewind', () => {
+        this.setRewinding(!this.rewinding);
+        onToggleRewind(this.rewinding);
+      });
+    }
     this.button('hud.reset', options.onReset);
     this.button('hud.zoomIn', options.onZoomIn);
     this.button('hud.zoomOut', options.onZoomOut);
+
+    // Orbit-path overlay toggle (planets, asteroids and comets).
+    const onToggleOrbits = options.onToggleOrbits;
+    if (onToggleOrbits !== undefined) {
+      this.orbitsInput = this.checkbox('hud.orbits', options.initialOrbits ?? false, (on) =>
+        onToggleOrbits(on),
+      );
+    }
+
+    // Labels toggle (bodies are drawn at realistic — small — sizes, so the
+    // labels are the primary way to find and identify them).
+    const onToggleLabels = options.onToggleLabels;
+    if (onToggleLabels !== undefined) {
+      this.labelsInput = this.checkbox('hud.labels', options.initialLabels ?? true, (on) =>
+        onToggleLabels(on),
+      );
+    }
 
     // Focus selector.
     const focusField = this.field('hud.focus');
@@ -147,11 +186,39 @@ export class Hud {
     return this.root;
   }
 
+  /** Whether the "show orbits" checkbox is currently checked. */
+  get orbitsChecked(): boolean {
+    return this.orbitsInput?.checked ?? false;
+  }
+
+  /** Whether the "show labels" checkbox is currently checked. */
+  get labelsChecked(): boolean {
+    return this.labelsInput?.checked ?? false;
+  }
+
   /** Reflect the paused state (updates the pause/resume button label). */
   setPaused(paused: boolean): void {
     this.paused = paused;
     this.translatables.set(this.pauseButton, paused ? 'hud.resume' : 'hud.pause');
     this.pauseButton.textContent = this.t(paused ? 'hud.resume' : 'hud.pause');
+  }
+
+  /** Reflect the rewinding state (updates the rewind button label + active style). */
+  setRewinding(rewinding: boolean): void {
+    this.rewinding = rewinding;
+    const button = this.rewindButton;
+    if (button === null) {
+      return;
+    }
+    const id = rewinding ? 'hud.rewindStop' : 'hud.rewind';
+    this.translatables.set(button, id);
+    button.textContent = this.t(id);
+    button.classList.toggle('hud-button--active', rewinding);
+  }
+
+  /** Whether the HUD currently shows the rewinding state. */
+  get isRewinding(): boolean {
+    return this.rewinding;
   }
 
   /** Update the displayed lifecycle stage. */
@@ -242,6 +309,30 @@ export class Hud {
     wrapper.appendChild(label);
     this.root.appendChild(wrapper);
     return wrapper;
+  }
+
+  /**
+   * Build a labelled checkbox control. `onChange` receives the new checked
+   * state; the caption is registered for translation like every other label.
+   */
+  private checkbox(
+    labelId: string,
+    initial: boolean,
+    onChange: (checked: boolean) => void,
+  ): HTMLInputElement {
+    const wrapper = document.createElement('label');
+    wrapper.className = 'hud-field hud-toggle';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.className = 'hud-toggle__input';
+    input.checked = initial;
+    input.addEventListener('change', () => onChange(input.checked));
+    const caption = document.createElement('span');
+    caption.className = 'hud-field__label';
+    this.translatables.set(caption, labelId);
+    wrapper.append(input, caption);
+    this.root.appendChild(wrapper);
+    return input;
   }
 
   private button(labelId: string, onClick: () => void): HTMLButtonElement {

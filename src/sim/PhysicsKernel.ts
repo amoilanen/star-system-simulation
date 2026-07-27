@@ -37,6 +37,22 @@ export interface StepResult {
   events: SimulationEvent[];
   /** The lifecycle stage the simulation is in after the step. */
   stage: LifecycleStage;
+  /**
+   * Normalized 0..1 progress through the current stage. During FORMATION stages
+   * this reflects accretion progress (core mass fraction — the physics, not a
+   * timer); during the stellar stages it reflects elapsed sim-time in the stage.
+   */
+  stageProgress: number;
+  /**
+   * Physically meaningful elapsed time for the star system, in sim seconds.
+   *
+   * This is NOT the raw wall-clock-scaled `Clock.simTime`: because formation is
+   * accretion-driven (so it stays watchable at any pace) its progress is mapped
+   * onto the REAL formation timescale (~1.6 Myr for a solar cloud), after which
+   * the stellar clock continues. Without this the star appeared to ignite after
+   * a few dozen years.
+   */
+  elapsedSimSeconds: number;
 }
 
 // --- Particle buffer layout (interleaved Float32Array) ----------------------

@@ -10,7 +10,11 @@ import * as THREE from 'three';
 import { LifecycleStage, RemnantType } from '../config/fateModel';
 import { BODY_OFFSET, BODY_STRIDE, BodyType } from '../sim/PhysicsKernel';
 import type { Vec3 } from '../sim/PhysicsKernel';
+import type { CloudComposition, Locale } from '../config/SimulationConfig';
+import type { I18n } from '../i18n/i18n';
+import { BodyLabels } from './BodyLabels';
 import { BodyRenderer } from './BodyRenderer';
+import { OrbitRenderer } from './OrbitRenderer';
 import { CameraController } from './CameraController';
 import { ParticleField } from './ParticleField';
 import { StarRenderer } from './StarRenderer';
@@ -33,6 +37,13 @@ export interface RenderState {
   stageProgress: number;
   /** Cloud mass in M☉ (drives main-sequence temperature/radius). */
   mass: number;
+  /** Cloud composition (drives the star's colour tint with metallicity). */
+  composition: CloudComposition;
+  /**
+   * Central gravitational parameter the kernel integrates against, so the
+   * orbit overlay can reconstruct the exact conics the bodies are following.
+   */
+  mu: number;
   /** Terminal remnant kind, or null before the remnant stage. */
   remnant: RemnantType | null;
 }
@@ -41,6 +52,17 @@ export interface RenderState {
 export interface SceneManagerOptions {
   /** GPU particle capacity; must be ≥ the kernel's particle count. */
   maxParticles: number;
+  /**
+   * Distance from the star within which comets grow a tail (scene units).
+   * Typically derived from the cloud extent; defaults to a sensible value.
+   */
+  cometTailDistance?: number;
+  /** Bound on drawn orbit-path extent (scene units); trims hyperbolic fly-bys. */
+  orbitMaxRadius?: number;
+  /** Active locale for the on-screen body labels. */
+  locale?: Locale;
+  /** i18n registry for the body labels. */
+  i18n?: I18n;
 }
 
 /** A callback returning the next frame's {@link RenderState}, or null to idle. */
@@ -49,7 +71,22 @@ export type FrameProvider = (realDtSeconds: number) => RenderState | null;
 /** Result of a click pick: the star itself, or a specific celestial body. */
 export type ScenePick =
   | { kind: 'star' }
-  | { kind: 'body'; id: number; type: BodyType; radius: number; captured: boolean };
+  | {
+      kind: 'body';
+      id: number;
+      type: BodyType;
+      radius: number;
+      /** Mass in solar masses, so the UI can classify the planet by mass. */
+      mass: number;
+      captured: boolean;
+    };
+
+/**
+ * Pick radius as a fraction of the distance from the camera, i.e. a constant
+ * apparent size (~2.3°). Keeps realistically small bodies comfortably clickable
+ * at any zoom without making a nearby body swallow every click.
+ */
+const PICK_ANGULAR_RADIUS = 0.04;
 
 /** Nearest non-negative ray-sphere intersection distance, or null if it misses. */
 function rayHitsSphere(
@@ -87,6 +124,9 @@ export class SceneManager {
   private readonly starRenderer: StarRenderer;
   private readonly particleField: ParticleField;
   private readonly bodyRenderer: BodyRenderer;
+  private readonly orbits: OrbitRenderer;
+  private readonly labels: BodyLabels;
+  private readonly labelLayer: HTMLDivElement;
   private readonly post: PostProcessing;
   private readonly starLight: THREE.PointLight;
   private readonly resizeHandler: () => void;
@@ -120,15 +160,19 @@ export class SceneManager {
     this.scene.background = new THREE.Color(0x01010a);
     this.scene.add(this.createStarfield());
 
-    this.camera = new THREE.PerspectiveCamera(55, width / height, 0.1, 20000);
+    // A near plane far closer than the old 0.1 so the camera can actually get
+    // up to a realistically-sized planet (radius ~0.016 AU) without clipping it.
+    this.camera = new THREE.PerspectiveCamera(55, width / height, 0.02, 20000);
     this.camera.position.set(0, 20, 60);
 
     this.cameraController = new CameraController(this.camera, this.renderer.domElement);
 
     // Lighting: the star illuminates the planets; a faint ambient lifts shadows.
-    this.starLight = new THREE.PointLight(0xffffff, 3, 0, 0.0);
+    // Intensity is deliberately modest so the diffuse-lit bodies stay BELOW the
+    // bloom threshold — planets should be lit, not glow like stars themselves.
+    this.starLight = new THREE.PointLight(0xffffff, 1.4, 0, 0.0);
     this.scene.add(this.starLight);
-    this.scene.add(new THREE.AmbientLight(0x223344, 0.4));
+    this.scene.add(new THREE.AmbientLight(0x33445a, 0.5));
 
     this.starRenderer = new StarRenderer();
     this.scene.add(this.starRenderer.group);
@@ -137,7 +181,26 @@ export class SceneManager {
     this.scene.add(this.particleField.points);
 
     this.bodyRenderer = new BodyRenderer();
+    if (options.cometTailDistance !== undefined) {
+      this.bodyRenderer.setTailActivationDistance(options.cometTailDistance);
+    }
     this.scene.add(this.bodyRenderer.group);
+
+    this.orbits = new OrbitRenderer();
+    if (options.orbitMaxRadius !== undefined) {
+      this.orbits.setMaxRadius(options.orbitMaxRadius);
+    }
+    this.scene.add(this.orbits.group);
+
+    // Screen-space label overlay above the canvas (never eats pointer events).
+    this.labelLayer = document.createElement('div');
+    this.labelLayer.className = 'body-labels';
+    container.appendChild(this.labelLayer);
+    this.labels = new BodyLabels({
+      container: this.labelLayer,
+      locale: options.locale ?? 'en',
+      ...(options.i18n === undefined ? {} : { i18n: options.i18n }),
+    });
 
     this.post = createPostProcessing(this.renderer, this.scene, this.camera, width, height);
 
@@ -149,23 +212,33 @@ export class SceneManager {
   render(state: RenderState, realDtSeconds: number): void {
     const dt = Number.isFinite(realDtSeconds) && realDtSeconds > 0 ? realDtSeconds : 0;
 
+    // Dust is now PHYSICALLY depleted by the kernel (accreted onto the star and
+    // planets, or blown out as ejecta at death), so the particle buffer already
+    // reflects the thinning cloud — we simply draw every active particle. A gentle
+    // brightness ease keeps the residual circumstellar disc from over-glowing
+    // while the freshly-ejected death shell (bright by its own colour) still pops.
     this.particleField.update(state.particles, state.particleCount);
-
-    // Fade the birth dust once the star ignites so residual cloud stops
-    // competing with the star system; flash it bright again for the supernova
-    // ejecta at death. Eased toward the target so transitions never pop.
-    const targetDust = dustBrightnessForStage(state.stage, state.stageProgress);
     const ease = dt > 0 ? Math.min(1, dt * 1.5) : 1;
+    const targetDust = dustBrightnessForStage(state.stage);
     this.dustBrightness += (targetDust - this.dustBrightness) * ease;
     this.particleField.setBrightness(this.dustBrightness);
 
-    this.bodyRenderer.update(state.bodies, state.bodyCount, dt);
+    const viewportHeightPx = this.renderer.domElement.clientHeight || this.container.clientHeight;
+    this.bodyRenderer.update(state.bodies, state.bodyCount, dt, this.camera, viewportHeightPx);
+    this.orbits.update(state.bodies, state.bodyCount, state.mu);
 
-    const appearance = starAppearance(state.stage, state.mass, state.stageProgress, state.remnant);
-    this.starRenderer.update(appearance, dt, this.camera);
+    const appearance = starAppearance(
+      state.stage,
+      state.mass,
+      state.stageProgress,
+      state.remnant,
+      state.composition,
+    );
+    this.starRenderer.update(appearance, dt, this.camera, viewportHeightPx);
     this.starLight.visible = appearance.visible;
     this.starLight.color.setRGB(appearance.color.r, appearance.color.g, appearance.color.b);
-    this.starLight.intensity = appearance.visible ? 2 + appearance.glow * 2 : 0;
+    // Keep planet illumination modest so lit bodies never bloom like the star.
+    this.starLight.intensity = appearance.visible ? 1.1 + appearance.glow * 0.5 : 0;
     this.lastStarRadius = appearance.radius || 1;
 
     // Cache body state so focus/follow can locate bodies by id between frames.
@@ -174,6 +247,19 @@ export class SceneManager {
 
     this.cameraController.update(dt);
     this.post.render(dt);
+
+    // Labels project through the camera, so update them AFTER the controller has
+    // settled this frame's camera transform.
+    this.labels.update(
+      state.bodies,
+      state.bodyCount,
+      this.camera,
+      this.renderer.domElement,
+      state.stage,
+      state.mass,
+      state.remnant,
+      this.lastStarRadius,
+    );
   }
 
   /**
@@ -206,6 +292,31 @@ export class SceneManager {
       this.rafId = null;
     }
     this.frameProvider = null;
+  }
+
+  /** Show or hide the orbital-path overlay for every body. */
+  setOrbitsEnabled(enabled: boolean): void {
+    this.orbits.setEnabled(enabled);
+  }
+
+  /** Whether the orbital-path overlay is currently drawn. */
+  get orbitsEnabled(): boolean {
+    return this.orbits.isEnabled;
+  }
+
+  /** Show or hide the on-screen body labels. */
+  setLabelsEnabled(enabled: boolean): void {
+    this.labels.setEnabled(enabled);
+  }
+
+  /** Whether the on-screen body labels are currently shown. */
+  get labelsEnabled(): boolean {
+    return this.labels.isEnabled;
+  }
+
+  /** Switch the label overlay's locale. */
+  setLabelLocale(locale: Locale): void {
+    this.labels.setLocale(locale);
   }
 
   /** Smoothly center and frame the star at the scene origin (FR-8). */
@@ -252,12 +363,15 @@ export class SceneManager {
 
     // The star sits at the origin. Its bright core is small but its glow halo
     // reads much larger, so use a generous pick radius so clicking the star (or
-    // its glow) reliably selects it.
+    // its glow) reliably selects it. Bodies are drawn at realistic (tiny)
+    // proportions, so pick radii are ANGULAR — a constant fraction of the
+    // distance to the camera — rather than a fixed world size that would be
+    // enormous up close and unclickable far away.
     const starHit = rayHitsSphere(
       origin,
       direction,
       [0, 0, 0],
-      Math.max(this.lastStarRadius * 2.5, 4),
+      Math.max(this.lastStarRadius * 2.5, origin.length() * PICK_ANGULAR_RADIUS),
     );
     if (starHit !== null && starHit < bestT) {
       bestT = starHit;
@@ -272,7 +386,17 @@ export class SceneManager {
         this.lastBodies[base + BODY_OFFSET.z] ?? 0,
       ];
       const radius = this.lastBodies[base + BODY_OFFSET.radius] ?? 0.5;
-      const t = rayHitsSphere(origin, direction, position, Math.max(radius * 2.2, 1.4));
+      const distance = Math.hypot(
+        position[0] - origin.x,
+        position[1] - origin.y,
+        position[2] - origin.z,
+      );
+      const t = rayHitsSphere(
+        origin,
+        direction,
+        position,
+        Math.max(radius * 2, distance * PICK_ANGULAR_RADIUS),
+      );
       if (t !== null && t < bestT) {
         bestT = t;
         best = {
@@ -280,6 +404,7 @@ export class SceneManager {
           id: this.lastBodies[base + BODY_OFFSET.id] ?? -1,
           type: (this.lastBodies[base + BODY_OFFSET.type] ?? BodyType.Planet) as BodyType,
           radius,
+          mass: this.lastBodies[base + BODY_OFFSET.mass] ?? 0,
           captured: (this.lastBodies[base + BODY_OFFSET.captured] ?? 0) !== 0,
         };
       }
@@ -321,6 +446,9 @@ export class SceneManager {
     this.stop();
     window.removeEventListener('resize', this.resizeHandler);
     this.cameraController.dispose();
+    this.orbits.dispose();
+    this.labels.dispose();
+    this.labelLayer.remove();
     this.starRenderer.dispose();
     this.particleField.dispose();
     this.bodyRenderer.dispose();
@@ -381,30 +509,26 @@ export class SceneManager {
 
 /**
  * Target brightness (0..1) for the dust/ejecta particle cloud at a given
- * lifecycle stage. The birth cloud is fully lit while it collapses, fades out as
- * the star ignites and clears its surroundings, stays dim through the star's
- * life, then flashes bright again as supernova ejecta before settling faint
- * around the remnant.
+ * lifecycle stage. The physical particle COUNT is handled by the kernel (dust is
+ * really accreted/ejected); this only tempers glow so the dense birth cloud and
+ * the bright death shell read well while the thin circumstellar disc during the
+ * star's life does not over-bloom.
  */
-function dustBrightnessForStage(stage: LifecycleStage, progress: number): number {
-  const clamped = Math.min(1, Math.max(0, progress));
+function dustBrightnessForStage(stage: LifecycleStage): number {
   switch (stage) {
     case LifecycleStage.DustCloud:
     case LifecycleStage.ProtostarCoalescence:
-      return 1;
     case LifecycleStage.FusionIgnition:
-      // Thin the surroundings as fusion switches on, but keep the residual
-      // circumstellar dust/disk clearly visible around the young star.
-      return 1 - 0.55 * clamped;
+      return 1;
     case LifecycleStage.MainSequence:
     case LifecycleStage.RedGiant:
-      return 0.45;
+      return 0.7;
     case LifecycleStage.Death:
       // Supernova / envelope ejection re-illuminates the cloud.
       return 1;
     case LifecycleStage.Remnant:
-      return 0.45;
+      return 0.85;
     default:
-      return 0.45;
+      return 0.7;
   }
 }

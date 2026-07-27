@@ -44,11 +44,22 @@ export function createPostProcessing(
 
   composer.addPass(new RenderPass(scene, camera));
 
+  // Tuned for a star drawn at REALISTIC (compact) proportions.
+  //
+  // UnrealBloomPass blurs five progressively coarser mips of the scene. At the
+  // coarsest of them one texel spans ~32 screen pixels, so a star that is only a
+  // few pixels across occupies well under a single texel — and bilinearly
+  // upsampling that lone texel painted a visible grey SQUARE of glow around the
+  // star. (It went unnoticed while the star was drawn as a half-AU ball, which
+  // covered many texels.) The star's halo is supplied by its own corona
+  // billboard, so bloom only needs to add a gentle cinematic bleed on top: a low
+  // strength plus a high threshold keeps the coarse-mip contribution far below
+  // the visible floor while the death shell and ignition flash still glow.
   const bloom = new UnrealBloomPass(
     new THREE.Vector2(width, height),
-    options.strength ?? 0.9,
-    options.radius ?? 0.6,
-    options.threshold ?? 0.2,
+    options.strength ?? 0.28,
+    options.radius ?? 0.45,
+    options.threshold ?? 0.55,
   );
   composer.addPass(bloom);
 

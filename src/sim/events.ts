@@ -22,6 +22,7 @@ export enum SimEventType {
   RemnantFormed,
   BodyCaptured, // comet/asteroid captured
   BodyEjected, // comet/asteroid ejected
+  BodyConsumed, // a body spiralled into the star and was torn apart
 }
 
 /**
@@ -54,6 +55,7 @@ export const EVENT_MESSAGE_IDS: Readonly<Record<SimEventType, string>> = {
   [SimEventType.RemnantFormed]: 'event.remnantFormed',
   [SimEventType.BodyCaptured]: 'event.bodyCaptured',
   [SimEventType.BodyEjected]: 'event.bodyEjected',
+  [SimEventType.BodyConsumed]: 'event.bodyConsumed',
 } as const;
 
 /** Resolve the i18n message key for an event type. */

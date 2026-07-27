@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bodyInfoMessages, GAS_GIANT_RADIUS, type PickTarget } from '../../src/ui/bodyInfo';
+import { bodyInfoMessages, type PickTarget } from '../../src/ui/bodyInfo';
 import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
 import { BodyType } from '../../src/sim/PhysicsKernel';
 import { i18n } from '../../src/i18n/i18n';
@@ -36,17 +36,27 @@ describe('bodyInfoMessages', () => {
     const rocky = bodyInfoMessages({
       kind: 'body',
       type: BodyType.Planet,
-      radius: GAS_GIANT_RADIUS - 0.1,
+      radius: 0.08,
+      mass: 1 / 332946, // 1 M⊕
       captured: true,
     });
     const giant = bodyInfoMessages({
       kind: 'body',
       type: BodyType.Planet,
-      radius: GAS_GIANT_RADIUS + 0.1,
+      radius: 0.24,
+      mass: 318 / 332946, // Jupiter
+      captured: true,
+    });
+    const iceGiant = bodyInfoMessages({
+      kind: 'body',
+      type: BodyType.Planet,
+      radius: 0.16,
+      mass: 17 / 332946, // Neptune
       captured: true,
     });
     expect(rocky.titleId).toBe('info.rockyPlanet.title');
     expect(giant.titleId).toBe('info.gasGiant.title');
+    expect(iceGiant.titleId).toBe('info.iceGiant.title');
   });
 
   it('labels comets and asteroids with a captured/passing note', () => {

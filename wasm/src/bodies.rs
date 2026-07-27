@@ -3,7 +3,7 @@
 //! `src/sim/TsFallbackKernel.ts`; the deterministic RNG, seeding order and
 //! capture/ejection rules are replicated exactly for kernel parity.
 
-use crate::nbody::{is_bound, magnitude, Vec3};
+use crate::nbody::{is_bound, magnitude, Vec3, ASTEROID_RADIUS, COMET_RADIUS};
 
 /// Kinds of orbiting/visiting bodies. Numeric values MUST match the TypeScript
 /// `BodyType` enum ordering (`src/sim/PhysicsKernel.ts`). The full contract is
@@ -109,6 +109,50 @@ pub fn classify_visitor(mu: f64, pos: Vec3, vel: Vec3, eject_radius: f64) -> Vis
     }
 }
 
+/// A unit vector perpendicular to `axis`, rotated by `angle` around it — i.e. an
+/// arbitrary direction in the plane normal to `axis`. Mirrors `perpendicularTo`.
+///
+/// Used to give an incoming visitor a tangential velocity component (a non-zero
+/// impact parameter), which is what turns a degenerate radial plunge into a real
+/// hyperbolic fly-by.
+#[must_use]
+pub fn perpendicular_to(axis: Vec3, angle: f64) -> Vec3 {
+    let len = magnitude(axis);
+    if len <= 0.0 || !len.is_finite() {
+        return [1.0, 0.0, 0.0];
+    }
+    let a: Vec3 = [axis[0] / len, axis[1] / len, axis[2] / len];
+    // Pick any reference not parallel to the axis, then build an orthonormal pair.
+    let reference: Vec3 = if a[1].abs() < 0.9 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let e1: Vec3 = [
+        a[1] * reference[2] - a[2] * reference[1],
+        a[2] * reference[0] - a[0] * reference[2],
+        a[0] * reference[1] - a[1] * reference[0],
+    ];
+    let e1_len = magnitude(e1);
+    if e1_len <= 0.0 || !e1_len.is_finite() {
+        return [1.0, 0.0, 0.0];
+    }
+    let u: Vec3 = [e1[0] / e1_len, e1[1] / e1_len, e1[2] / e1_len];
+    // v = a x u completes the right-handed basis of the perpendicular plane.
+    let v: Vec3 = [
+        a[1] * u[2] - a[2] * u[1],
+        a[2] * u[0] - a[0] * u[2],
+        a[0] * u[1] - a[1] * u[0],
+    ];
+    let c = angle.cos();
+    let s = angle.sin();
+    [
+        u[0] * c + v[0] * s,
+        u[1] * c + v[1] * s,
+        u[2] * c + v[2] * s,
+    ]
+}
+
 /// Create a comet/asteroid at the system boundary heading inward (mirror of
 /// `makeVisitor`). Consumes six RNG draws in the exact same order as the TS side.
 pub fn make_visitor(rng: &mut Mulberry32, mu: f64, eject_radius: f64, id: f64) -> CelestialBody {
@@ -126,12 +170,25 @@ pub fn make_visitor(rng: &mut Mulberry32, mu: f64, eject_radius: f64, id: f64) -
     // capture an occasional event rather than the common case. Mirrors the TS
     // fallback's `makeVisitor`.
     let speed = escape * (0.9 + 0.7 * rng.next_f64());
-    let dist = magnitude(position);
-    let aim = 0.15 + 0.5 * rng.next_f64();
+    let dist = magnitude(position).max(f64::EPSILON);
+    // Impact parameter: how far the incoming trajectory MISSES the star by. Real
+    // interstellar visitors are never aimed exactly at the star, and this is what
+    // makes them swing past it on a hyperbola.
+    //
+    // Aiming a visitor precisely at the star (the previous behaviour) gives it
+    // ZERO angular momentum — a degenerate radial trajectory with no orbital
+    // plane. Such a body fell straight through the softened core and oscillated
+    // back and forth on a fixed line forever, and its "orbit" drew as a straight
+    // line running through the star.
+    let impact = eject_radius * (0.08 + 0.45 * rng.next_f64());
+    let sin_alpha = (impact / dist).min(0.95);
+    let cos_alpha = (1.0 - sin_alpha * sin_alpha).max(0.0).sqrt();
+    let radial: Vec3 = [position[0] / dist, position[1] / dist, position[2] / dist];
+    let tangent = perpendicular_to(radial, 2.0 * std::f64::consts::PI * rng.next_f64());
     let velocity: Vec3 = [
-        (-position[0] / dist) * speed * aim,
-        (-position[1] / dist) * speed * aim,
-        (-position[2] / dist) * speed * aim,
+        speed * (-radial[0] * cos_alpha + tangent[0] * sin_alpha),
+        speed * (-radial[1] * cos_alpha + tangent[1] * sin_alpha),
+        speed * (-radial[2] * cos_alpha + tangent[2] * sin_alpha),
     ];
     let is_comet = rng.next_f64() < 0.5;
     CelestialBody {
@@ -142,7 +199,12 @@ pub fn make_visitor(rng: &mut Mulberry32, mu: f64, eject_radius: f64, id: f64) -
             BodyType::Asteroid
         },
         mass: 1.0e-9,
-        radius: if is_comet { 0.3 } else { 0.2 },
+        // Comets/asteroids are far smaller than planets (scene units).
+        radius: if is_comet {
+            COMET_RADIUS
+        } else {
+            ASTEROID_RADIUS
+        },
         pos: position,
         vel: velocity,
         spin: rng.next_f64(),

@@ -17,10 +17,21 @@ export const coronaFragmentShader = /* glsl */ `
   varying vec2 vUv;
 
   void main() {
-    // Radial distance from the quad center.
+    // Radial distance from the quad center, 0 at the centre and 1 at the
+    // inscribed circle.
     float d = length(vUv - vec2(0.5)) * 2.0;
+    // Outside the inscribed circle there is no halo at all — otherwise the
+    // square quad itself becomes visible.
+    if (d > 1.0) discard;
     // Soft inverse falloff: bright core, long faint skirt.
-    float glow = smoothstep(1.0, 0.0, d);
+    //
+    // NB: written as 1 - smoothstep(0, 1, d) rather than smoothstep(1, 0, d).
+    // GLSL leaves smoothstep UNDEFINED when edge0 >= edge1, and on this driver
+    // the descending form returned a constant — so the corona rendered as a
+    // uniformly lit SQUARE around the star. It went unnoticed while the star was
+    // drawn as a huge ball, but at realistic (compact) scale the square was
+    // unmistakable.
+    float glow = 1.0 - smoothstep(0.0, 1.0, d);
     glow = pow(glow, 2.2);
     float alpha = glow * uIntensity;
     gl_FragColor = vec4(uColor * glow, alpha);

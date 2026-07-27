@@ -15,10 +15,10 @@ export const particleVertexShader = /* glsl */ `
     vColor = aColor;
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     // Perspective size attenuation: nearer particles are larger. The factor is
-    // kept modest and the result clamped so grains read as fine dust in scale
-    // with the star, never as large blobs when close to the camera.
-    float pt = aSize * uSizeScale * uPixelRatio * (110.0 / -mvPosition.z);
-    gl_PointSize = clamp(pt, 0.75, 9.0 * uPixelRatio);
+    // kept small and the result tightly clamped so grains read as FINE dust in
+    // scale with the star, never as large blobs when close to the camera.
+    float pt = aSize * uSizeScale * uPixelRatio * (55.0 / -mvPosition.z);
+    gl_PointSize = clamp(pt, 0.5, 4.0 * uPixelRatio);
     gl_Position = projectionMatrix * mvPosition;
   }
 `;
@@ -33,7 +33,9 @@ export const particleFragmentShader = /* glsl */ `
     vec2 c = gl_PointCoord - vec2(0.5);
     float d = length(c);
     if (d > 0.5) discard;
-    float alpha = smoothstep(0.5, 0.0, d) * uBrightness;
+    // 1 - smoothstep(0, 0.5, d), not smoothstep(0.5, 0, d): GLSL leaves
+    // smoothstep undefined when edge0 >= edge1 (see corona.ts).
+    float alpha = (1.0 - smoothstep(0.0, 0.5, d)) * uBrightness;
     gl_FragColor = vec4(vColor * alpha, alpha);
   }
 `;

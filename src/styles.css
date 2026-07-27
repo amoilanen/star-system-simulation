@@ -276,6 +276,12 @@ button:hover {
   border-color: var(--accent);
 }
 
+/* Toggled-on transport button (e.g. rewind while scrubbing). */
+button.hud-button--active {
+  background: rgba(255, 176, 90, 0.32);
+  border-color: var(--accent-strong, #ffb05a);
+}
+
 select {
   padding: 7px 34px 7px 12px;
   background: var(--panel-solid);
@@ -516,4 +522,87 @@ input[type='checkbox'] {
 
 .context-menu__item:hover {
   background: rgba(110, 168, 255, 0.22);
+}
+
+/* ------------------------------------------------------------- Body labels */
+/* Floating, screen-space labels naming the star and each orbiting body and
+ * showing their live physical statistics. Positioned per-frame by BodyLabels
+ * via a transform; the layer itself never swallows pointer events so the scene
+ * stays fully click/drag-able underneath. */
+
+.body-labels {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.body-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 0.3rem 0.45rem;
+  border-radius: 0.35rem;
+  border: 1px solid rgba(150, 180, 255, 0.22);
+  background: rgba(10, 14, 30, 0.62);
+  backdrop-filter: blur(2px);
+  color: #dce6ff;
+  font-size: 0.7rem;
+  line-height: 1.25;
+  white-space: nowrap;
+  /* Nudge the label just above the body it belongs to. */
+  margin-top: -0.4rem;
+}
+
+.body-label--star {
+  border-color: rgba(255, 214, 150, 0.4);
+  background: rgba(28, 18, 6, 0.66);
+  color: #ffeccc;
+}
+
+.body-label__title {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.body-label__stats {
+  margin-top: 0.15rem;
+  display: grid;
+  gap: 0.05rem;
+}
+
+.body-label__stat {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.6rem;
+  font-size: 0.65rem;
+}
+
+.body-label__stat-key {
+  opacity: 0.62;
+}
+
+.body-label__stat-value {
+  font-variant-numeric: tabular-nums;
+}
+
+/* HUD checkbox toggles (orbits / labels). Laid out like the other HUD fields
+ * but with the control before its caption. */
+.hud-toggle {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+}
+
+.hud-toggle__input {
+  width: 0.95rem;
+  height: 0.95rem;
+  accent-color: #8fa8e8;
+  cursor: pointer;
+}
+
+.hud-toggle .hud-field__label {
+  cursor: pointer;
 }

@@ -38,6 +38,27 @@ export function tailLength(bodyPos: Vec3, starPos: Vec3, maxLength: number): num
 }
 
 /**
+ * Comet-tail activation factor in [0, 1] as a function of distance to the star:
+ * a comet grows a tail only once solar heating sublimates its ices, i.e. when it
+ * is sufficiently close. Returns 0 beyond `activationDistance` (no tail — the
+ * comet is an inert iceball far from the star), ramping smoothly to a full tail
+ * as it approaches the inner system. Pure; exported for unit testing.
+ */
+export function cometTailActivation(
+  bodyPos: Vec3,
+  starPos: Vec3,
+  activationDistance: number,
+): number {
+  if (!(activationDistance > 0)) {
+    return 0;
+  }
+  const r = length([bodyPos[0] - starPos[0], bodyPos[1] - starPos[1], bodyPos[2] - starPos[2]]);
+  // Zero at/after activationDistance; reaches a full tail by ~40% of it.
+  const t = (activationDistance - r) / (activationDistance * 0.6);
+  return Math.max(0, Math.min(1, t));
+}
+
+/**
  * Accumulate an axial spin angle (radians) for a body spinning at `spinRate`
  * over elapsed `dt`, wrapped into `[0, 2π)` to avoid unbounded growth (FR-6).
  * Pure.

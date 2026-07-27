@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { advanceSpin, tailDirectionAwayFromStar, tailLength } from '../../src/render/bodyMath';
+import {
+  advanceSpin,
+  cometTailActivation,
+  tailDirectionAwayFromStar,
+  tailLength,
+} from '../../src/render/bodyMath';
 
 describe('tailDirectionAwayFromStar', () => {
   it('points from the star toward the comet, normalized', () => {
@@ -34,6 +39,34 @@ describe('tailLength', () => {
     const far = tailLength([50, 0, 0], [0, 0, 0], 10);
     expect(near).toBeGreaterThan(far);
     expect(near).toBeLessThanOrEqual(10);
+  });
+});
+
+describe('cometTailActivation', () => {
+  it('is zero when the comet is at or beyond the activation distance', () => {
+    expect(cometTailActivation([25, 0, 0], [0, 0, 0], 25)).toBe(0);
+    expect(cometTailActivation([40, 0, 0], [0, 0, 0], 25)).toBe(0);
+  });
+
+  it('reaches a full tail well inside the activation distance', () => {
+    expect(cometTailActivation([5, 0, 0], [0, 0, 0], 25)).toBe(1);
+    expect(cometTailActivation([0, 0, 0], [0, 0, 0], 25)).toBe(1);
+  });
+
+  it('ramps between zero and full as the comet approaches', () => {
+    const mid = cometTailActivation([18, 0, 0], [0, 0, 0], 25);
+    expect(mid).toBeGreaterThan(0);
+    expect(mid).toBeLessThan(1);
+  });
+
+  it('grows monotonically as the comet gets closer', () => {
+    const far = cometTailActivation([22, 0, 0], [0, 0, 0], 25);
+    const near = cometTailActivation([12, 0, 0], [0, 0, 0], 25);
+    expect(near).toBeGreaterThan(far);
+  });
+
+  it('is zero for a non-positive activation distance', () => {
+    expect(cometTailActivation([1, 0, 0], [0, 0, 0], 0)).toBe(0);
   });
 });
 

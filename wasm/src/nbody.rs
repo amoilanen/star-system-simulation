@@ -24,16 +24,146 @@ pub const GRAVITY: f64 = 1.0;
 
 /// Softening length (scene units) that removes the 1/r² singularity at r→0.
 /// Matches `SOFTENING` in the TS fallback.
-pub const SOFTENING: f64 = 1.0;
+pub const SOFTENING: f64 = 0.35;
 
 /// Hard cap on simulated dust particles for interactive frame rates (FR-10).
 pub const MAX_PARTICLES: usize = 4000;
 
 /// Maximum integration substeps per kernel `step` call.
-pub const MAX_SUBSTEPS: usize = 8;
+pub const MAX_SUBSTEPS: usize = 16;
 
 /// Fixed internal integration timestep (dimensionless visual seconds).
 pub const INTERNAL_DT: f64 = 1.0 / 60.0;
+
+// --- Emergent-accretion constants (mirror the TS fallback) ------------------
+
+/// Visual speed-up of the orbital dynamics: effective `mu` = cloud mass × this.
+/// Sets the orbital/free-fall timescale so orbits are watchable and the cloud
+/// collapses over a reasonable formation phase.
+pub const ORBITAL_MASS_SCALE: f64 = 110.0;
+/// Reference sim-seconds for the orbital-time compression curve (calibrated to
+/// the per-frame `simDt` the Clock produces across the pace range).
+pub const ORBITAL_REF: f64 = 2.0e4;
+/// Orbital-time units produced per unit of the compression curve.
+pub const ORBITAL_TIME_UNIT: f64 = 0.03;
+/// Maximum orbital time advanced per `step` (integrator stability).
+pub const ORBITAL_MAX: f64 = 0.2;
+/// Rate at which vertical (out-of-plane) velocity is dissipated → flattening.
+pub const VERTICAL_DAMP: f64 = 1.8;
+/// Rate at which vertical POSITION relaxes toward the mid-plane (disc settling).
+pub const DISK_SETTLE: f64 = 2.6;
+/// Gas drag letting un-accreted dust lose angular momentum and spiral inward to
+/// feed the growing star (formation only). Deliberately GENTLE so the cloud
+/// drains onto the core GRADUALLY — a stronger drag made the star appear to be
+/// born almost immediately. Dissipative and monotonic, so ignition is still
+/// reached; it just takes more steps.
+pub const GAS_DRAG: f64 = 0.28;
+
+// --- Planet-formation constants (mirror the TS fallback) --------------------
+
+/// Snow line in AU: ices condense beyond it, so solid supply jumps and giants
+/// form there. One scene unit is one AU.
+pub const SNOW_LINE_AU: f64 = 2.7;
+/// Dust retained per sweep INSIDE the snow line (rock/metal only).
+pub const ROCKY_ACCRETION_EFFICIENCY: f64 = 0.0001;
+/// Extra retention just beyond the snow line (ices + runaway gas capture).
+pub const GIANT_ACCRETION_EFFICIENCY: f64 = 0.02;
+/// e-folding distance (AU) over which the giant-forming supply thins out.
+pub const GIANT_EFOLD_AU: f64 = 7.0;
+/// How strongly planetesimals feel the disc's vertical damping vs. the dust.
+pub const BODY_DAMP_FRACTION: f64 = 0.02;
+
+/// Fraction of swept dust a planetesimal RETAINS at `distance_au` (mirror of
+/// `accretionEfficiency`): rocky worlds inside the snow line, giants just
+/// beyond it, ice giants further out.
+#[must_use]
+pub fn accretion_efficiency(distance_au: f64) -> f64 {
+    // NaN-safe: anything not strictly positive yields no accretion.
+    if distance_au.is_nan() || distance_au <= 0.0 {
+        return 0.0;
+    }
+    if distance_au < SNOW_LINE_AU {
+        return ROCKY_ACCRETION_EFFICIENCY;
+    }
+    let falloff = (-(distance_au - SNOW_LINE_AU) / GIANT_EFOLD_AU).exp();
+    ROCKY_ACCRETION_EFFICIENCY + GIANT_ACCRETION_EFFICIENCY * falloff
+}
+
+/// Compress the (astronomically scaled) stellar sim-time increment into a
+/// bounded, always-visible amount of orbital time. Mirrors `orbitalStep`.
+#[must_use]
+pub fn orbital_step(sim_dt_seconds: f64) -> f64 {
+    if !sim_dt_seconds.is_finite() || sim_dt_seconds <= 0.0 {
+        return 0.0;
+    }
+    let compressed = ORBITAL_TIME_UNIT * (1.0 + sim_dt_seconds / ORBITAL_REF).ln();
+    compressed.clamp(0.0, ORBITAL_MAX)
+}
+
+/// Accretion (feeding-zone) radius of a body of the given mass (oligarchic
+/// growth heuristic ∝ cube-root of mass). Mirrors `accretionRadius`.
+#[must_use]
+pub fn accretion_radius(body_mass: f64, cloud_mass: f64) -> f64 {
+    let reference = cloud_mass.max(f64::EPSILON);
+    // Small so planetesimals only sip from their immediate feeding zone while the
+    // central protostar (a far larger sink) swallows the overwhelming bulk of the
+    // infalling dust — planets end up a tiny fraction of the stellar mass.
+    0.4 + 1.2 * (body_mass.max(0.0) / reference).cbrt()
+}
+
+/// Visual radius bounds for celestial bodies, in scene units (= AU). Mirrors
+/// the TS fallback's `MIN_BODY_RADIUS` / `MAX_BODY_RADIUS`.
+///
+/// Solar-System proportions, not arcade ones: Jupiter's true radius is 0.00048
+/// AU against a 5.2 AU orbit, so a literal drawing would be sub-pixel. Bodies
+/// are exaggerated ~30×, but no further — the largest gas giant is still ~1/3 of
+/// the star's radius and ~1/300 of its orbit. Visibility when zoomed out is a
+/// RENDERER concern (a minimum apparent size), not a physical one.
+pub const MIN_BODY_RADIUS: f64 = 0.004;
+pub const MAX_BODY_RADIUS: f64 = 0.016;
+
+/// Visual radii of visiting comets/asteroids, in scene units (= AU).
+pub const COMET_RADIUS: f64 = 0.008;
+pub const ASTEROID_RADIUS: f64 = 0.006;
+
+/// Visual radius (scene units) of a body from its accreted mass. Mirrors
+/// `bodyRadiusFromMass`.
+#[must_use]
+pub fn body_radius_from_mass(body_mass: f64, cloud_mass: f64) -> f64 {
+    // Reference ≈ one Jupiter mass so Jupiter-class planets read as gas giants.
+    let reference = (cloud_mass * 1e-3).max(f64::EPSILON);
+    let r = 0.0035 + 0.011 * (body_mass.max(0.0) / reference).cbrt();
+    r.clamp(MIN_BODY_RADIUS, MAX_BODY_RADIUS)
+}
+
+/// Radius at which two growing oligarchs COLLIDE and merge. Mirrors `mergeRadius`.
+///
+/// Deliberately decoupled from `body_radius_from_mass`: this is a DYNAMICAL
+/// radius (overlapping feeding zones plus gravitational focusing, which hugely
+/// enlarges a planetesimal's effective cross-section), not the drawn size of the
+/// body. Merging on the drawn radius would make the emergent planet count depend
+/// on a purely visual choice.
+#[must_use]
+pub fn merge_radius(body_mass: f64, cloud_mass: f64) -> f64 {
+    let reference = (cloud_mass * 1e-3).max(f64::EPSILON);
+    let r = 0.026 + 0.085 * (body_mass.max(0.0) / reference).cbrt();
+    r.clamp(0.03, 0.12)
+}
+
+/// Momentum-conserving merge of two masses' velocities (perfectly inelastic
+/// collision). Mirrors `mergedVelocity`.
+#[must_use]
+pub fn merged_velocity(m1: f64, v1: Vec3, m2: f64, v2: Vec3) -> Vec3 {
+    let m = m1 + m2;
+    if m <= 0.0 {
+        return [0.0, 0.0, 0.0];
+    }
+    [
+        (m1 * v1[0] + m2 * v2[0]) / m,
+        (m1 * v1[1] + m2 * v2[1]) / m,
+        (m1 * v1[2] + m2 * v2[2]) / m,
+    ]
+}
 
 /// Euclidean length of a vector.
 #[must_use]

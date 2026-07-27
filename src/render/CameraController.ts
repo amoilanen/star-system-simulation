@@ -32,7 +32,9 @@ export class CameraController {
     this.controls = new OrbitControls(camera, domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
-    this.controls.minDistance = 0.5;
+    // Small enough to fly right up to a realistically-sized planet; bodies are
+    // only ~0.005–0.02 AU across (see `bodyRadiusFromMass`).
+    this.controls.minDistance = 0.06;
     this.controls.maxDistance = 5000;
   }
 

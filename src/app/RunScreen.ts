@@ -123,7 +123,15 @@ export class RunScreen {
     }
 
     this.runner = new SimulationRunner(this.config, kernel, { particleCount });
-    this.scene = new SceneManager(this.canvasHost, { maxParticles: particleCount });
+    this.scene = new SceneManager(this.canvasHost, {
+      maxParticles: particleCount,
+      // Comets grow tails once they reach roughly the inner half of the system.
+      cometTailDistance: this.config.cloudExtent * 0.5,
+      // Keep hyperbolic fly-by arcs within the neighbourhood of the system.
+      orbitMaxRadius: this.config.cloudExtent * 2,
+      locale: this.locale,
+      i18n: this.i18n,
+    });
 
     this.hud = new Hud({
       container: this.overlay,
@@ -132,10 +140,15 @@ export class RunScreen {
       initialPace: this.config.pace,
       onPaceChange: (pace) => this.runner?.setPace(pace),
       onTogglePause: () => this.handleTogglePause(),
+      onToggleRewind: (rewinding) => this.runner?.setRewinding(rewinding),
       onReset: () => this.onExit(),
       onZoomIn: () => this.scene?.cameraController.zoomIn(),
       onZoomOut: () => this.scene?.cameraController.zoomOut(),
       onFocusChange: (value) => this.handleFocusChange(value),
+      onToggleLabels: (enabled) => this.scene?.setLabelsEnabled(enabled),
+      onToggleOrbits: (enabled) => this.scene?.setOrbitsEnabled(enabled),
+      initialLabels: true,
+      initialOrbits: false,
     });
     // The HUD is interactive; re-enable pointer events for its controls.
     this.hud.element.style.pointerEvents = 'auto';
@@ -196,7 +209,7 @@ export class RunScreen {
     if (runner === null) {
       return null;
     }
-    const { state, events } = runner.tick(realDtSeconds);
+    const { state, events, elapsed } = runner.tick(realDtSeconds);
     this.lastStage = state.stage;
     this.lastRemnant = state.remnant;
 
@@ -212,7 +225,10 @@ export class RunScreen {
     if (hud !== null) {
       hud.setStage(state.stage);
       hud.setBodyCount(state.bodyCount);
-      hud.setElapsedYears(simSecondsToYears(runner.clock.simTime));
+      // Physically meaningful elapsed time for THIS frame (formation mapped onto
+      // real formation timescales, and the rewound timestamp while scrubbing),
+      // NOT the raw pace-scaled clock.
+      hud.setElapsedYears(simSecondsToYears(elapsed));
       hud.setSpeedYearsPerSecond(simSecondsToYears(runner.clock.currentRate()));
       this.syncFocusOptions(state);
     }
@@ -241,7 +257,13 @@ export class RunScreen {
     const target: PickTarget =
       pick.kind === 'star'
         ? { kind: 'star', stage: this.lastStage ?? 0, remnant: this.lastRemnant }
-        : { kind: 'body', type: pick.type, radius: pick.radius, captured: pick.captured };
+        : {
+            kind: 'body',
+            type: pick.type,
+            radius: pick.radius,
+            mass: pick.mass,
+            captured: pick.captured,
+          };
     this.infoPanel?.show(bodyInfoMessages(target));
   }
 

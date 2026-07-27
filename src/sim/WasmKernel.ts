@@ -28,6 +28,8 @@ export interface WasmKernelHandle {
   events_ptr(): number;
   event_stride(): number;
   stage(): number;
+  stage_progress(): number;
+  elapsed_sim_seconds(): number;
   free(): void;
 }
 
@@ -74,7 +76,12 @@ export class WasmKernel implements PhysicsKernel {
     const handle = this.requireHandle();
     const count = handle.step(dtSimSeconds);
     const events = this.drainEvents(handle, count);
-    return { events, stage: handle.stage() as LifecycleStage };
+    return {
+      events,
+      stage: handle.stage() as LifecycleStage,
+      stageProgress: handle.stage_progress(),
+      elapsedSimSeconds: handle.elapsed_sim_seconds(),
+    };
   }
 
   getParticleBuffer(): Float32Array {
@@ -144,6 +151,7 @@ function decodeEventData(
       return { remnant: dataA as RemnantType, supernova: dataB === 1 };
     case SimEventType.BodyCaptured:
     case SimEventType.BodyEjected:
+    case SimEventType.BodyConsumed:
       return { bodyId: dataA, bodyType: dataB as BodyType };
     default:
       return undefined;

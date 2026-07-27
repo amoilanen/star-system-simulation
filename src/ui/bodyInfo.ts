@@ -6,6 +6,7 @@
 
 import { LifecycleStage, RemnantType } from '../config/fateModel';
 import { BodyType } from '../sim/PhysicsKernel';
+import { solarToEarthMasses } from '../sim/astro';
 
 /** The star, described by its current lifecycle stage / remnant kind. */
 export interface StarPick {
@@ -18,8 +19,10 @@ export interface StarPick {
 export interface BodyPick {
   kind: 'body';
   type: BodyType;
-  /** Scene-unit radius, used to tell rocky planets from gas giants. */
+  /** Scene-unit radius (visual size). */
   radius: number;
+  /** Mass in solar masses, used to classify the planet (rocky/ice/gas giant). */
+  mass?: number;
   /** Whether a visiting body has been captured into a stable orbit. */
   captured: boolean;
 }
@@ -36,10 +39,30 @@ export interface BodyInfoMessages {
 }
 
 /**
- * Planets at or above this scene-unit radius are described as gas giants; below
- * it, as rocky/stone planets. Matches the seeded planet radii (0.4 → 0.85).
+ * Planet classification thresholds in EARTH MASSES. Classifying by mass rather
+ * than by drawn size matches how astronomers actually distinguish these worlds
+ * and stays correct however the visual scale is tuned:
+ *   < 8 M⊕  terrestrial/rocky (Earth 1, Venus 0.8)
+ *   8–50 M⊕ ice giant        (Uranus 14.5, Neptune 17)
+ *   ≥ 50 M⊕ gas giant        (Saturn 95, Jupiter 318)
  */
-export const GAS_GIANT_RADIUS = 0.6;
+export const ICE_GIANT_MIN_EARTH_MASSES = 8;
+export const GAS_GIANT_MIN_EARTH_MASSES = 50;
+
+/**
+ * i18n title id for a planet of `massSolar`, by mass class. Pure; shared by the
+ * label overlay and the click-to-inspect panel so both agree.
+ */
+export function planetClassTitleId(massSolar: number): string {
+  const earthMasses = solarToEarthMasses(massSolar);
+  if (earthMasses >= GAS_GIANT_MIN_EARTH_MASSES) {
+    return 'info.gasGiant.title';
+  }
+  if (earthMasses >= ICE_GIANT_MIN_EARTH_MASSES) {
+    return 'info.iceGiant.title';
+  }
+  return 'info.rockyPlanet.title';
+}
 
 /**
  * Map a picked target to the message ids describing it. Pure — no DOM, no i18n
@@ -92,9 +115,10 @@ function celestialBodyInfoMessages(body: BodyPick): BodyInfoMessages {
       return { titleId: 'info.asteroid.title', descId: 'info.asteroid.desc', noteId: note };
     case BodyType.Planet:
     case BodyType.Protoplanet:
-    default:
-      return body.radius >= GAS_GIANT_RADIUS
-        ? { titleId: 'info.gasGiant.title', descId: 'info.gasGiant.desc' }
-        : { titleId: 'info.rockyPlanet.title', descId: 'info.rockyPlanet.desc' };
+    default: {
+      const titleId = planetClassTitleId(body.mass ?? 0);
+      const descId = `${titleId.slice(0, -'.title'.length)}.desc`;
+      return { titleId, descId };
+    }
   }
 }

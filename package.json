@@ -6,6 +6,7 @@
   "description": "Simulation of a star system birth and death from a cloud of star dust",
   "scripts": {
     "dev": "vite",
+    "dev:all": "npm run build && npm run dev",
     "wasm:build": "wasm-pack build wasm --target web",
     "build": "npm run wasm:build && vite build",
     "typecheck": "tsc --noEmit",

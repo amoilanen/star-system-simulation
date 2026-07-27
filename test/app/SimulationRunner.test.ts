@@ -21,6 +21,17 @@ function makeConfig(overrides: Partial<SimulationConfig> = {}): SimulationConfig
   };
 }
 
+/**
+ * Ticks needed to carry a run from dust cloud to remnant. Each tick advances the
+ * kernel by one bounded orbital step, and formation is rate-limited by the
+ * star's finite accretion rate (`CORE_ACCRETION_RATE`), so reaching ignition
+ * legitimately takes a few hundred steps — that slow build-up is the point.
+ */
+const LIFECYCLE_TICKS = 900;
+
+/** Small particle count: these tests assert wiring, not planet demographics. */
+const WIRING_PARTICLES = 300;
+
 /** Drive `ticks` frames of 1 real second each, collecting events and stages. */
 function drive(
   runner: SimulationRunner,
@@ -38,11 +49,13 @@ function drive(
 
 describe('SimulationRunner (headless orchestration)', () => {
   it('advances the full birth→death lifecycle, wiring events end-to-end', () => {
-    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel());
+    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
 
     // pace = 1 compresses the whole lifecycle to ~1 minute; a handful of
     // one-second ticks walks the star from dust cloud to remnant.
-    const { events, stages } = drive(runner, 120);
+    const { events, stages } = drive(runner, LIFECYCLE_TICKS);
 
     // Terminal stage reached.
     expect(runner.currentStage).toBe(LifecycleStage.Remnant);
@@ -86,9 +99,11 @@ describe('SimulationRunner (headless orchestration)', () => {
 
   it('surfaces the selected remnant type at the terminal stage', () => {
     // High-mass ⇒ supernova ⇒ pulsar (fateModel single source of truth).
-    const runner = new SimulationRunner(makeConfig({ mass: 20 }), new TsFallbackKernel());
+    const runner = new SimulationRunner(makeConfig({ mass: 20 }), new TsFallbackKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
     let last = runner.tick(1);
-    for (let i = 0; i < 40 && last.state.stage !== LifecycleStage.Remnant; i += 1) {
+    for (let i = 0; i < LIFECYCLE_TICKS && last.state.stage !== LifecycleStage.Remnant; i += 1) {
       last = runner.tick(1);
     }
     expect(last.state.stage).toBe(LifecycleStage.Remnant);
@@ -96,7 +111,9 @@ describe('SimulationRunner (headless orchestration)', () => {
   });
 
   it('freezes progression while paused (A6) and resumes afterwards', () => {
-    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel());
+    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
     runner.tick(1); // leave the initial idle frame behind
     const pausedStage = runner.currentStage;
 
@@ -108,14 +125,17 @@ describe('SimulationRunner (headless orchestration)', () => {
 
     // Resuming lets the stage advance again.
     expect(runner.togglePause()).toBe(false);
-    drive(runner, 120);
+    drive(runner, LIFECYCLE_TICKS);
     expect(runner.currentStage).toBe(LifecycleStage.Remnant);
   });
 
   it('reset returns to the dust-cloud stage and rewinds the clock', () => {
     const clock = new Clock({ pace: 1 });
-    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), { clock });
-    drive(runner, 120);
+    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+      clock,
+      particleCount: WIRING_PARTICLES,
+    });
+    drive(runner, LIFECYCLE_TICKS);
     expect(runner.currentStage).toBe(LifecycleStage.Remnant);
     expect(clock.simTime).toBeGreaterThan(0);
 
@@ -124,8 +144,55 @@ describe('SimulationRunner (headless orchestration)', () => {
     expect(clock.simTime).toBe(0);
   });
 
+  it('rewinds to a previous state, then replays forward and resumes live', () => {
+    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
+
+    // Build up some live history and advance the lifecycle a few stages.
+    const order = (s: LifecycleStage): number => STAGE_ORDER.indexOf(s);
+    let liveElapsed = 0;
+    let liveStage = LifecycleStage.DustCloud;
+    // Enough ticks to get clear of the (deliberately slow) dust-cloud stage.
+    for (let i = 0; i < 150; i += 1) {
+      const t = runner.tick(1);
+      liveElapsed = t.elapsed;
+      liveStage = t.state.stage;
+      expect(t.fromHistory).toBe(false);
+    }
+    expect(order(liveStage)).toBeGreaterThan(order(LifecycleStage.DustCloud));
+
+    // Rewind: elapsed decreases and the stage regresses toward the past.
+    runner.setRewinding(true);
+    let rewound = runner.tick(1);
+    for (let i = 0; i < 30; i += 1) {
+      rewound = runner.tick(1);
+    }
+    expect(rewound.fromHistory).toBe(true);
+    expect(rewound.elapsed).toBeLessThan(liveElapsed);
+    expect(order(rewound.state.stage)).toBeLessThanOrEqual(order(liveStage));
+
+    // Play forward from the past: still replaying recorded history for a while.
+    runner.setRewinding(false);
+    const forward = runner.tick(1);
+    expect(forward.elapsed).toBeGreaterThanOrEqual(rewound.elapsed);
+
+    // Eventually it catches the frontier and resumes live stepping.
+    let caughtLive = false;
+    for (let i = 0; i < 60; i += 1) {
+      const t = runner.tick(1);
+      if (!t.fromHistory) {
+        caughtLive = true;
+        break;
+      }
+    }
+    expect(caughtLive).toBe(true);
+  });
+
   it('requests the default particle count from the kernel', () => {
-    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel());
+    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
     const { state } = runner.tick(0);
     // The fallback kernel caps particles at its own maximum; the runner should
     // request the documented default, and the effective count is non-zero.

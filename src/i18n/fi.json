@@ -1,7 +1,6 @@
 {
   "app.title": "Tähtijärjestelmän simulaatio",
   "app.subtitle": "Katso, kuinka tähtijärjestelmä syntyy pölypilvestä — ja kuolee.",
-
   "setup.heading": "Määritä tähtijärjestelmäsi",
   "setup.language": "Kieli",
   "setup.language.en": "Englanti",
@@ -19,13 +18,13 @@
   "setup.composition.hint": "Osuudet normalisoidaan niin, että summa on 100 %.",
   "setup.showEvents": "Näytä tietoa tähtijärjestelmän tapahtumista",
   "setup.start": "Käynnistä simulaatio",
-
   "preset.sunLike": "Auringon kaltainen",
   "preset.lowMass": "Pienimassainen tähti",
   "preset.highMass": "Suurimassainen tähti",
-
   "hud.pause": "Keskeytä",
   "hud.resume": "Jatka",
+  "hud.rewind": "Kelaa taaksepäin",
+  "hud.rewindStop": "Lopeta kelaus",
   "hud.reset": "Nollaa",
   "hud.timeScale": "Aikaskaala",
   "hud.zoomIn": "Lähennä",
@@ -37,7 +36,6 @@
   "hud.bodyCount": "{count, plural, =0 {Ei kiertäviä kappaleita} one {# kiertävä kappale} other {# kiertävää kappaletta}}",
   "hud.elapsed": "Kulunut: {time}",
   "hud.speed": "{value} sekunnissa",
-
   "time.year": "{count, plural, one {vuosi} other {vuotta}}",
   "time.plain": "{number} {unit}",
   "time.scaled": "{number} {scale} {unit}",
@@ -45,7 +43,6 @@
   "time.scale.million": "miljoonaa",
   "time.scale.billion": "miljardia",
   "time.scale.trillion": "biljoonaa",
-
   "stage.dustCloud": "Pölypilvi",
   "stage.protostarCoalescence": "Prototähti muodostuu",
   "stage.fusionIgnition": "Fuusion syttyminen",
@@ -53,18 +50,14 @@
   "stage.redGiant": "Punainen jättiläinen",
   "stage.death": "Kuolema",
   "stage.remnant": "Jäännös",
-
   "remnant.whiteDwarf": "valkoinen kääpiö",
   "remnant.neutronStar": "neutronitähti",
   "remnant.pulsar": "pulsari",
-
   "body.protoplanet": "protoplaneetta",
   "body.planet": "planeetta",
   "body.comet": "komeetta",
   "body.asteroid": "asteroidi",
-
   "hud.focus.body": "{body} #{id}",
-
   "event.collapseOnset": "Pölypilvi alkaa luhistua oman painovoimansa vaikutuksesta.",
   "event.protostarFormed": "Pilven keskelle on muodostunut prototähti.",
   "event.fusionIgnition": "Ydinfuusio on syttynyt — tähti on syntynyt!",
@@ -74,9 +67,7 @@
   "event.remnantFormed": "Tähdestä jää jäljelle {remnant}.",
   "event.bodyCaptured": "Vieraileva {body} on siepattu kiertoradalle.",
   "event.bodyEjected": "{body} on sinkoutunut ulos tähtijärjestelmästä.",
-
   "menu.centerOn": "Keskitä kohteeseen {target}",
-
   "info.heading": "Mikä tämä on?",
   "info.close": "Sulje",
   "info.protostar.title": "Prototähti",
@@ -102,5 +93,16 @@
   "info.comet.title": "Komeetta",
   "info.comet.desc": "Jäinen kappale, jolle kasvaa hehkuva pyrstö sen lähestyessä tähteä ja jäiden höyrystyessä. Pyrstö osoittaa aina poispäin tähdestä.",
   "info.note.captured": "Se on siepattu vakaalle kiertoradalle tähden ympärille.",
-  "info.note.passing": "Se on vain ohikulkumatkalla ja saattaa paeta järjestelmästä jälleen."
+  "info.note.passing": "Se on vain ohikulkumatkalla ja saattaa paeta järjestelmästä jälleen.",
+  "info.protoplanet.title": "Protoplaneetta",
+  "label.stat.mass": "Massa",
+  "label.stat.coreTemp": "Ytimen lämpötila",
+  "label.stat.surfaceTemp": "Pintalämpötila",
+  "label.stat.velocity": "Ratanopeus",
+  "label.stat.distance": "Etäisyys",
+  "hud.labels": "Näytä nimikkeet",
+  "event.bodyConsumed": "Planeetta on kiertynyt tähteen ja repeytynyt kappaleiksi.",
+  "hud.orbits": "Näytä radat",
+  "info.iceGiant.title": "Jaattilaisplaneetta (jaa)",
+  "info.iceGiant.desc": "Vedesta, ammoniakista ja metaanijaasta koostuva maailma kivisen ytimen ymparilla, kuten Uranus tai Neptunus. Se syntyi lumirajan takana mutta liian kaukana kaapatakseen paljon kaasua."
 }

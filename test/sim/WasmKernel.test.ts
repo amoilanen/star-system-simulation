@@ -9,8 +9,7 @@ import {
   type WasmKernelHandle,
   type WasmModule,
 } from '../../src/sim/WasmKernel';
-import { TsFallbackKernel } from '../../src/sim/TsFallbackKernel';
-import { BodyType, PARTICLE_STRIDE, BODY_STRIDE } from '../../src/sim/PhysicsKernel';
+import { BodyType, BODY_OFFSET, PARTICLE_STRIDE, BODY_STRIDE } from '../../src/sim/PhysicsKernel';
 import { SimEventType } from '../../src/sim/events';
 import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
 import type { CloudComposition, SimulationConfig } from '../../src/config/SimulationConfig';
@@ -71,6 +70,8 @@ function makeFakeModule(): { mod: WasmModule; particle: number[]; body: number[]
     events_ptr: () => EVENT_PTR,
     event_stride: () => 4,
     stage: () => LifecycleStage.MainSequence,
+    stage_progress: () => 0.5,
+    elapsed_sim_seconds: () => 1.6e13,
     free: () => {},
   };
 
@@ -138,68 +139,86 @@ describe('createKernel / feature detection', () => {
     kernel.init({ config: makeConfig(), particleCount: 10 });
     const result = kernel.step(1e14);
     expect(typeof result.stage).toBe('number');
-    expect(kernel.getParticleBuffer().length).toBe(10 * PARTICLE_STRIDE);
+    expect(typeof result.stageProgress).toBe('number');
+    // Dust may already be accreting, so the count is bounded by the seed count.
+    expect(kernel.getParticleBuffer().length).toBeLessThanOrEqual(10 * PARTICLE_STRIDE);
+    expect(kernel.getParticleBuffer().length).toBeGreaterThan(0);
     kernel.dispose();
   });
 });
 
-// --- Kernel parity: WASM ↔ TS fallback --------------------------------------
+// --- WASM kernel behavioural invariants -------------------------------------
 //
 // Runs only when the WASM package has been built (`npm run wasm:build`), which
-// the verification sequence does before `npm test`. Both kernels mirror the same
-// deterministic model, so their buffers agree within float tolerance and their
-// stage/event streams agree exactly on a small scenario.
+// the verification sequence does before `npm test`. The emergent accretion model
+// is order-dependent and is NOT bit-identical across JS and Rust, so instead of
+// cross-language parity we assert the WASM kernel obeys the same PHYSICAL
+// invariants as the TS reference (valid buffer layout, the stellar FSM advances,
+// and dust is physically depleted as it accretes).
 
 const wasmBinUrl = new URL('../../wasm/pkg/star_kernel_bg.wasm', import.meta.url);
 const wasmJsUrl = new URL('../../wasm/pkg/star_kernel.js', import.meta.url);
 const wasmBuilt = existsSync(fileURLToPath(wasmBinUrl)) && existsSync(fileURLToPath(wasmJsUrl));
-const describeParity = wasmBuilt ? describe : describe.skip;
+const describeWasm = wasmBuilt ? describe : describe.skip;
 
-function expectClose(actual: Float32Array, expected: Float32Array, tol: number): void {
-  expect(actual.length).toBe(expected.length);
-  for (let i = 0; i < expected.length; i += 1) {
-    const a = actual[i] ?? NaN;
-    const e = expected[i] ?? NaN;
-    expect(Math.abs(a - e), `lane ${i}: wasm=${a} ts=${e}`).toBeLessThanOrEqual(
-      tol + tol * Math.abs(e),
-    );
-  }
-}
-
-describeParity('WASM ↔ TS fallback parity (deterministic small scenario)', () => {
-  it('agrees on seeded buffers and stepped stage/event streams', async () => {
+describeWasm('WASM kernel behavioural invariants', () => {
+  it('seeds a valid buffer layout and advances the stellar lifecycle', async () => {
     const bytes = readFileSync(fileURLToPath(wasmBinUrl));
     const mod = await loadWasmModule({ module_or_path: new Uint8Array(bytes) });
 
     const config = makeConfig({ mass: 1 });
-    const particleCount = 24;
+    const particleCount = 64;
 
     const wasm = new WasmKernel(mod);
-    const ts = new TsFallbackKernel();
     wasm.init({ config, particleCount });
-    ts.init({ config, particleCount });
 
-    // Post-init parity: identical seeding (RNG + layout) up to float transcendentals.
-    expectClose(wasm.getParticleBuffer(), ts.getParticleBuffer(), 1e-3);
-    expectClose(wasm.getBodyBuffer(), ts.getBodyBuffer(), 1e-3);
+    // Post-init: correct interleaved buffer layout.
     expect(wasm.getParticleBuffer().length).toBe(particleCount * PARTICLE_STRIDE);
     expect(wasm.getBodyBuffer().length % BODY_STRIDE).toBe(0);
+    expect(wasm.getBodyBuffer().length).toBeGreaterThan(0);
+    // First seeded body is a bound protoplanet.
+    expect(wasm.getBodyBuffer()[BODY_OFFSET.type]).toBe(BodyType.Protoplanet);
+    expect(wasm.getBodyBuffer()[BODY_OFFSET.captured]).toBe(1);
 
-    // Small steps (below the visitor-spawn interval): stage + events agree exactly.
-    const dts = [1e14, 2e14, 1e14];
-    for (const dt of dts) {
-      const rw = wasm.step(dt);
-      const rt = ts.step(dt);
-      expect(rw.stage).toBe(rt.stage);
-      expect(rw.events.map((e) => e.type)).toEqual(rt.events.map((e) => e.type));
-      expectClose(wasm.getParticleBuffer(), ts.getParticleBuffer(), 1e-2);
-      expectClose(wasm.getBodyBuffer(), ts.getBodyBuffer(), 1e-2);
+    // Formation is accretion-driven AND rate-limited by the star's finite
+    // accretion rate (CORE_ACCRETION_RATE), so reaching ignition legitimately
+    // takes several hundred bounded orbital steps; the stellar clock then
+    // carries the run to the remnant.
+    const types = new Set<SimEventType>();
+    let stage = LifecycleStage.DustCloud;
+    for (let i = 0; i < 900 && stage !== LifecycleStage.Remnant; i += 1) {
+      const result = wasm.step(1e17);
+      for (const e of result.events) {
+        types.add(e.type);
+      }
+      stage = result.stage;
     }
-
-    // The scenario actually advanced the lifecycle FSM past the dust cloud.
-    expect(wasm.step(0).stage).toBeGreaterThan(LifecycleStage.DustCloud);
-
+    expect(stage).toBe(LifecycleStage.Remnant);
+    for (const stageEvent of [
+      SimEventType.CollapseOnset,
+      SimEventType.ProtostarFormed,
+      SimEventType.FusionIgnition,
+      SimEventType.RedGiantOnset,
+      SimEventType.DeathEvent,
+      SimEventType.RemnantFormed,
+    ]) {
+      expect(types.has(stageEvent)).toBe(true);
+    }
     wasm.dispose();
-    ts.dispose();
+  });
+
+  it('physically depletes dust as it accretes', async () => {
+    const bytes = readFileSync(fileURLToPath(wasmBinUrl));
+    const mod = await loadWasmModule({ module_or_path: new Uint8Array(bytes) });
+
+    const wasm = new WasmKernel(mod);
+    wasm.init({ config: makeConfig({ mass: 1 }), particleCount: 1500 });
+    const dust0 = wasm.getParticleBuffer().length / PARTICLE_STRIDE;
+    for (let i = 0; i < 60; i += 1) {
+      wasm.step(3e14);
+    }
+    const dust1 = wasm.getParticleBuffer().length / PARTICLE_STRIDE;
+    expect(dust1).toBeLessThan(dust0);
+    wasm.dispose();
   });
 });

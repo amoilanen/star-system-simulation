@@ -68,10 +68,14 @@ export const starFragmentShader = /* glsl */ `
     // Fresnel term brightens the limb into a corona rim.
     float fresnel = pow(1.0 - max(dot(vNormalW, vViewDir), 0.0), 2.5);
 
-    vec3 surface = mix(uColorEdge, uColorCore, hotSpots);
-    vec3 color = surface + uColorCore * fresnel * uGlow;
-    // Boost emission so the bloom pass produces a convincing glow.
-    color *= (0.8 + 0.6 * granulation) * (1.0 + uGlow * 0.5);
+    // Keep the surface close to the blackbody hue: a bounded granulation term
+    // modulates brightness without pushing every channel to 1.0, otherwise the
+    // ACES tone-map + bloom would desaturate all stages to the same white and
+    // the stage-to-stage colour change (e.g. a red giant) would be invisible.
+    vec3 surface = mix(uColorEdge, uColorCore, hotSpots) * (0.85 + 0.4 * granulation);
+    // Tinted rim glow, bounded so a hot star flares white-hot at the limb while
+    // a cool star's rim stays its own colour rather than blowing out.
+    vec3 color = surface + uColorCore * fresnel * (0.35 + 0.35 * uGlow);
 
     gl_FragColor = vec4(color, 1.0);
   }

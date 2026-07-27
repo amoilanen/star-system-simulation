@@ -1,7 +1,6 @@
 {
   "app.title": "Star System Simulation",
   "app.subtitle": "Watch a star system be born from a cloud of dust — and die.",
-
   "setup.heading": "Configure your star system",
   "setup.language": "Language",
   "setup.language.en": "English",
@@ -19,13 +18,13 @@
   "setup.composition.hint": "Fractions are normalized to sum to 100%.",
   "setup.showEvents": "Show information about star system events",
   "setup.start": "Start simulation",
-
   "preset.sunLike": "Sun-like",
   "preset.lowMass": "Low-mass star",
   "preset.highMass": "High-mass star",
-
   "hud.pause": "Pause",
   "hud.resume": "Resume",
+  "hud.rewind": "Rewind",
+  "hud.rewindStop": "Stop rewind",
   "hud.reset": "Reset",
   "hud.timeScale": "Time scale",
   "hud.zoomIn": "Zoom in",
@@ -37,7 +36,6 @@
   "hud.bodyCount": "{count, plural, =0 {No orbiting bodies} one {# orbiting body} other {# orbiting bodies}}",
   "hud.elapsed": "Elapsed: {time}",
   "hud.speed": "{value} / second",
-
   "time.year": "{count, plural, one {year} other {years}}",
   "time.plain": "{number} {unit}",
   "time.scaled": "{number} {scale} {unit}",
@@ -45,7 +43,6 @@
   "time.scale.million": "million",
   "time.scale.billion": "billion",
   "time.scale.trillion": "trillion",
-
   "stage.dustCloud": "Dust cloud",
   "stage.protostarCoalescence": "Protostar forming",
   "stage.fusionIgnition": "Fusion ignition",
@@ -53,18 +50,14 @@
   "stage.redGiant": "Red giant",
   "stage.death": "Death",
   "stage.remnant": "Remnant",
-
   "remnant.whiteDwarf": "white dwarf",
   "remnant.neutronStar": "neutron star",
   "remnant.pulsar": "pulsar",
-
   "body.protoplanet": "protoplanet",
   "body.planet": "planet",
   "body.comet": "comet",
   "body.asteroid": "asteroid",
-
   "hud.focus.body": "{body} #{id}",
-
   "event.collapseOnset": "The dust cloud begins to collapse under its own gravity.",
   "event.protostarFormed": "A protostar has formed at the center of the cloud.",
   "event.fusionIgnition": "Nuclear fusion has ignited — a star is born!",
@@ -74,9 +67,7 @@
   "event.remnantFormed": "The star leaves behind a {remnant}.",
   "event.bodyCaptured": "A visiting {body} has been captured into orbit.",
   "event.bodyEjected": "A {body} has been flung out of the star system.",
-
   "menu.centerOn": "Center on {target}",
-
   "info.heading": "What is this?",
   "info.close": "Close",
   "info.protostar.title": "Protostar",
@@ -102,5 +93,16 @@
   "info.comet.title": "Comet",
   "info.comet.desc": "An icy body that grows a glowing tail as it nears the star and its ices vaporize. The tail always points away from the star.",
   "info.note.captured": "It has been captured into a stable orbit around the star.",
-  "info.note.passing": "It is only passing through and may escape the system again."
+  "info.note.passing": "It is only passing through and may escape the system again.",
+  "info.protoplanet.title": "Protoplanet",
+  "label.stat.mass": "Mass",
+  "label.stat.coreTemp": "Core temp.",
+  "label.stat.surfaceTemp": "Surface temp.",
+  "label.stat.velocity": "Orbital speed",
+  "label.stat.distance": "Distance",
+  "hud.labels": "Show labels",
+  "event.bodyConsumed": "A planet has spiralled into the star and been torn apart.",
+  "hud.orbits": "Show orbits",
+  "info.iceGiant.title": "Ice giant",
+  "info.iceGiant.desc": "A world of water, ammonia and methane ices around a rocky core, like Uranus or Neptune. It formed beyond the snow line but too far out to capture much gas."
 }
