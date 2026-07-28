@@ -17,8 +17,9 @@ import {
   type SimulationConfig,
 } from '../config/SimulationConfig';
 import { DEFAULT_PRESET_ID, PRESETS, type SimulationPreset } from '../config/presets';
-import { determineFate, RemnantType } from '../config/fateModel';
+import { determineFate, isSubstellar, RemnantType } from '../config/fateModel';
 import { stellarMassFromCloud } from '../config/starFormation';
+import { solarToJupiterMasses } from '../sim/astro';
 import { i18n as sharedI18n, type I18n } from '../i18n/i18n';
 
 /**
@@ -28,9 +29,11 @@ import { i18n as sharedI18n, type I18n } from '../i18n/i18n';
  * because the cloud only turns about a third of itself into a star: reaching the
  * ~22 M☉ stellar mass where core collapse produces a BLACK HOLE takes a cloud of
  * roughly 90 M☉, which the old 40 M☉ ceiling could never supply. The bottom end
- * reaches the sub-stellar regime so the full spectrum is explorable.
+ * reaches well into the SUB-STELLAR regime — a 0.1 M☉ cloud assembles only
+ * ~0.04 M☉ (≈43 Jupiters), far below the 0.08 M☉ hydrogen-burning limit — so
+ * brown dwarfs are explorable rather than merely a rounding-error edge case.
  */
-export const MASS_MIN = 0.2;
+export const MASS_MIN = 0.1;
 export const MASS_MAX = 250;
 
 /** Slider positions across the logarithmic mass range (finer ⇒ smoother drag). */
@@ -42,6 +45,7 @@ const REMNANT_MESSAGE_IDS: Readonly<Record<RemnantType, string>> = {
   [RemnantType.NeutronStar]: 'remnant.neutronStar',
   [RemnantType.Pulsar]: 'remnant.pulsar',
   [RemnantType.BlackHole]: 'remnant.blackHole',
+  [RemnantType.BrownDwarf]: 'remnant.brownDwarf',
 };
 
 /**
@@ -258,8 +262,12 @@ export class SetupForm {
       metals,
     });
     const fate = determineFate(starMass, composition);
-    this.outcomeHint.textContent = this.i18n.translate(this.locale, 'setup.outcome', {
+    // A substellar cloud never makes a star at all, so the ordinary
+    // "forms a star, which ends as X" sentence would be simply untrue.
+    const messageId = isSubstellar(starMass) ? 'setup.outcome.substellar' : 'setup.outcome';
+    this.outcomeHint.textContent = this.i18n.translate(this.locale, messageId, {
       star: starMass >= 10 ? Math.round(starMass) : Number(starMass.toPrecision(2)),
+      jupiters: Math.round(solarToJupiterMasses(starMass)),
       remnant: this.t(REMNANT_MESSAGE_IDS[fate.remnant] ?? 'remnant.whiteDwarf'),
     });
   }

@@ -3,6 +3,7 @@ import {
   determineFate,
   effectiveFinalMass,
   remnantMass,
+  isSubstellar,
   fateModel,
   FATE_THRESHOLDS,
   RemnantType,
@@ -121,5 +122,73 @@ describe('determineFate — composition modifiers shift the outcome', () => {
 describe('fateModel', () => {
   it('delegates to determineFate', () => {
     expect(fateModel.determineFate(1, SOLAR)).toEqual(determineFate(1, SOLAR));
+  });
+});
+
+describe('bug 8 — a remnant is never heavier than the star it came from', () => {
+  it('keeps a low-mass star’s white dwarf below the progenitor mass', () => {
+    // The semi-empirical initial–final mass relation M_f = 0.4 + 0.11 M_i is
+    // calibrated on ≳0.8 M☉ progenitors. Applied literally to a red dwarf its
+    // CONSTANT term dominates, so a 0.07 M☉ star was "leaving behind" a 0.41
+    // M☉ white dwarf — six times its own mass, created from nothing.
+    for (const m of [0.05, 0.07, 0.1, 0.2, 0.4, 0.5, 0.8, 1, 3, 7]) {
+      expect(remnantMass(m, RemnantType.WhiteDwarf)).toBeLessThan(m);
+    }
+  });
+
+  it('never returns a remnant heavier than the progenitor for any remnant kind', () => {
+    for (const m of [0.05, 0.5, 1, 5, 9, 15, 25, 50, 100]) {
+      for (const remnant of [
+        RemnantType.WhiteDwarf,
+        RemnantType.NeutronStar,
+        RemnantType.Pulsar,
+        RemnantType.BlackHole,
+      ]) {
+        // Neutron stars/black holes only ever form from massive progenitors, so
+        // only check the kinds the fate model can actually produce at this mass.
+        if (remnant !== RemnantType.WhiteDwarf && m < FATE_THRESHOLDS.supernovaMinMass) {
+          continue;
+        }
+        expect(remnantMass(m, remnant)).toBeLessThan(m);
+      }
+    }
+  });
+});
+
+describe('substellar objects — a brown dwarf is not a dead star but a failed one', () => {
+  it('classifies anything below the hydrogen-burning limit as a brown dwarf', () => {
+    for (const m of [0.01, 0.03, 0.05, 0.079]) {
+      const fate = determineFate(m, SOLAR);
+      expect(fate.remnant).toBe(RemnantType.BrownDwarf);
+      // Nothing about it explodes: it never builds a core that can collapse.
+      expect(fate.supernova).toBe(false);
+      expect(isSubstellar(m)).toBe(true);
+    }
+  });
+
+  it('classifies anything at or above the limit as a real star', () => {
+    for (const m of [0.08, 0.1, 0.5, 1]) {
+      expect(isSubstellar(m)).toBe(false);
+      expect(determineFate(m, SOLAR).remnant).toBe(RemnantType.WhiteDwarf);
+    }
+  });
+
+  it('decides on the RAW mass, not the wind-stripped one', () => {
+    // The metallicity correction models line-driven winds, which are a property
+    // of hot, luminous massive stars. A 0.05 M☉ object has no such wind, so
+    // stripping mass from it before asking whether it can fuse would be
+    // backwards — and it must not flip a real star into a brown dwarf either.
+    const metalRich = { hydrogen: 0.68, helium: 0.22, metals: 0.1 };
+    expect(effectiveFinalMass(0.085, metalRich)).toBeLessThan(
+      FATE_THRESHOLDS.hydrogenBurningMinMass,
+    );
+    // ...yet it is still a star, because 0.085 M☉ CAN fuse hydrogen.
+    expect(determineFate(0.085, metalRich).remnant).toBe(RemnantType.WhiteDwarf);
+  });
+
+  it('keeps all of its mass — it never dies, so it never sheds anything', () => {
+    for (const m of [0.02, 0.05, 0.079]) {
+      expect(remnantMass(m, RemnantType.BrownDwarf)).toBe(m);
+    }
   });
 });

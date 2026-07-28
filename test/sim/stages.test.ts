@@ -1,35 +1,21 @@
 import { describe, it, expect } from 'vitest';
-import { StageMachine, STAGE_ORDER, STAGE_ENTRY_EVENT, stageDurations } from '../../src/sim/stages';
-import { EventBus, SimEventType, type SimulationEvent } from '../../src/sim/events';
-import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
+import { STAGE_ORDER, STAGE_ENTRY_EVENT, DEATH_PHASES, stageDurations } from '../../src/sim/stages';
+import { EVENT_MESSAGE_IDS, SimEventType } from '../../src/sim/events';
+import { LifecycleStage } from '../../src/config/fateModel';
 import { CATALOGS } from '../../src/i18n/i18n';
-import type { CloudComposition, SimulationConfig } from '../../src/config/SimulationConfig';
+import type { CloudComposition } from '../../src/config/SimulationConfig';
+
+// NB `stages.ts` deliberately holds no state machine: both kernels drive the
+// progression themselves, because only they know the accreted core mass that
+// makes FORMATION physics-driven rather than timed — and only they know that a
+// SUBSTELLAR object short-circuits the order entirely (a brown dwarf never
+// ignites, so it goes straight from FusionIgnition to Remnant). What lives here
+// is the shared ordering, the entry events, the death's internal structure and
+// the illustrative durations, so that is what this file tests. End-to-end stage
+// and event behaviour is covered against the real kernels in
+// `TsFallbackKernel.test.ts`, `WasmKernel.test.ts` and the simulation battery.
 
 const SOLAR_COMPOSITION: CloudComposition = { hydrogen: 0.74, helium: 0.24, metals: 0.02 };
-
-function makeConfig(overrides: Partial<SimulationConfig> = {}): SimulationConfig {
-  return {
-    locale: 'en',
-    composition: SOLAR_COMPOSITION,
-    mass: 1,
-    cloudExtent: 50,
-    pace: 0.5,
-    showEventAnnotations: true,
-    ...overrides,
-  };
-}
-
-/** Run the FSM to completion by feeding one huge dt and collect emitted events. */
-function runToRemnant(config: SimulationConfig): SimulationEvent[] {
-  const bus = new EventBus();
-  const events: SimulationEvent[] = [];
-  bus.subscribe((e) => events.push(e));
-  const machine = new StageMachine(config, bus);
-  // A dt far larger than any lifecycle guarantees we cross every boundary.
-  machine.update(1e30);
-  expect(machine.isTerminal).toBe(true);
-  return events;
-}
 
 describe('STAGE_ORDER', () => {
   it('walks the full lifecycle in the spec order', () => {
@@ -42,6 +28,54 @@ describe('STAGE_ORDER', () => {
       LifecycleStage.Death,
       LifecycleStage.Remnant,
     ]);
+  });
+
+  it('is strictly increasing, so "later stage" comparisons are sound', () => {
+    // Both kernels compare stages with `<` / `>=` ("has the star ignited yet?",
+    // "is it past the death?"), which only means anything while the enum's
+    // numeric order matches the timeline.
+    for (let i = 1; i < STAGE_ORDER.length; i += 1) {
+      expect(STAGE_ORDER[i]!).toBeGreaterThan(STAGE_ORDER[i - 1]!);
+    }
+  });
+});
+
+describe('STAGE_ENTRY_EVENT', () => {
+  it('gives every stage except the initial one exactly one entry event', () => {
+    // DustCloud is where the simulation begins, so nothing is ever "entered".
+    expect(STAGE_ENTRY_EVENT[LifecycleStage.DustCloud]).toBeUndefined();
+    const entered = STAGE_ORDER.filter((s) => s !== LifecycleStage.DustCloud);
+    for (const stage of entered) {
+      expect(STAGE_ENTRY_EVENT[stage]).toBeDefined();
+    }
+    // Six transitions between seven stages ⇒ six events, never duplicated.
+    const events = entered.map((s) => STAGE_ENTRY_EVENT[s]);
+    expect(events).toHaveLength(6);
+    expect(new Set(events).size).toBe(6);
+  });
+
+  it('maps each stage to the event that announces it, in order', () => {
+    const events = STAGE_ORDER.filter((s) => s !== LifecycleStage.DustCloud).map(
+      (s) => STAGE_ENTRY_EVENT[s],
+    );
+    expect(events).toEqual([
+      SimEventType.CollapseOnset,
+      SimEventType.ProtostarFormed,
+      SimEventType.FusionIgnition,
+      SimEventType.RedGiantOnset,
+      SimEventType.DeathEvent,
+      SimEventType.RemnantFormed,
+    ]);
+  });
+
+  it('has a translatable message for every entry event in every locale', () => {
+    for (const stage of STAGE_ORDER.filter((s) => s !== LifecycleStage.DustCloud)) {
+      const messageId = EVENT_MESSAGE_IDS[STAGE_ENTRY_EVENT[stage]!];
+      expect(messageId).toBeTruthy();
+      for (const [locale, catalog] of Object.entries(CATALOGS)) {
+        expect(catalog[messageId], `${locale} is missing ${messageId}`).toBeTruthy();
+      }
+    }
   });
 });
 
@@ -61,132 +95,36 @@ describe('stageDurations', () => {
     const high = stageDurations(20, SOLAR_COMPOSITION)[LifecycleStage.MainSequence];
     expect(low).toBeGreaterThan(sun);
     expect(sun).toBeGreaterThan(high);
+    // The scaling is steep: a 20 M☉ star burns out >1000× faster than the Sun.
+    expect(sun / high).toBeGreaterThan(1000);
+  });
+
+  it('puts a solar main sequence at ~10 Gyr', () => {
+    const sun = stageDurations(1, SOLAR_COMPOSITION)[LifecycleStage.MainSequence];
+    const gyr = 1e9 * 365.25 * 24 * 3600;
+    expect(sun / gyr).toBeGreaterThan(8);
+    expect(sun / gyr).toBeLessThan(12);
+  });
+
+  it('shortens the main sequence as metallicity rises (higher opacity)', () => {
+    const poor = stageDurations(1, { hydrogen: 0.79, helium: 0.209, metals: 0.001 });
+    const rich = stageDurations(1, { hydrogen: 0.68, helium: 0.22, metals: 0.1 });
+    expect(rich[LifecycleStage.MainSequence]).toBeLessThan(poor[LifecycleStage.MainSequence]);
+    // Never zero or negative, however extreme the composition.
+    expect(rich[LifecycleStage.MainSequence]).toBeGreaterThan(0);
   });
 });
 
-describe('StageMachine transitions', () => {
-  it('starts in DustCloud and reaches Remnant', () => {
-    const machine = new StageMachine(makeConfig(), new EventBus());
-    expect(machine.currentStage).toBe(LifecycleStage.DustCloud);
-    expect(machine.isTerminal).toBe(false);
-    machine.update(1e30);
-    expect(machine.currentStage).toBe(LifecycleStage.Remnant);
-    expect(machine.isTerminal).toBe(true);
+describe('DEATH_PHASES', () => {
+  it('orders shock breakout before peak luminosity, both inside the stage', () => {
+    expect(DEATH_PHASES.shockBreakout).toBeGreaterThan(0);
+    expect(DEATH_PHASES.shockBreakout).toBeLessThan(DEATH_PHASES.peakLuminosity);
+    expect(DEATH_PHASES.peakLuminosity).toBeLessThan(1);
   });
 
-  it('emits exactly one event per transition, in stage-entry order', () => {
-    const events = runToRemnant(makeConfig({ mass: 1 }));
-    expect(events.map((e) => e.type)).toEqual([
-      SimEventType.CollapseOnset, // → ProtostarCoalescence
-      SimEventType.ProtostarFormed, // → FusionIgnition
-      SimEventType.FusionIgnition, // → MainSequence
-      SimEventType.RedGiantOnset, // → RedGiant
-      SimEventType.DeathEvent, // → Death
-      SimEventType.RemnantFormed, // → Remnant
-    ]);
-    // Six transitions between seven stages ⇒ six events, never duplicated.
-    expect(events).toHaveLength(6);
-  });
-
-  it('maps each entry event to its stage per STAGE_ENTRY_EVENT', () => {
-    const events = runToRemnant(makeConfig());
-    const entryStages = STAGE_ORDER.filter((s) => s !== LifecycleStage.DustCloud);
-    entryStages.forEach((stage, i) => {
-      expect(events[i]?.type).toBe(STAGE_ENTRY_EVENT[stage]);
-    });
-  });
-
-  it('stamps each event with a valid, translatable messageId', () => {
-    const events = runToRemnant(makeConfig());
-    for (const event of events) {
-      expect(event.messageId).toBeTruthy();
-      expect(CATALOGS.en[event.messageId], `en missing ${event.messageId}`).toBeTruthy();
-      expect(CATALOGS.fi[event.messageId], `fi missing ${event.messageId}`).toBeTruthy();
-    }
-  });
-
-  it('stamps events with non-decreasing sim times matching the timeline', () => {
-    const config = makeConfig({ mass: 1 });
-    const events = runToRemnant(config);
-    const durations = stageDurations(config.mass, config.composition);
-
-    // Cumulative sim-time at which the first two stages are entered.
-    const afterDust = durations[LifecycleStage.DustCloud];
-    const afterProto = afterDust + durations[LifecycleStage.ProtostarCoalescence];
-    expect(events[0]?.simTime).toBeCloseTo(afterDust, 3);
-    expect(events[1]?.simTime).toBeCloseTo(afterProto, 3);
-
-    const times = events.map((e) => e.simTime);
-    for (let i = 1; i < times.length; i += 1) {
-      expect(times[i]).toBeGreaterThan(times[i - 1] as number);
-    }
-  });
-
-  it('advances one boundary at a time when fed small dt increments', () => {
-    const config = makeConfig({ mass: 1 });
-    const durations = stageDurations(config.mass, config.composition);
-    const bus = new EventBus();
-    const machine = new StageMachine(config, bus);
-
-    // Feed exactly the DustCloud duration ⇒ transition into ProtostarCoalescence.
-    machine.update(durations[LifecycleStage.DustCloud]);
-    expect(machine.currentStage).toBe(LifecycleStage.ProtostarCoalescence);
-    const drained = bus.drain();
-    expect(drained).toHaveLength(1);
-    expect(drained[0]?.type).toBe(SimEventType.CollapseOnset);
-  });
-
-  it('ignores non-positive or non-finite dt (paused clock, A6)', () => {
-    const bus = new EventBus();
-    const machine = new StageMachine(makeConfig(), bus);
-    machine.update(0);
-    machine.update(-5);
-    machine.update(Number.NaN);
-    machine.update(Number.POSITIVE_INFINITY);
-    expect(machine.currentStage).toBe(LifecycleStage.DustCloud);
-    expect(machine.elapsedSimTime).toBe(0);
-    expect(bus.pending).toBe(0);
-  });
-
-  it('reset returns to the initial stage and clears sim time', () => {
-    const machine = new StageMachine(makeConfig(), new EventBus());
-    machine.update(1e30);
-    expect(machine.isTerminal).toBe(true);
-    machine.reset();
-    expect(machine.currentStage).toBe(LifecycleStage.DustCloud);
-    expect(machine.elapsedSimTime).toBe(0);
-    expect(machine.isTerminal).toBe(false);
-  });
-});
-
-describe('death-path selection (FR-4)', () => {
-  it('low/intermediate mass emits a quiet white-dwarf death', () => {
-    const events = runToRemnant(makeConfig({ mass: 1 }));
-    const death = events.find((e) => e.type === SimEventType.DeathEvent);
-    const remnant = events.find((e) => e.type === SimEventType.RemnantFormed);
-    expect(death?.data).toEqual({ supernova: false });
-    expect(remnant?.data).toEqual({ remnant: RemnantType.WhiteDwarf, supernova: false });
-  });
-
-  it('high mass emits supernova → neutron star', () => {
-    // ~10 M☉ effective → above supernova (8) but below pulsar (12) threshold.
-    const events = runToRemnant(makeConfig({ mass: 10 }));
-    const death = events.find((e) => e.type === SimEventType.DeathEvent);
-    const remnant = events.find((e) => e.type === SimEventType.RemnantFormed);
-    expect(death?.data).toEqual({ supernova: true });
-    expect(remnant?.data).toEqual({ remnant: RemnantType.NeutronStar, supernova: true });
-  });
-
-  it('very high mass emits supernova → pulsar', () => {
-    const events = runToRemnant(makeConfig({ mass: 20 }));
-    const death = events.find((e) => e.type === SimEventType.DeathEvent);
-    const remnant = events.find((e) => e.type === SimEventType.RemnantFormed);
-    expect(death?.data).toEqual({ supernova: true });
-    expect(remnant?.data).toEqual({ remnant: RemnantType.Pulsar, supernova: true });
-  });
-
-  it('exposes the pre-computed fate via fateOutcome', () => {
-    const machine = new StageMachine(makeConfig({ mass: 20 }), new EventBus());
-    expect(machine.fateOutcome).toEqual({ supernova: true, remnant: RemnantType.Pulsar });
+  it('reserves enough steps for the death to be watchable', () => {
+    expect(DEATH_PHASES.minSteps).toBeGreaterThan(1);
+    // The shock must not land on the very first step, or there is no build-up.
+    expect(DEATH_PHASES.minSteps * DEATH_PHASES.shockBreakout).toBeGreaterThan(1);
   });
 });

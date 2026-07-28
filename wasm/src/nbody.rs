@@ -30,10 +30,70 @@ pub const SOFTENING: f64 = 0.35;
 pub const MAX_PARTICLES: usize = 4000;
 
 /// Maximum integration substeps per kernel `step` call.
-pub const MAX_SUBSTEPS: usize = 16;
+pub const MAX_SUBSTEPS: usize = 64;
 
-/// Fixed internal integration timestep (dimensionless visual seconds).
+/// Largest internal integration timestep (dimensionless visual seconds).
 pub const INTERNAL_DT: f64 = 1.0 / 60.0;
+
+/// Largest orbital phase angle (radians) one substep may advance — the CFL-type
+/// accuracy condition `h * omega <= ORBIT_RESOLUTION` for the FASTEST orbit in
+/// the system (mirror of `ORBIT_RESOLUTION` in the TS fallback).
+///
+/// Semi-implicit Euler is symplectic only CONDITIONALLY: its energy error grows
+/// with `h * omega` and it destabilizes past `h * omega ~ 2`. Since
+/// `omega = sqrt(mu / (r^2 + eps^2)^1.5)` grows with cloud mass and shrinks with
+/// orbit size, a heavy COMPACT cloud (78 M_sun across only 25 AU) under-sampled
+/// its innermost orbit and the integrator MANUFACTURED energy — the inner planet
+/// flipped from bound to unbound in one step and was flung to r ~ 550 AU with no
+/// physical cause. Bounding the substep by the shortest dynamical time actually
+/// present fixes it; 0.3 rad is ~21 substeps per innermost orbit.
+pub const ORBIT_RESOLUTION: f64 = 0.3;
+
+/// PERIAPSIS distance of the conic a body is on: `q = L^2 / (mu (1 + e))` with
+/// `e = sqrt(1 + 2 E L^2 / mu^2)` (mirror of `periapsisDistance`).
+///
+/// Closest approach — not the body's present distance — is where an orbit is
+/// hardest to integrate, because that is where it moves fastest. A planet
+/// sitting quietly at 3.2 AU can be diving to 1.0 AU inside the very next step,
+/// and a timestep chosen for 3.2 AU badly under-resolves that passage; that is
+/// exactly where the integrator still manufactured energy after a CFL guard
+/// keyed on the CURRENT radius. The `p/(1+e)` form stays finite for
+/// near-parabolic orbits and is valid for hyperbolic ones too.
+#[must_use]
+pub fn periapsis_distance(mu: f64, pos: Vec3, vel: Vec3) -> f64 {
+    let r = magnitude(pos);
+    let v2 = vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2];
+    let l = [
+        pos[1] * vel[2] - pos[2] * vel[1],
+        pos[2] * vel[0] - pos[0] * vel[2],
+        pos[0] * vel[1] - pos[1] * vel[0],
+    ];
+    let l2 = l[0] * l[0] + l[1] * l[1] + l[2] * l[2];
+    if !(mu > 0.0) || !l2.is_finite() {
+        return r;
+    }
+    let energy = 0.5 * v2 - mu / (r * r + SOFTENING * SOFTENING).sqrt();
+    let ecc = (1.0 + (2.0 * energy * l2) / (mu * mu)).max(0.0).sqrt();
+    let q = l2 / (mu * (1.0 + ecc));
+    if q.is_finite() {
+        q.min(r)
+    } else {
+        r
+    }
+}
+
+/// Largest substep that still resolves an orbit whose closest approach to the
+/// star is `r_min`, per the `ORBIT_RESOLUTION` condition. Never exceeds
+/// `INTERNAL_DT`.
+#[must_use]
+pub fn stable_substep(mu: f64, softening: f64, r_min: f64) -> f64 {
+    let r2 = r_min.max(0.0).powi(2) + softening * softening;
+    let omega = (mu.max(0.0) / r2.powf(1.5)).sqrt();
+    if !(omega > 0.0) || !omega.is_finite() {
+        return INTERNAL_DT;
+    }
+    INTERNAL_DT.min(ORBIT_RESOLUTION / omega)
+}
 
 // --- Emergent-accretion constants (mirror the TS fallback) ------------------
 
@@ -229,18 +289,42 @@ pub fn circular_speed(mu: f64, softening: f64, r: f64) -> f64 {
     }
 }
 
-/// Advance a body one symplectic (semi-implicit) Euler substep under the softened
-/// central force. Returns fresh position/velocity; the symplectic form keeps
-/// bounded orbits bounded and conserves the softened energy well. Mirrors
-/// `integrateOrbit` in the TS fallback.
+/// Advance a body one VELOCITY-VERLET substep under the softened central force
+/// (mirror of `integrateOrbit`):
+///
+///   v_half = v + a(x)*h/2 ;  x' = x + v_half*h ;  v' = v_half + a(x')*h/2
+///
+/// Symplectic (bounded orbits stay bounded, no secular drift) and second-order —
+/// but the reason it replaced semi-implicit Euler is that its position and
+/// velocity are SYNCHRONIZED.
+///
+/// Euler's are not: it returns `v` a half-step ahead of `x`, so the pair is not a
+/// point on the true trajectory. The instantaneous energy computed from it
+/// oscillates by O(h*omega), largest exactly at periapsis where the body moves
+/// fastest — and that is the number the simulation makes DECISIONS from. A
+/// marginally-bound eccentric planet was reported unbound on every perihelion
+/// pass (E flipping -46 -> +15 and back, while the orbit never changed), and a
+/// visitor's capture-or-escape is classified from the same quantity. Verlet's
+/// error is O(h^2) and synchronized, so the reported state IS the physical state.
 #[must_use]
 pub fn integrate_orbit(pos: Vec3, vel: Vec3, mu: f64, softening: f64, h: f64) -> (Vec3, Vec3) {
-    let a = softened_accel(mu, softening, pos);
-    let nvel: Vec3 = [vel[0] + a[0] * h, vel[1] + a[1] * h, vel[2] + a[2] * h];
+    let half = 0.5 * h;
+    let a0 = softened_accel(mu, softening, pos);
+    let v_half: Vec3 = [
+        vel[0] + a0[0] * half,
+        vel[1] + a0[1] * half,
+        vel[2] + a0[2] * half,
+    ];
     let npos: Vec3 = [
-        pos[0] + nvel[0] * h,
-        pos[1] + nvel[1] * h,
-        pos[2] + nvel[2] * h,
+        pos[0] + v_half[0] * h,
+        pos[1] + v_half[1] * h,
+        pos[2] + v_half[2] * h,
+    ];
+    let a1 = softened_accel(mu, softening, npos);
+    let nvel: Vec3 = [
+        v_half[0] + a1[0] * half,
+        v_half[1] + a1[1] * half,
+        v_half[2] + a1[2] * half,
     ];
     (npos, nvel)
 }
@@ -437,5 +521,59 @@ mod tests {
         assert!(near.contains(&0));
         assert!(near.contains(&1));
         assert!(!near.contains(&2), "far point must not be a neighbour");
+    }
+}
+
+#[cfg(test)]
+mod cfl_tests {
+    use super::*;
+
+    #[test]
+    fn substep_always_satisfies_the_orbit_resolution_condition() {
+        // h * omega <= ORBIT_RESOLUTION for the fastest orbit present, and never
+        // above the fixed ceiling for slow ones. Violating this is what let
+        // semi-implicit Euler manufacture energy and eject an inner planet.
+        for mu in [50.0_f64, 200.0, 1000.0, 5000.0] {
+            for r in [0.3_f64, 1.0, 5.0, 40.0] {
+                let h = stable_substep(mu, SOFTENING, r);
+                let omega = (mu / (r * r + SOFTENING * SOFTENING).powf(1.5)).sqrt();
+                assert!(h * omega <= ORBIT_RESOLUTION + 1e-9);
+                assert!(h <= INTERNAL_DT + 1e-12);
+                assert!(h > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn periapsis_is_below_the_current_radius_for_an_eccentric_orbit() {
+        // Closest approach is where a body moves fastest, so that is what must
+        // size the substep: a planet at 3.2 AU can be diving to ~1 AU next step.
+        let pos = [3.2, 0.0, 0.0];
+        let vel = [0.0, 0.0, circular_speed(400.0, SOFTENING, 3.2) * 0.45];
+        let q = periapsis_distance(400.0, pos, vel);
+        assert!(q > 0.0 && q < 1.2, "periapsis {q} not inside the orbit");
+        assert!(
+            stable_substep(400.0, SOFTENING, q) < stable_substep(400.0, SOFTENING, magnitude(pos))
+        );
+    }
+
+    #[test]
+    fn periapsis_of_a_circular_orbit_is_the_orbit_radius_but_never_larger() {
+        // The estimate mixes the SOFTENED energy with the Kepler conic formula,
+        // so it slightly UNDER-states the periapsis (~9% at 4 AU). That error is
+        // in the safe direction: a smaller periapsis buys a finer substep, so
+        // the guard can only ever over-resolve, never under-resolve, an orbit.
+        let r = 4.0;
+        let pos = [r, 0.0, 0.0];
+        let vel = [0.0, 0.0, circular_speed(400.0, SOFTENING, r)];
+        let q = periapsis_distance(400.0, pos, vel);
+        assert!(
+            q <= r,
+            "periapsis {q} must not exceed the current radius {r}"
+        );
+        assert!(
+            q > 0.8 * r,
+            "periapsis {q} unreasonably below the radius {r}"
+        );
     }
 }

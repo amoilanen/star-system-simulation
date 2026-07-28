@@ -25,6 +25,12 @@ import {
   ParticleKind,
   perpendicularTo,
   mergeRadius,
+  periapsisDistance,
+  softenedAccel,
+  stableSubstep,
+  SOFTENING,
+  ORBIT_RESOLUTION,
+  INTERNAL_DT,
 } from '../../src/sim/TsFallbackKernel';
 import { mainSequenceRadius } from '../../src/render/starVisual';
 import { orbitalElements, orbitPathPoints } from '../../src/render/orbitPath';
@@ -38,7 +44,12 @@ import {
 } from '../../src/sim/PhysicsKernel';
 import { SimEventType } from '../../src/sim/events';
 import { DEATH_PHASES } from '../../src/sim/stages';
-import { LifecycleStage } from '../../src/config/fateModel';
+import {
+  LifecycleStage,
+  RemnantType,
+  determineFate,
+  FATE_THRESHOLDS,
+} from '../../src/config/fateModel';
 import { cloudMassForStar, stellarMassFromCloud } from '../../src/config/starFormation';
 import { GAS_GIANT_MIN_EARTH_MASSES, ICE_GIANT_MIN_EARTH_MASSES } from '../../src/ui/bodyInfo';
 import { Clock } from '../../src/sim/Clock';
@@ -1263,6 +1274,286 @@ describe('the death is a watchable, physically staged sequence', () => {
     const max = Math.max(...radii);
     expect(min).toBeGreaterThan(0);
     expect(max / min).toBeLessThan(3);
+    kernel.dispose();
+  });
+});
+
+describe('bug 7 — the integrator never manufactures the energy that ejects a planet', () => {
+  // A HEAVY, COMPACT cloud is the hard case: mu scales with the cloud mass while
+  // the innermost orbit shrinks with the cloud extent, so the innermost orbital
+  // rate omega = sqrt(mu / (r^2 + eps^2)^1.5) is at its largest. With a fixed
+  // timestep the substep no longer resolved that orbit (h*omega ~ 1 at apoapsis
+  // and past the h*omega = 2 stability limit at periapsis), and semi-implicit
+  // Euler ADDED energy: the inner planet flipped from bound to unbound in a
+  // single step and left the system at ~550 AU, with nothing pulling on it.
+
+  /** Softened specific orbital energy of every planet/protoplanet in the buffer. */
+  function planetEnergies(kernel: TsFallbackKernel, mu: number): number[] {
+    const buf = kernel.getBodyBuffer();
+    const out: number[] = [];
+    for (let i = 0; i < buf.length / BODY_STRIDE; i += 1) {
+      const b = i * BODY_STRIDE;
+      const type = buf[b + BODY_OFFSET.type] as BodyType;
+      if (type !== BodyType.Planet && type !== BodyType.Protoplanet) {
+        continue;
+      }
+      const r = Math.hypot(
+        buf[b + BODY_OFFSET.x]!,
+        buf[b + BODY_OFFSET.y]!,
+        buf[b + BODY_OFFSET.z]!,
+      );
+      const v2 =
+        buf[b + BODY_OFFSET.vx]! ** 2 +
+        buf[b + BODY_OFFSET.vy]! ** 2 +
+        buf[b + BODY_OFFSET.vz]! ** 2;
+      out.push(0.5 * v2 - mu / Math.sqrt(r * r + SOFTENING * SOFTENING));
+    }
+    return out;
+  }
+
+  it('keeps every planet bound in a heavy, compact cloud', () => {
+    const mass = cloudMassForStar(18, 0.05);
+    const config = makeConfig({
+      mass,
+      cloudExtent: 25,
+      pace: 1,
+      composition: { hydrogen: 0.7175, helium: 0.2325, metals: 0.05 },
+    });
+    const mu = orbitalMu(mass);
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config, particleCount: 600 });
+    for (let i = 0; i < 400; i += 1) {
+      kernel.step(1e14);
+      for (const energy of planetEnergies(kernel, mu)) {
+        // Negative == gravitationally bound. Nothing in the model can unbind a
+        // planet while the star lives, so a positive energy is the integrator's.
+        expect(energy).toBeLessThan(0);
+      }
+    }
+    kernel.dispose();
+  });
+
+  it('resolves an eccentric orbit at PERIAPSIS, not merely where the body is now', () => {
+    // Closest approach is where a body moves fastest, so that is what must set
+    // the substep: a planet sitting quietly at 3.2 AU can be diving to 1.0 AU
+    // inside the very next step. Sizing the step for its CURRENT distance left
+    // the periapsis passage under-resolved and a jumped 2.3 AU -> unbound.
+    const pos: Vec3 = [3.2, 0, 0];
+    // Slow, highly eccentric orbit: same distance, far smaller periapsis.
+    const vel: Vec3 = [0, 0, circularSpeed(400, SOFTENING, 3.2) * 0.45];
+    const q = periapsisDistance(400, pos, vel);
+    expect(q).toBeLessThan(1.2);
+    expect(q).toBeGreaterThan(0);
+    // ...and the substep chosen for that periapsis is far finer than the one the
+    // body's present distance would have suggested.
+    expect(stableSubstep(400, SOFTENING, q)).toBeLessThan(
+      stableSubstep(400, SOFTENING, magnitude(pos)),
+    );
+  });
+
+  it('never advances a substep past the orbit-resolution (CFL) condition', () => {
+    // h * omega <= ORBIT_RESOLUTION for the fastest orbit, and never above the
+    // fixed ceiling for slow ones.
+    for (const mu of [50, 200, 1000, 5000]) {
+      for (const r of [0.3, 1, 5, 40]) {
+        const h = stableSubstep(mu, SOFTENING, r);
+        const omega = Math.sqrt(mu / Math.pow(r * r + SOFTENING * SOFTENING, 1.5));
+        expect(h * omega).toBeLessThanOrEqual(ORBIT_RESOLUTION + 1e-9);
+        expect(h).toBeLessThanOrEqual(INTERNAL_DT + 1e-12);
+        expect(h).toBeGreaterThan(0);
+      }
+    }
+  });
+});
+
+describe('bug 9 — the reported orbital state is the PHYSICAL state', () => {
+  it('never reports a bound eccentric planet as unbound at periapsis', () => {
+    // Reproduces the real failure: a weakly-bound, very eccentric planet
+    // (E0 = -46, periapsis ~0.9 AU) in one of the heaviest clouds. Semi-implicit
+    // Euler returns v a HALF-STEP ahead of x, so the pair it hands back is not a
+    // point on the trajectory; the instantaneous energy derived from it swings
+    // by O(h*omega), worst exactly at periapsis where the body is fastest. The
+    // planet was therefore reported UNBOUND on every perihelion pass even though
+    // its orbit never changed — and that number is not cosmetic: `classifyVisitor`
+    // decides a comet's capture-or-escape from precisely this quantity.
+    const mu = 1232;
+    const a = 13.4;
+    const ecc = 0.93;
+    const apoapsis = a * (1 + ecc);
+    // Angular momentum of the conic, so the orbit really has this shape.
+    const angularMomentum = Math.sqrt(mu * a * (1 - ecc * ecc));
+    const start: Vec3 = [apoapsis, 0, 0];
+    const startVel: Vec3 = [0, 0, angularMomentum / apoapsis];
+
+    const energyOf = (p: Vec3, v: Vec3): number => totalSpecificEnergySoftened(mu, SOFTENING, p, v);
+    const initial = energyOf(start, startVel);
+    expect(initial).toBeLessThan(0);
+
+    const h = stableSubstep(mu, SOFTENING, periapsisDistance(mu, start, startVel));
+
+    /** The previous integrator, kept here purely to pin the regression. */
+    const semiImplicitEuler = (p: Vec3, v: Vec3): { pos: Vec3; vel: Vec3 } => {
+      const acc = softenedAccel(mu, SOFTENING, p);
+      const nv: Vec3 = [v[0] + acc[0] * h, v[1] + acc[1] * h, v[2] + acc[2] * h];
+      return { pos: [p[0] + nv[0] * h, p[1] + nv[1] * h, p[2] + nv[2] * h], vel: nv };
+    };
+
+    const countSpuriousEscapes = (
+      advance: (p: Vec3, v: Vec3) => { pos: Vec3; vel: Vec3 },
+    ): { escapes: number; sawPeriapsis: boolean } => {
+      let pos = start;
+      let vel = startVel;
+      let escapes = 0;
+      let minRadius = Infinity;
+      for (let i = 0; i < 40000; i += 1) {
+        const next = advance(pos, vel);
+        pos = next.pos;
+        vel = next.vel;
+        minRadius = Math.min(minRadius, magnitude(pos));
+        if (energyOf(pos, vel) >= 0) {
+          escapes += 1;
+        }
+      }
+      // Several perihelion passages really were sampled.
+      return { escapes, sawPeriapsis: minRadius < 1.5 };
+    };
+
+    const euler = countSpuriousEscapes(semiImplicitEuler);
+    const verlet = countSpuriousEscapes((p, v) => integrateOrbit(p, v, mu, SOFTENING, h));
+
+    expect(euler.sawPeriapsis).toBe(true);
+    expect(verlet.sawPeriapsis).toBe(true);
+    // The bug, pinned: the old scheme declared this bound planet unbound.
+    expect(euler.escapes).toBeGreaterThan(0);
+    // The fix: velocity-Verlet keeps x and v synchronized, so it never does.
+    expect(verlet.escapes).toBe(0);
+  });
+
+  it('conserves energy far better than the scheme it replaced', () => {
+    const mu = 1232;
+    let pos: Vec3 = [4.5, 0, 0];
+    let vel: Vec3 = [0, 0, circularSpeed(mu, SOFTENING, 4.5) * 0.62];
+    const initial = totalSpecificEnergySoftened(mu, SOFTENING, pos, vel);
+    const h = stableSubstep(mu, SOFTENING, periapsisDistance(mu, pos, vel));
+    let worst = 0;
+    for (let i = 0; i < 20000; i += 1) {
+      const next = integrateOrbit(pos, vel, mu, SOFTENING, h);
+      pos = next.pos;
+      vel = next.vel;
+      worst = Math.max(
+        worst,
+        Math.abs(totalSpecificEnergySoftened(mu, SOFTENING, pos, vel) - initial) /
+          Math.abs(initial),
+      );
+    }
+    // Symplectic: the error OSCILLATES within a bound rather than drifting, and
+    // that bound is ~6x tighter than semi-implicit Euler's at the same timestep.
+    expect(worst).toBeLessThan(0.05);
+  });
+});
+
+describe('brown dwarfs — a cloud too light to make a star never makes one', () => {
+  /** A cloud whose star-formation budget lands well below 0.08 M☉. */
+  function substellarConfig(): SimulationConfig {
+    return makeConfig({ mass: 0.1, cloudExtent: 20, pace: 1 });
+  }
+
+  function runToTerminal(kernel: TsFallbackKernel): {
+    stage: LifecycleStage;
+    events: SimEventType[];
+    starMass: number;
+  } {
+    const events: SimEventType[] = [];
+    let stage = LifecycleStage.DustCloud;
+    let starMass = 0;
+    for (let i = 0; i < LIFECYCLE_STEPS * 4 && stage !== LifecycleStage.Remnant; i += 1) {
+      const res = kernel.step(1e17);
+      events.push(...res.events.map((e) => e.type));
+      stage = res.stage;
+      starMass = res.starMassSolar;
+    }
+    return { stage, events, starMass };
+  }
+
+  it('never ignites: no fusion event, no main sequence, no red giant, no death', () => {
+    const config = substellarConfig();
+    const stellar = stellarMassFromCloud(config.mass, config.composition.metals);
+    // Precondition: this really is a substellar cloud.
+    expect(stellar).toBeLessThan(FATE_THRESHOLDS.hydrogenBurningMinMass);
+
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config, particleCount: 400 });
+    const { stage, events } = runToTerminal(kernel);
+
+    expect(stage).toBe(LifecycleStage.Remnant);
+    // Only the LIFECYCLE events; comets and asteroids come and go throughout.
+    const lifecycle = events.filter((t) =>
+      [
+        SimEventType.CollapseOnset,
+        SimEventType.ProtostarFormed,
+        SimEventType.FusionIgnition,
+        SimEventType.RedGiantOnset,
+        SimEventType.DeathEvent,
+        SimEventType.RemnantFormed,
+      ].includes(t),
+    );
+    // It collapses and forms a protostar — then stops. Degeneracy halts the
+    // contraction before the core reaches ~10^7 K, so hydrogen never lights.
+    expect(lifecycle).toEqual([
+      SimEventType.CollapseOnset,
+      SimEventType.ProtostarFormed,
+      SimEventType.RemnantFormed,
+    ]);
+    expect(lifecycle).not.toContain(SimEventType.FusionIgnition);
+    expect(lifecycle).not.toContain(SimEventType.RedGiantOnset);
+    expect(lifecycle).not.toContain(SimEventType.DeathEvent);
+    kernel.dispose();
+  });
+
+  it('reports itself as a brown dwarf that kept all of its mass', () => {
+    const config = substellarConfig();
+    const stellar = stellarMassFromCloud(config.mass, config.composition.metals);
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config, particleCount: 400 });
+    const { starMass } = runToTerminal(kernel);
+
+    expect(determineFate(stellar, config.composition).remnant).toBe(RemnantType.BrownDwarf);
+    // Every other outcome sheds mass on the way out; this one has nothing to
+    // shed, because it never dies.
+    expect(starMass).toBeCloseTo(stellar, 6);
+    kernel.dispose();
+  });
+
+  it('throws no ejecta and keeps its disc — there is no explosion to have', () => {
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config: substellarConfig(), particleCount: 800 });
+    runToTerminal(kernel);
+    const particles = internalParticles(kernel);
+    // A supernova/planetary-nebula shell would be Ejecta; a brown dwarf makes
+    // neither, so nothing here may be ejecta.
+    expect(particles.some((p) => p.kind === ParticleKind.Ejecta)).toBe(false);
+    // ...and its planets are not swept away by a blast that never happened.
+    const bodies = kernel.getBodyBuffer().length / BODY_STRIDE;
+    expect(bodies).toBeGreaterThan(0);
+    kernel.dispose();
+  });
+
+  it('stops its clock at the formation timescale, not a stellar lifetime', () => {
+    const config = substellarConfig();
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config, particleCount: 400 });
+    let elapsed = 0;
+    let stage = LifecycleStage.DustCloud;
+    for (let i = 0; i < LIFECYCLE_STEPS * 4 && stage !== LifecycleStage.Remnant; i += 1) {
+      const res = kernel.step(1e17);
+      stage = res.stage;
+      elapsed = res.elapsedSimSeconds;
+    }
+    // It formed over a few Myr and is now simply cooling: the multi-Gyr main
+    // sequence, red giant and death durations must NOT be on its clock.
+    const myr = 1e6 * 365.25 * 24 * 3600;
+    expect(elapsed / myr).toBeGreaterThan(0.5);
+    expect(elapsed / myr).toBeLessThan(50);
     kernel.dispose();
   });
 });

@@ -85,6 +85,56 @@ export function stellarRadiusSolar(massSolar: number): number {
 }
 
 /**
+ * Stellar radius in SOLAR radii for the star's CURRENT lifecycle stage. The
+ * equilibrium temperature a planet reports depends on how big the star is NOW,
+ * not on its main-sequence size: a red giant swells to ~10² R☉ and roasts its
+ * planets, while a white dwarf is Earth-sized and leaves them frozen. Values
+ * are textbook orders of magnitude; pure and clamped.
+ */
+export function stellarRadiusForStageSolar(
+  stage: LifecycleStage,
+  massSolar: number,
+  remnant: RemnantType | null = null,
+): number {
+  const m = Math.max(massSolar, 1e-3);
+  switch (stage) {
+    case LifecycleStage.DustCloud:
+    case LifecycleStage.ProtostarCoalescence:
+      // A protostar is bloated: several solar radii while still contracting.
+      return 4 * Math.pow(m, 0.5);
+    case LifecycleStage.FusionIgnition:
+      // Contracted most of the way to the main sequence.
+      return 1.5 * stellarRadiusSolar(m);
+    case LifecycleStage.RedGiant:
+    case LifecycleStage.Death:
+      // The Sun will reach ~100–250 R☉; more massive giants are larger still.
+      return Math.min(600, 100 * Math.pow(m, 0.5));
+    case LifecycleStage.Remnant:
+      switch (remnant) {
+        case RemnantType.BrownDwarf:
+          // Degenerate matter barely compresses, so every brown dwarf is about
+          // one JUPITER radius (~0.1 R☉) almost regardless of its mass — the
+          // same physics that keeps white dwarfs Earth-sized.
+          return 0.1;
+        case RemnantType.NeutronStar:
+        case RemnantType.Pulsar:
+          // ~10 km — a few × 10⁻⁵ R☉.
+          return 2e-5;
+        case RemnantType.BlackHole:
+          // No radiating surface at all.
+          return 0;
+        case RemnantType.WhiteDwarf:
+        default:
+          // Earth-sized: ~0.01 R☉.
+          return 0.01;
+      }
+    case LifecycleStage.MainSequence:
+    default:
+      return stellarRadiusSolar(m);
+  }
+}
+
+/**
  * Planetary equilibrium (surface) temperature in Kelvin for a body orbiting at
  * `distanceAu` from a star of effective temperature `starTeffK` and radius
  * `starRadiusSolar`:
@@ -144,6 +194,11 @@ export function coreTemperatureK(
       return Math.max(3e8, mainSequenceCore * 20);
     case LifecycleStage.Remnant:
       switch (remnant) {
+        case RemnantType.BrownDwarf:
+          // The whole point of a brown dwarf: degeneracy halts the collapse a
+          // few million K SHORT of the ~10^7 K hydrogen fusion needs, so the
+          // core never gets hot enough and the object never becomes a star.
+          return 3e6;
         case RemnantType.NeutronStar:
         case RemnantType.Pulsar:
           return 1e9;

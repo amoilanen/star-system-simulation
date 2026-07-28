@@ -144,6 +144,8 @@ export class BodyLabels {
         },
         starMass,
         starTeff,
+        stage,
+        remnant,
       );
       index = this.place(index, [x, y + radius + 0.25, z], content, camera, width, height, false);
     }

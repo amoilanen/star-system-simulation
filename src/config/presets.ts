@@ -1,8 +1,11 @@
 // Setup presets (FR-11, A5). Each preset maps to a full, valid parameter set so
 // non-expert users can start with one click. 'sun-like' is the default. Presets
-// intentionally span every death path for educational contrast:
+// intentionally span EVERY outcome the fate model can produce, so each one is
+// reachable without hunting for it on the sliders:
+//   - brown-dwarf         → never ignites at all (substellar)
 //   - sun-like / low-mass → white dwarf
-//   - high-mass           → supernova → pulsar
+//   - neutron-star        → supernova → neutron star
+//   - high-mass / pulsar  → supernova → pulsar
 //   - black-hole          → the most massive clouds collapse to a black hole
 //
 // IMPORTANT: `mass` is the CLOUD mass, and a cloud only ever turns about a third
@@ -42,13 +45,15 @@ function cloudFor(starMass: number, metals: number): number {
 
 /** All available presets, keyed by id. */
 export const PRESETS: Readonly<Record<string, SimulationPreset>> = {
-  'sun-like': {
-    id: 'sun-like',
-    nameMessageId: 'preset.sunLike',
-    composition: { hydrogen: 0.74, helium: 0.24, metals: 0.02 },
-    // ~1 M☉ star → white dwarf.
-    mass: cloudFor(1, 0.02),
-    cloudExtent: 50,
+  'brown-dwarf': {
+    id: 'brown-dwarf',
+    nameMessageId: 'preset.brownDwarf',
+    composition: { hydrogen: 0.75, helium: 0.24, metals: 0.01 },
+    // ~0.04 M☉ (≈43 Jupiters) — comfortably below the 0.08 M☉ hydrogen-burning
+    // limit, so the object never ignites and never leaves the protostar stage
+    // for a main sequence. A small, cool cloud, as such objects really form.
+    mass: cloudFor(0.04, 0.01),
+    cloudExtent: 20,
     pace: 0.5,
   },
   'low-mass': {
@@ -60,6 +65,25 @@ export const PRESETS: Readonly<Record<string, SimulationPreset>> = {
     cloudExtent: 35,
     pace: 0.5,
   },
+  'sun-like': {
+    id: 'sun-like',
+    nameMessageId: 'preset.sunLike',
+    composition: { hydrogen: 0.74, helium: 0.24, metals: 0.02 },
+    // ~1 M☉ star → white dwarf.
+    mass: cloudFor(1, 0.02),
+    cloudExtent: 50,
+    pace: 0.5,
+  },
+  'neutron-star': {
+    id: 'neutron-star',
+    nameMessageId: 'preset.neutronStar',
+    composition: { hydrogen: 0.73, helium: 0.25, metals: 0.02 },
+    // ~10 M☉ star: above the 8 M☉ core-collapse threshold but below the 12 M☉
+    // at which the young neutron star spins fast enough to present as a pulsar.
+    mass: cloudFor(10, 0.02),
+    cloudExtent: 70,
+    pace: 0.5,
+  },
   'high-mass': {
     id: 'high-mass',
     nameMessageId: 'preset.highMass',
@@ -67,6 +91,18 @@ export const PRESETS: Readonly<Record<string, SimulationPreset>> = {
     // ~16 M☉ star → supernova → pulsar.
     mass: cloudFor(16, 0.02),
     cloudExtent: 90,
+    pace: 0.5,
+  },
+  pulsar: {
+    id: 'pulsar',
+    nameMessageId: 'preset.pulsar',
+    // Metal-poor gas means weaker winds, so more of the star survives to the
+    // core-collapse — keeping it clear of the 22 M☉ black-hole boundary while
+    // staying well above the 12 M☉ pulsar threshold.
+    composition: { hydrogen: 0.75, helium: 0.247, metals: 0.003 },
+    // ~19 M☉ star → supernova → rapidly spinning neutron star (pulsar).
+    mass: cloudFor(19, 0.003),
+    cloudExtent: 100,
     pace: 0.5,
   },
   'black-hole': {
@@ -78,6 +114,20 @@ export const PRESETS: Readonly<Record<string, SimulationPreset>> = {
     // ~30 M☉ star → core collapse straight past the neutron-star limit.
     mass: cloudFor(30, 0.001),
     cloudExtent: 120,
+    pace: 0.5,
+  },
+  'direct-collapse': {
+    id: 'direct-collapse',
+    nameMessageId: 'preset.directCollapse',
+    composition: { hydrogen: 0.757, helium: 0.2425, metals: 0.0005 },
+    // ~45 M☉ star → above `directCollapseMinMass`, so there is NO supernova at
+    // all: the envelope is swallowed rather than expelled and the star simply
+    // winks out, leaving a black hole. This is the observed "red supergiant
+    // disappearance" channel, and the only outcome with supernova = false at
+    // the top of the mass range — worth its own preset because the death looks
+    // nothing like the others.
+    mass: cloudFor(45, 0.0005),
+    cloudExtent: 150,
     pace: 0.5,
   },
 } as const;

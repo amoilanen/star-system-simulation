@@ -1,32 +1,26 @@
-// Lifecycle stage FSM (spec §3.3, §4.2, FR-3, FR-4).
+// Lifecycle stage definitions & timing (spec §3.3, §4.2, FR-3, FR-4).
 //
-// A deterministic state machine that drives the visual/narrative progression of
-// a star system through its life:
+// The shared, kernel-agnostic description of how a star system progresses:
 //
 //   DustCloud → ProtostarCoalescence → FusionIgnition → MainSequence
 //            → RedGiant → Death → Remnant
 //
-// The machine is advanced by the simulation clock (it consumes sim-time `dt`),
-// keyed on the cloud's `mass` and `composition`, and emits EXACTLY ONE
-// correctly-typed {@link SimulationEvent} at each stage transition via the
-// injected {@link EventBus}. The death path (supernova + remnant kind) is
-// selected from the centralized {@link fateModel} — the single source of truth
-// for FR-4 — and carried on the death/remnant events so downstream layers do
-// not re-derive it.
+// This module owns the ORDERING, the per-stage entry events, the internal
+// structure of the death, and the illustrative stage durations. It deliberately
+// owns no state machine: both kernels drive the progression themselves, because
+// only they know the accreted core mass that makes FORMATION physics-driven
+// rather than timed (see `TsFallbackKernel.advanceStages` and its Rust twin).
+// A sub-stellar object short-circuits this order entirely — a brown dwarf never
+// ignites, so it goes straight from FusionIgnition to Remnant.
 //
 // Stage durations are illustrative, not simulation-grade (PRD A1): they use the
 // real qualitative ordering (massive stars live fast and die young) rather than
 // solving stellar structure. All timing knobs live in one place so they are
 // auditable and adjustable.
 
-import type { CloudComposition, SimulationConfig } from '../config/SimulationConfig';
-import {
-  LifecycleStage,
-  fateModel as defaultFateModel,
-  type FateModel,
-  type FateOutcome,
-} from '../config/fateModel';
-import { EventBus, SimEventType, type SimulationEvent } from './events';
+import type { CloudComposition } from '../config/SimulationConfig';
+import { LifecycleStage } from '../config/fateModel';
+import { SimEventType } from './events';
 
 /** One Julian year in seconds; the base unit for the illustrative durations. */
 const YEAR_SECONDS = 365.25 * 24 * 3600;
@@ -163,145 +157,4 @@ export function stageDurations(
     [LifecycleStage.Death]: deathSeconds,
     [LifecycleStage.Remnant]: Infinity,
   };
-}
-
-/** Options for {@link StageMachine}, all optional (sane defaults). */
-export interface StageMachineOptions {
-  /** Override the death-path model (defaults to the centralized `fateModel`). */
-  fateModel?: FateModel;
-  /**
-   * Override the per-stage durations (sim seconds). Defaults to
-   * {@link stageDurations} for the config's mass + composition. Primarily for
-   * tests and deterministic scenarios.
-   */
-  durations?: Readonly<Record<LifecycleStage, number>>;
-}
-
-/**
- * Deterministic lifecycle stage machine. Construct once per simulation run with
- * the immutable {@link SimulationConfig} and the shared {@link EventBus}, then
- * call {@link update} each frame with the sim-time `dt` produced by the Clock.
- */
-export class StageMachine {
-  private stage: LifecycleStage = LifecycleStage.DustCloud;
-  /** Sim seconds elapsed within the current stage. */
-  private elapsedInStage = 0;
-  /** Accumulated sim time; stamped onto emitted events. */
-  private simTime = 0;
-
-  private readonly bus: EventBus;
-  private readonly durations: Readonly<Record<LifecycleStage, number>>;
-  private readonly fate: FateOutcome;
-
-  constructor(config: SimulationConfig, bus: EventBus, options: StageMachineOptions = {}) {
-    this.bus = bus;
-    this.durations = options.durations ?? stageDurations(config.mass, config.composition);
-    const model = options.fateModel ?? defaultFateModel;
-    this.fate = model.determineFate(config.mass, config.composition);
-  }
-
-  /** The stage the star system is currently in. */
-  get currentStage(): LifecycleStage {
-    return this.stage;
-  }
-
-  /** The pre-computed death outcome (supernova flag + remnant kind). */
-  get fateOutcome(): FateOutcome {
-    return this.fate;
-  }
-
-  /** Accumulated sim time consumed by the FSM (sim seconds). */
-  get elapsedSimTime(): number {
-    return this.simTime;
-  }
-
-  /** Whether the FSM has reached its terminal {@link LifecycleStage.Remnant}. */
-  get isTerminal(): boolean {
-    return this.stage === LifecycleStage.Remnant;
-  }
-
-  /**
-   * Advance the FSM by `simDt` sim seconds. Crosses as many stage boundaries as
-   * the elapsed time warrants (a single large `dt` at fast pace can skip through
-   * several stages), emitting EXACTLY ONE correctly-typed, correctly-timed event
-   * per transition, in order. Non-positive/non-finite `dt` is ignored (the Clock
-   * returns 0 while paused, A6).
-   */
-  update(simDt: number): void {
-    if (!Number.isFinite(simDt) || simDt <= 0) {
-      return;
-    }
-
-    let remaining = simDt;
-    while (remaining > 0 && this.stage !== LifecycleStage.Remnant) {
-      const stageDuration = this.durations[this.stage];
-      const remainingInStage = stageDuration - this.elapsedInStage;
-
-      if (remaining < remainingInStage) {
-        // Stay within the current stage.
-        this.elapsedInStage += remaining;
-        this.simTime += remaining;
-        remaining = 0;
-      } else {
-        // Consume up to the boundary, then transition into the next stage.
-        this.simTime += remainingInStage;
-        remaining -= remainingInStage;
-        this.elapsedInStage = 0;
-        this.advanceStage();
-      }
-    }
-
-    // Once terminal, absorb any leftover dt so sim time keeps tracking wall time.
-    if (remaining > 0) {
-      this.simTime += remaining;
-    }
-  }
-
-  /** Reset to the initial {@link LifecycleStage.DustCloud} at sim time 0. */
-  reset(): void {
-    this.stage = LifecycleStage.DustCloud;
-    this.elapsedInStage = 0;
-    this.simTime = 0;
-  }
-
-  /** Move to the next ordered stage and emit its entry event. */
-  private advanceStage(): void {
-    const nextIndex = STAGE_ORDER.indexOf(this.stage) + 1;
-    const next = STAGE_ORDER[nextIndex];
-    // Guarded by the `stage !== Remnant` check in update(); Remnant is last.
-    if (next === undefined) {
-      return;
-    }
-    this.stage = next;
-    this.emitEntryEvent(this.stage);
-  }
-
-  /** Emit the single event associated with entering `stage`, if any. */
-  private emitEntryEvent(stage: LifecycleStage): void {
-    const type = STAGE_ENTRY_EVENT[stage];
-    if (type === undefined) {
-      return;
-    }
-    const event: Omit<SimulationEvent, 'messageId'> = {
-      type,
-      simTime: this.simTime,
-    };
-    const data = this.eventData(type);
-    if (data !== undefined) {
-      event.data = data;
-    }
-    this.bus.emit(event);
-  }
-
-  /** Structured payload for events that carry the selected death path. */
-  private eventData(type: SimEventType): Record<string, unknown> | undefined {
-    switch (type) {
-      case SimEventType.DeathEvent:
-        return { supernova: this.fate.supernova };
-      case SimEventType.RemnantFormed:
-        return { remnant: this.fate.remnant, supernova: this.fate.supernova };
-      default:
-        return undefined;
-    }
-  }
 }

@@ -113,5 +113,13 @@
   "hud.paused": "PYSÄYTETTY",
   "hud.pauseHint": "Välilyönti",
   "event.supernova": "Ydin luhistuu ja tähti repii itsensä kappaleiksi supernovassa — hetken ajan kirkkaampana kuin koko galaksi.",
-  "event.planetaryNebula": "Tähti työntää ulkokerroksensa hitaasti hehkuvaksi planetaariseksi sumuksi ja paljastaa polttavan ytimensä."
+  "event.planetaryNebula": "Tähti työntää ulkokerroksensa hitaasti hehkuvaksi planetaariseksi sumuksi ja paljastaa polttavan ytimensä.",
+  "remnant.brownDwarf": "ruskea kääpiö",
+  "info.brownDwarf.title": "Ruskea kääpiö",
+  "info.brownDwarf.desc": "\"Epäonnistunut tähti\" — liian kevyt fuusioimaan vetyä. Elektronien degeneraatiopaine pysäytti romahduksen ennen kuin ydin saavutti 10 miljoonaa kelviniä, joten se poltti deuteriuminsa ja alkoi sitten jäähtyä ja himmetä ikuisesti.",
+  "preset.brownDwarf": "Ruskea kääpiö (epäonnistunut tähti)",
+  "preset.neutronStar": "Neutronitähti",
+  "preset.pulsar": "Pulsari",
+  "setup.outcome.substellar": "→ muodostaa noin {jupiters} Jupiterin massaisen RUSKEAN KÄÄPIÖN, ei tähteä: alle 0,08 M☉ ytimestä ei koskaan tule tarpeeksi kuumaa vedyn fuusioon, joten se vain jäähtyy ikuisesti.",
+  "preset.directCollapse": "Suora romahdus (tähti katoaa)"
 }

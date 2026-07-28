@@ -96,6 +96,8 @@ function starInfoMessages(star: StarPick): BodyInfoMessages {
 
 function remnantInfoMessages(remnant: RemnantType | null): BodyInfoMessages {
   switch (remnant) {
+    case RemnantType.BrownDwarf:
+      return { titleId: 'info.brownDwarf.title', descId: 'info.brownDwarf.desc' };
     case RemnantType.NeutronStar:
       return { titleId: 'info.neutronStar.title', descId: 'info.neutronStar.desc' };
     case RemnantType.Pulsar:

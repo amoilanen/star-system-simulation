@@ -14,7 +14,7 @@ import {
   orbitalVelocityKms,
   sceneToAu,
   solarToEarthMasses,
-  stellarRadiusSolar,
+  stellarRadiusForStageSolar,
 } from '../sim/astro';
 import { planetClassTitleId } from './bodyInfo';
 import { mainSequenceTemperature } from '../render/starVisual';
@@ -105,6 +105,10 @@ export function starSurfaceTemperatureK(
       return 8000;
     case LifecycleStage.Remnant:
       switch (remnant) {
+        case RemnantType.BrownDwarf:
+          // Cool enough for clouds and even rain: L/T dwarfs sit at ~1000-2000 K,
+          // far below the ~2400 K floor of the coolest true (M-dwarf) star.
+          return 1800;
         case RemnantType.NeutronStar:
           return 6e5;
         case RemnantType.Pulsar:
@@ -152,6 +156,8 @@ export function starTitleId(stage: LifecycleStage, remnant: RemnantType | null):
       return 'info.dyingStar.title';
     case LifecycleStage.Remnant:
       switch (remnant) {
+        case RemnantType.BrownDwarf:
+          return 'info.brownDwarf.title';
         case RemnantType.NeutronStar:
           return 'info.neutronStar.title';
         case RemnantType.Pulsar:
@@ -188,9 +194,13 @@ export function bodyLabelContent(
   body: BodyLabelInput,
   starMassSolar: number,
   starTeffK: number,
+  stage: LifecycleStage = LifecycleStage.MainSequence,
+  remnant: RemnantType | null = null,
 ): LabelContent {
   const distanceAu = sceneToAu(body.distanceScene);
-  const starRadius = stellarRadiusSolar(starMassSolar);
+  // The star's CURRENT radius: a red giant swells to ~10² R☉ (planets heat
+  // up), a compact remnant is tiny (survivors freeze).
+  const starRadius = stellarRadiusForStageSolar(stage, starMassSolar, remnant);
   // A 0.3 Bond albedo is Earth-like and keeps the figures recognisable.
   const surface = equilibriumTemperatureK(starTeffK, starRadius, distanceAu, 0.3);
   const velocity = orbitalVelocityKms(starMassSolar, distanceAu);

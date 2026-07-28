@@ -21,20 +21,20 @@ use bodies::{
     classify_visitor, make_visitor, seed_from_config, BodyType, CelestialBody, Mulberry32,
     VisitorClassification,
 };
-use nbody::{
-    accretion_efficiency, accretion_radius, body_radius_from_mass, circular_speed, integrate_orbit,
-    magnitude, merge_radius, merged_velocity, orbital_step, softened_accel, Vec3,
-    BODY_DAMP_FRACTION, DISK_SETTLE, GAS_DRAG, GRAVITY, INTERNAL_DT, MAX_PARTICLES, MAX_SUBSTEPS,
-    ORBITAL_MASS_SCALE, ORBITAL_MAX, SOFTENING, VERTICAL_DAMP,
-};
 #[cfg(test)]
 use nbody::SNOW_LINE_AU;
-use stages::{
-    bool_f64, determine_fate, remnant_mass, stage_durations, stellar_mass_from_cloud, FateOutcome,
-    LifecycleStage, PackedEvent, SimEventType,
+use nbody::{
+    accretion_efficiency, accretion_radius, body_radius_from_mass, circular_speed, integrate_orbit,
+    magnitude, merge_radius, merged_velocity, orbital_step, periapsis_distance, softened_accel,
+    stable_substep, Vec3, BODY_DAMP_FRACTION, DISK_SETTLE, GAS_DRAG, GRAVITY, MAX_PARTICLES,
+    MAX_SUBSTEPS, ORBITAL_MASS_SCALE, ORBITAL_MAX, SOFTENING, VERTICAL_DAMP,
 };
 #[cfg(test)]
 use stages::cloud_mass_for_star;
+use stages::{
+    bool_f64, determine_fate, is_substellar, remnant_mass, stage_durations,
+    stellar_mass_from_cloud, FateOutcome, LifecycleStage, PackedEvent, SimEventType,
+};
 
 /// Number of Float32 lanes per particle (mirror `PARTICLE_STRIDE`).
 const PARTICLE_STRIDE: usize = 7;
@@ -52,8 +52,28 @@ const VISITOR_SPAWN_INTERVAL: f64 = 8.0e15;
 const MAX_VISITORS: usize = 10;
 /// Fraction of the cloud mass pre-seeded into the central protostar core.
 const CORE_SEED_FRACTION: f64 = 0.04;
-/// Fraction of the cloud mass in each planetesimal seed (~1 M⊕ for a solar cloud).
-const PLANETESIMAL_MASS_FRACTION: f64 = 1e-6;
+/// Earth masses per solar mass (mirror of `EARTH_MASSES_PER_SOLAR`).
+const EARTH_MASSES_PER_SOLAR: f64 = 332_946.0;
+
+/// Mass (M_sun) of each planetesimal seed — an ABSOLUTE planetary embryo mass
+/// (~0.01 M_earth, Moon-to-Mars scale), NOT a fraction of the cloud (mirror of
+/// `PLANETESIMAL_SEED_MASS`).
+///
+/// Scaling the seed with the cloud quietly asserted the answer instead of
+/// simulating it: at 1e-6 of the cloud, a 61 M_sun cloud handed every seed
+/// 20 M_earth before it had accreted a single grain, so the inner "terrestrial"
+/// worlds were born as ice giants and a 67 M_earth planet sat at 0.5 AU —
+/// inside the snow line, where only rock condenses and nothing of the sort can
+/// grow. From a true embryo the whole architecture is EMERGENT.
+const PLANETESIMAL_SEED_MASS: f64 = 0.01 / EARTH_MASSES_PER_SOLAR;
+
+/// Radial extent of the birth dust cloud, as fractions of the cloud extent.
+/// These bound where dust actually EXISTS, so they also bound where a
+/// planetesimal can grow: seeding beyond `DISC_OUTER_FRACTION` put the last
+/// seeds outside every grain in the simulation, orbiting empty space at their
+/// seed mass forever.
+const DISC_INNER_FRACTION: f64 = 0.015;
+const DISC_OUTER_FRACTION: f64 = 0.6;
 
 /// Body-swallow radius as a fraction of the dust feeding radius (mirror of the
 /// TS fallback's `BODY_SWALLOW_FRACTION`). A body inside it has fallen into the
@@ -229,6 +249,10 @@ pub struct Kernel {
     stellar_elapsed: f64,
     durations: [f64; 7],
     fate: FateOutcome,
+    /// Whether the object being assembled is SUBSTELLAR (below the
+    /// hydrogen-burning minimum mass). A brown dwarf never ignites, so it must
+    /// never be walked through a main sequence, red giant or death it cannot have.
+    substellar: bool,
     core_fraction: f64,
 
     particles: Vec<Particle>,
@@ -284,6 +308,7 @@ impl Kernel {
             // cloud's: a 40 M☉ cloud makes a ~10 M☉ star, which lives far longer.
             durations: stage_durations(star_mass, metals),
             fate: determine_fate(star_mass, metals),
+            substellar: is_substellar(star_mass),
             core_fraction: core_mass / star_mass,
             particles: Vec::new(),
             bodies: Vec::new(),
@@ -320,19 +345,24 @@ impl Kernel {
         // the accreted core mass, which in turn drives the formation stages.
         let orbital = orbital_step(dt_sim_seconds);
         if orbital > 0.0 {
-            let substeps = (orbital / INTERNAL_DT)
-                .ceil()
-                .max(1.0)
-                .min(MAX_SUBSTEPS as f64) as usize;
-            let h = orbital / substeps as f64;
+            // Resolve the FASTEST orbit present, not a fixed timestep: otherwise
+            // a heavy, compact cloud under-samples its innermost orbit and the
+            // integrator invents the energy that ejects the planet.
+            let h_max = stable_substep(self.mu(), SOFTENING, self.innermost_body_radius());
+            let substeps = (orbital / h_max).ceil().max(1.0).min(MAX_SUBSTEPS as f64) as usize;
+            // If even MAX_SUBSTEPS cannot resolve the step, advance LESS orbital
+            // time rather than integrating it inaccurately: the dynamics run
+            // slower on screen, which is honest, instead of flinging bodies out.
+            let advanced = orbital.min(substeps as f64 * h_max);
+            let h = advanced / substeps as f64;
             let forming = (self.stage as u32) <= LifecycleStage::FusionIgnition as u32;
             for _ in 0..substeps {
                 self.integrate_particles(h, forming);
                 self.integrate_bodies(h);
             }
             let stage = self.stage;
-            self.accrete(stage, orbital);
-            self.age_particles(orbital);
+            self.accrete(stage, advanced, h);
+            self.age_particles(advanced);
             // Anything that has plunged into the star is torn apart and consumed.
             self.swallow_bodies_into_star(&mut events);
         }
@@ -442,6 +472,13 @@ impl Kernel {
     /// Whether the rebound shock has reached the surface, so the star is now
     /// actually blowing its envelope off (mirror of `hasShockBrokenOut`).
     fn has_shock_broken_out(&self) -> bool {
+        if self.substellar {
+            // A brown dwarf has no shock to break out: it never fuses hydrogen, so
+            // it never builds a core that can collapse. Without this guard it
+            // reached the Remnant stage and promptly blew a planetary nebula it
+            // cannot produce, sweeping away the disc and planets it should keep.
+            return false;
+        }
         if self.stage as u32 > LifecycleStage::Death as u32 {
             return true;
         }
@@ -472,9 +509,42 @@ impl Kernel {
     /// physical feeding radius, but never smaller than the distance a fast
     /// in-falling grain covers in one substep, so grains cannot "tunnel"
     /// through the capture sphere around a massive (fast) cloud.
-    fn capture_radius(&self) -> f64 {
-        let infall_per_substep = self.mu().sqrt() * INTERNAL_DT;
+    /// Keyed on the ACTUAL substep `h` used this step (which the CFL guard may
+    /// have shrunk well below `INTERNAL_DT`), so the zone is never larger than
+    /// the physics requires.
+    fn capture_radius_for(&self, h: f64) -> f64 {
+        let infall_per_substep = self.mu().sqrt() * h;
         self.core_accretion_radius.max(2.0 * infall_per_substep)
+    }
+
+    /// Closest approach to the star of ANY integrated body, in scene units — the
+    /// point that sets the shortest dynamical time and so the integration
+    /// substep. Uses each body's PERIAPSIS rather than its present distance, so
+    /// an eccentric planet's fast periapsis passage is resolved before it
+    /// happens instead of after it has already been flung outward. Visitors
+    /// count too: a comet's perihelion passage decides capture vs fly-by, so
+    /// integrating it coarsely would fake the outcome.
+    ///
+    /// NOT floored at the swallow radius: a body can be on a star-grazing orbit
+    /// whose periapsis is far inside it yet still be caught mid-orbit by every
+    /// swallow check, and sizing the step for that floor rather than for its real
+    /// perihelion passage left exactly that passage under-resolved — the last
+    /// source of manufactured energy. No floor is needed to bound the cost:
+    /// softening flattens the potential inside eps, so omega can never exceed
+    /// sqrt(mu/eps^3) however small the periapsis gets.
+    fn innermost_body_radius(&self) -> f64 {
+        let mu = self.mu();
+        let mut r_min = f64::INFINITY;
+        for b in &self.bodies {
+            let q = periapsis_distance(mu, b.pos, b.vel);
+            if q < r_min {
+                r_min = q;
+            }
+        }
+        if !r_min.is_finite() {
+            r_min = self.core_accretion_radius;
+        }
+        r_min.max(0.0)
     }
 
     // --- Formation/stellar evolution controller ------------------------------
@@ -493,9 +563,21 @@ impl Kernel {
             self.emit_stage(SimEventType::ProtostarFormed, 0.0, 0.0, out);
         }
         if self.stage == LifecycleStage::FusionIgnition && core_frac >= IGNITION_CORE_FRACTION {
-            self.stage = LifecycleStage::MainSequence;
-            self.stellar_elapsed = 0.0;
-            self.emit_stage(SimEventType::FusionIgnition, 0.0, 0.0, out);
+            if self.substellar {
+                // Below the hydrogen-burning limit, electron degeneracy halts the
+                // contraction before the core ever reaches ~10^7 K. Fusion NEVER
+                // starts, so no `FusionIgnition` event is emitted and there is no
+                // main sequence, red giant or death to walk through: the object is
+                // already the brown dwarf it will remain, and from here it cools.
+                self.stage = LifecycleStage::Remnant;
+                self.stellar_elapsed = 0.0;
+                let remnant = self.fate.remnant as u32 as f64;
+                self.emit_stage(SimEventType::RemnantFormed, remnant, 0.0, out);
+            } else {
+                self.stage = LifecycleStage::MainSequence;
+                self.stellar_elapsed = 0.0;
+                self.emit_stage(SimEventType::FusionIgnition, 0.0, 0.0, out);
+            }
         }
 
         // Stellar — sim-time driven; a single large dt can cross several stages.
@@ -578,6 +660,12 @@ impl Kernel {
             LifecycleStage::FusionIgnition => {
                 dust + proto + ignition * self.compute_stage_progress()
             }
+            _ if self.substellar => {
+                // A brown dwarf skips the main sequence, the red giant and the
+                // death entirely, so none of those durations may be added to its
+                // clock: it simply cools from the moment it finishes forming.
+                dust + proto + ignition + self.stellar_elapsed
+            }
             _ => {
                 let mut done = dust + proto + ignition;
                 if (self.stage as u32) > LifecycleStage::MainSequence as u32 {
@@ -626,8 +714,8 @@ impl Kernel {
         let extent = self.cloud_extent;
         let cum = self.species_cumulative();
         let seed_mu = self.mu();
-        let dust_budget = self.cloud_mass
-            * (1.0 - CORE_SEED_FRACTION - PLANETESIMAL_COUNT as f64 * PLANETESIMAL_MASS_FRACTION);
+        let dust_budget = self.cloud_mass * (1.0 - CORE_SEED_FRACTION)
+            - PLANETESIMAL_COUNT as f64 * PLANETESIMAL_SEED_MASS;
         let per_particle = if count > 0 {
             (dust_budget / count as f64).max(0.0)
         } else {
@@ -639,7 +727,9 @@ impl Kernel {
             // plane with a modest vertical spread that dissipation collapses into
             // a disc. Concentration + sub-Keplerian spin let the cloud drain onto
             // the forming star over the formation phase.
-            let rho = extent * (0.015 + 0.585 * self.rng.next_f64());
+            let rho = extent
+                * (DISC_INNER_FRACTION
+                    + (DISC_OUTER_FRACTION - DISC_INNER_FRACTION) * self.rng.next_f64());
             let phi = 2.0 * std::f64::consts::PI * self.rng.next_f64();
             let x = rho * phi.cos();
             let z = rho * phi.sin();
@@ -679,8 +769,9 @@ impl Kernel {
         // line, so every planet was an ice/gas world and the biggest one always
         // formed closest to the star.
         let inner = (self.cloud_extent * 0.008).max(self.core_accretion_radius * 1.4);
-        let outer = (inner * 6.0).max(self.cloud_extent * 0.75);
-        let mass = self.cloud_mass * PLANETESIMAL_MASS_FRACTION;
+        // The outermost seed must sit INSIDE the dust disc it grows from.
+        let outer = (inner * 6.0).max(self.cloud_extent * DISC_OUTER_FRACTION * 0.9);
+        let mass = PLANETESIMAL_SEED_MASS;
         let ratio = if PLANETESIMAL_COUNT > 1 {
             (outer / inner).powf(1.0 / (PLANETESIMAL_COUNT - 1) as f64)
         } else {
@@ -804,9 +895,9 @@ impl Kernel {
     /// Sweep dust onto the central core and the planetesimals/planets, and merge
     /// overlapping bodies — the emergent growth that turns a disc into planets
     /// and feeds the star. Momentum is conserved on every merge.
-    fn accrete(&mut self, stage: LifecycleStage, orbital_dt: f64) {
+    fn accrete(&mut self, stage: LifecycleStage, orbital_dt: f64, substep: f64) {
         let cloud_mass = self.cloud_mass;
-        let capture_radius = self.capture_radius();
+        let capture_radius = self.capture_radius_for(substep);
         let core_r2 = capture_radius * capture_radius;
 
         // Angular-momentum-regulated accretion budget for this step: the star
@@ -1553,10 +1644,11 @@ mod tests {
             .collect();
         assert!(planets.len() > 4, "too few planets formed");
 
-        let heaviest = planets
-            .iter()
-            .copied()
-            .fold((0.0f64, 0.0f64), |a, b| if b.1 > a.1 { b } else { a });
+        let heaviest =
+            planets
+                .iter()
+                .copied()
+                .fold((0.0f64, 0.0f64), |a, b| if b.1 > a.1 { b } else { a });
         assert!(
             heaviest.0 > SNOW_LINE_AU,
             "biggest planet formed at {} AU, inside the snow line",

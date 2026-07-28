@@ -232,6 +232,22 @@ export const NEUTRON_STAR_RADIUS = 0.012;
 export const BLACK_HOLE_RADIUS = 0.03;
 
 /**
+ * Drawn radius of a brown dwarf, in scene units. Degeneracy makes every brown
+ * dwarf about one JUPITER radius (~5e-4 AU) whatever its mass — so it is far
+ * bigger than a white dwarf yet still far smaller than any true star, and it is
+ * drawn that way: noticeably larger than a compact remnant, clearly smaller
+ * than the main-sequence star it failed to become.
+ */
+export const BROWN_DWARF_RADIUS = 0.03;
+
+/**
+ * Effective temperature of a brown dwarf, in Kelvin. L/T dwarfs sit at roughly
+ * 1000-2000 K — below the ~2400 K floor of the coolest real star, which is why
+ * they glow a dull red rather than shining.
+ */
+export const BROWN_DWARF_TEMPERATURE_K = 1800;
+
+/**
  * Composition-driven temperature multiplier (illustrative). Metal-rich gas is
  * more opaque, giving a slightly cooler/redder photosphere; a metal-poor
  * (hydrogen-dominated) cloud runs a touch hotter/bluer. Centred on the Solar
@@ -580,6 +596,25 @@ export const NEUTRON_STAR_TEMPERATURE_K = 40000;
 /** Visual appearance of the terminal compact remnant. */
 export function remnantAppearance(remnant: RemnantType | null): StarAppearance {
   switch (remnant) {
+    case RemnantType.BrownDwarf: {
+      // Not a corpse but a failure-to-launch: an object that never fused
+      // hydrogen. It is drawn as a dim, dull-red ember — barely self-luminous,
+      // with a mottled, convecting (and in reality cloudy) surface, which is
+      // exactly how it differs from the brilliant point of a compact remnant.
+      return {
+        visible: true,
+        temperatureK: BROWN_DWARF_TEMPERATURE_K,
+        color: blackbodyColor(BROWN_DWARF_TEMPERATURE_K),
+        radius: BROWN_DWARF_RADIUS,
+        // Barely glowing: it radiates the heat of its own contraction, nothing more.
+        glow: 0.45,
+        surfaceLum: 0.35,
+        pulsarBeam: false,
+        // Brown dwarfs are fully convective, with banded weather and dust clouds.
+        surfaceDetail: 0.85,
+        ...NO_BLAST,
+      };
+    }
     case RemnantType.WhiteDwarf: {
       // A cooled white dwarf reads as a small, WHITE ball (as requested): a
       // near-neutral blackbody rather than the hot blue-white of a just-formed

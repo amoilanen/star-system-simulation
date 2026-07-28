@@ -19,12 +19,24 @@ export enum LifecycleStage {
   Remnant,
 }
 
-/** Terminal compact-object types this model produces (spec §4.2). */
+/**
+ * Terminal compact-object types this model produces (spec §4.2).
+ *
+ * `BrownDwarf` is deliberately last so the existing numeric values — which the
+ * WASM kernel packs into its events buffer — keep their meaning.
+ */
 export enum RemnantType {
   WhiteDwarf,
   NeutronStar,
   Pulsar,
   BlackHole,
+  /**
+   * A SUBSTELLAR object: it never reached the core temperature hydrogen fusion
+   * needs, so it is not the corpse of a star but an object that never became
+   * one. It is listed among the remnants because it is likewise a degenerate
+   * body that simply cools forever.
+   */
+  BrownDwarf,
 }
 
 /** Outcome of a fate determination. */
@@ -37,6 +49,18 @@ export interface FateOutcome {
 
 /** Centralized, auditable thresholds driving FR-4. Single source of truth. */
 export const FATE_THRESHOLDS = {
+  /**
+   * Hydrogen-burning minimum mass (M☉): the least massive object that can ever
+   * sustain hydrogen fusion in its core, ~0.08 M☉ (≈80 Jupiters) at solar
+   * composition.
+   *
+   * Below it, gravity is halted by ELECTRON DEGENERACY before the core reaches
+   * the ~10^7 K hydrogen needs, so contraction stops and fusion never starts.
+   * The object is a brown dwarf: it burns its deuterium in a few million years
+   * and then simply cools, forever. It has no main sequence, no red-giant
+   * phase, and no death — so it must not be walked through them.
+   */
+  hydrogenBurningMinMass: 0.08,
   /**
    * Effective final STELLAR mass (M☉) at/above which the star ends in a core-
    * collapse supernova. Below this it quietly forms a white dwarf. This is the
@@ -91,11 +115,29 @@ export function effectiveFinalMass(mass: number, composition: CloudComposition):
 }
 
 /**
+ * Whether an object of `mass` M☉ is SUBSTELLAR — below the hydrogen-burning
+ * minimum mass, so it never ignites and is a brown dwarf rather than a star.
+ *
+ * Tested against the raw mass, NOT {@link effectiveFinalMass}: the metallicity
+ * correction models line-driven WINDS, which are a property of hot, luminous
+ * massive stars. A 0.05 M☉ object has no such wind, so stripping mass from it
+ * before asking whether it can fuse would be physically backwards.
+ */
+export function isSubstellar(mass: number): boolean {
+  return mass < FATE_THRESHOLDS.hydrogenBurningMinMass;
+}
+
+/**
  * Determine the death path from the star's mass + composition (FR-4). `mass` is
  * the STELLAR mass (see `starFormation.ts`), not the cloud mass the user dialled
  * in. Uses the centralized {@link FATE_THRESHOLDS}. Pure and deterministic.
  */
 export function determineFate(mass: number, composition: CloudComposition): FateOutcome {
+  // Below the hydrogen-burning limit there is no death path at all, because
+  // there is never a star: the object stalls as a brown dwarf and cools.
+  if (isSubstellar(mass)) {
+    return { supernova: false, remnant: RemnantType.BrownDwarf };
+  }
   const finalMass = effectiveFinalMass(mass, composition);
   const { supernovaMinMass, pulsarMinMass, blackHoleMinMass, directCollapseMinMass } =
     FATE_THRESHOLDS;
@@ -128,9 +170,18 @@ export function remnantMass(stellarMass: number, remnant: RemnantType): number {
   const m = Math.max(stellarMass, 0);
   const { chandrasekharMass, tovMass, directCollapseMinMass } = FATE_THRESHOLDS;
   switch (remnant) {
+    case RemnantType.BrownDwarf:
+      // A brown dwarf never dies, so it never sheds anything: it IS the object
+      // that formed. Unlike every other case here, mass is retained in full.
+      return m;
     case RemnantType.WhiteDwarf:
       // Initial–final mass relation: M_f ≈ 0.4 + 0.11 M_i (Kalirai et al.).
-      return Math.min(chandrasekharMass, Math.max(0.15, 0.4 + 0.11 * m));
+      // The relation is calibrated on ≳0.8 M☉ progenitors; below that its
+      // constant term would leave a remnant HEAVIER than the star it came
+      // from, which is mass creation. A star can never keep more of itself
+      // than it had, and it always sheds its envelope on the way out — so the
+      // remnant is additionally capped at 85% of the progenitor.
+      return Math.min(chandrasekharMass, 0.85 * m, Math.max(0.15, 0.4 + 0.11 * m));
     case RemnantType.NeutronStar:
     case RemnantType.Pulsar:
       // Core mass grows only weakly with progenitor mass and is capped by TOV.

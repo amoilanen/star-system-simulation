@@ -5,7 +5,9 @@
 An interactive, browser-based simulation of the **birth and death of a star system** —
 from a collapsing cloud of star dust, through protostar coalescence and the ignition of
 nuclear fusion, across the main sequence and red-giant phases, to a final remnant
-(white dwarf, neutron star, or pulsar — or a supernova along the way).
+(white dwarf, neutron star, pulsar or black hole — or a supernova along the way).
+Clouds too light to ever fuse hydrogen stop short of being stars at all and end
+as brown dwarfs.
 
 The simulation runs **entirely in the browser**. The heavy numeric work (N-body gravity,
 stage progression, orbital integration) is done by a **Rust physics kernel compiled to
@@ -16,7 +18,9 @@ post-processing).
 ## Features
 
 - **Configurable initial conditions** — cloud composition (H / He / metals), mass, cloud
-  extent, and simulation pace, plus presets (`sun-like`, `low-mass`, `high-mass`).
+  extent, and simulation pace, plus a preset for every outcome the model can
+  produce (`brown-dwarf`, `low-mass`, `sun-like`, `neutron-star`, `high-mass`,
+  `pulsar`, `black-hole`, `direct-collapse`).
 - **Adjustable time scale** — from near-real time up to a full birth→death cycle in about a
   minute; pause/resume live.
 - **Full lifecycle** — dust cloud → protostar → fusion ignition → main sequence → red giant

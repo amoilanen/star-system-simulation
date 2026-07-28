@@ -113,5 +113,13 @@
   "hud.paused": "PAUSED",
   "hud.pauseHint": "Space",
   "event.supernova": "The core collapses and the star tears itself apart in a supernova — brighter, for a moment, than the whole galaxy.",
-  "event.planetaryNebula": "The star gently sheds its outer layers into a glowing planetary nebula, laying its searing core bare."
+  "event.planetaryNebula": "The star gently sheds its outer layers into a glowing planetary nebula, laying its searing core bare.",
+  "remnant.brownDwarf": "brown dwarf",
+  "info.brownDwarf.title": "Brown dwarf",
+  "info.brownDwarf.desc": "A \"failed star\" — too light to ever fuse hydrogen. Electron degeneracy halted its collapse before the core reached 10 million K, so it burned its deuterium, then began cooling and fading forever.",
+  "preset.brownDwarf": "Brown dwarf (failed star)",
+  "preset.neutronStar": "Neutron star",
+  "preset.pulsar": "Pulsar",
+  "setup.outcome.substellar": "→ forms a ~{jupiters} Jupiter-mass BROWN DWARF, not a star: below 0.08 M☉ the core never gets hot enough to fuse hydrogen, so it just cools forever.",
+  "preset.directCollapse": "Direct collapse (star winks out)"
 }

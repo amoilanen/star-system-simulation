@@ -38,6 +38,7 @@ export const REMNANT_MESSAGE_IDS: Readonly<Record<RemnantType, string>> = {
   [RemnantType.NeutronStar]: 'remnant.neutronStar',
   [RemnantType.Pulsar]: 'remnant.pulsar',
   [RemnantType.BlackHole]: 'remnant.blackHole',
+  [RemnantType.BrownDwarf]: 'remnant.brownDwarf',
 };
 
 /** BodyType → i18n message id, for interpolating `{body}` into messages. */

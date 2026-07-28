@@ -30,11 +30,12 @@ import {
   LifecycleStage,
   RemnantType,
   fateModel,
+  isSubstellar,
   remnantMass,
   type FateOutcome,
 } from '../config/fateModel';
 import { stellarMassFromCloud } from '../config/starFormation';
-import { auToScene, sceneToAu } from './astro';
+import { auToScene, sceneToAu, EARTH_MASSES_PER_SOLAR } from './astro';
 import { EventBus, SimEventType } from './events';
 import { DEATH_PHASES, stageDurations } from './stages';
 import {
@@ -62,10 +63,33 @@ export const SOFTENING = 0.35;
 export const MAX_PARTICLES = 4000;
 
 /** Maximum integration substeps per {@link TsFallbackKernel.step} call. */
-export const MAX_SUBSTEPS = 16;
+export const MAX_SUBSTEPS = 64;
 
-/** Fixed internal integration timestep (dimensionless visual seconds). */
+/** Largest internal integration timestep (dimensionless visual seconds). */
 export const INTERNAL_DT = 1 / 60;
+
+/**
+ * Largest orbital phase angle (radians) one integration substep may advance —
+ * the CFL-type accuracy condition `h · ω ≤ ORBIT_RESOLUTION` applied to the
+ * FASTEST orbit currently in the system.
+ *
+ * This is what keeps the integrator honest. Semi-implicit Euler is symplectic,
+ * but only CONDITIONALLY: its energy error grows with `h · ω`, and past
+ * `h · ω ≈ 2` it is outright unstable. The angular rate of the innermost orbit
+ * is `ω = √(μ / (r² + ε²)^1.5)`, and μ grows with the cloud mass while the
+ * innermost orbit shrinks with the cloud extent — so a HEAVY, COMPACT cloud
+ * (e.g. 78 M☉ across only 25 AU) sat at `h · ω ≈ 1` at apoapsis and well past
+ * 2 at periapsis. There the integrator MANUFACTURED energy: the innermost
+ * planet's specific orbital energy flipped from −642 to +668 in a single step
+ * and it was flung out to r ≈ 550 AU — an ejection with no physical cause at
+ * all, since nothing else was pulling on it.
+ *
+ * Bounding the substep by the shortest dynamical time actually present, rather
+ * than by a fixed {@link INTERNAL_DT}, resolves every orbit the system
+ * contains. 0.3 rad is ~21 substeps per innermost orbit, which holds a
+ * first-order symplectic scheme's energy oscillation below a percent.
+ */
+export const ORBIT_RESOLUTION = 0.3;
 
 /**
  * Visual speed-up of the orbital dynamics: orbits and the collapse must be
@@ -208,8 +232,30 @@ const MAX_VISITORS = 10;
 /** Fraction of the cloud mass pre-seeded into the central protostar core. */
 const CORE_SEED_FRACTION = 0.04;
 
-/** Fraction of the cloud mass in each planetesimal seed (~1 M⊕ for a solar cloud). */
-const PLANETESIMAL_MASS_FRACTION = 1e-6;
+/**
+ * Mass (M☉) of each planetesimal seed — an ABSOLUTE planetary embryo mass
+ * (~0.01 M⊕, Moon-to-Mars scale), not a fraction of the cloud.
+ *
+ * Scaling the seed with the cloud was quietly asserting the answer instead of
+ * simulating it: at 1e-6 of the cloud, a 61 M☉ cloud handed every seed 20 M⊕
+ * before it had accreted a single grain, so the inner "terrestrial" worlds were
+ * born as ice giants and a 67 M⊕ planet sat at 0.5 AU — inside the snow line,
+ * where only rock condenses and nothing of the sort can grow. Starting from a
+ * true embryo means the entire planetary architecture is EMERGENT: every gram a
+ * planet ends up with was swept from the disc, at the retention its own orbit
+ * allows (see {@link accretionEfficiency}).
+ */
+export const PLANETESIMAL_SEED_MASS = 0.01 / EARTH_MASSES_PER_SOLAR;
+
+/**
+ * Radial extent of the birth dust cloud, as fractions of the configured cloud
+ * extent. These bound where dust actually EXISTS, so they also bound where a
+ * planetesimal can grow — `seedPlanetesimals` keys its outermost seed off
+ * {@link DISC_OUTER_FRACTION} rather than assuming the disc reaches further
+ * than the grains do.
+ */
+export const DISC_INNER_FRACTION = 0.015;
+export const DISC_OUTER_FRACTION = 0.6;
 
 /**
  * Fraction of swept dust a planetesimal RETAINS at `distanceAu`; the remainder
@@ -484,9 +530,23 @@ export function circularSpeed(mu: number, softening: number, r: number): number 
 }
 
 /**
- * Advance a body one symplectic (semi-implicit) Euler substep under the softened
- * central force. Returns fresh position/velocity; the symplectic form keeps
- * bounded orbits bounded and conserves the softened energy well.
+ * Advance a body one VELOCITY-VERLET substep under the softened central force:
+ *
+ *   v½ = v + a(x)·h/2 ;  x' = x + v½·h ;  v' = v½ + a(x')·h/2
+ *
+ * Symplectic (bounded orbits stay bounded, no secular energy drift) and
+ * second-order — but the reason it replaced semi-implicit Euler here is that its
+ * position and velocity are SYNCHRONIZED.
+ *
+ * Euler's are not: it returns `v` a half-step ahead of `x`, so the pair it hands
+ * back is not a point on the true trajectory. The instantaneous energy computed
+ * from it oscillates by O(h·ω) — biggest exactly at periapsis, where the body
+ * moves fastest — and that is not a cosmetic problem. It is the number the
+ * simulation makes DECISIONS from: a marginally-bound eccentric planet was
+ * reported unbound each time it swung through perihelion (E flipping −46 → +15
+ * and back, while the orbit itself never changed), and {@link classifyVisitor}
+ * decides a comet's capture-or-escape from the very same quantity. Verlet's
+ * error is O(h²) and synchronized, so the reported state IS the physical state.
  */
 export function integrateOrbit(
   pos: Vec3,
@@ -495,9 +555,12 @@ export function integrateOrbit(
   softening: number,
   h: number,
 ): { pos: Vec3; vel: Vec3 } {
-  const a = softenedAccel(mu, softening, pos);
-  const nvel: Vec3 = [vel[0] + a[0] * h, vel[1] + a[1] * h, vel[2] + a[2] * h];
-  const npos: Vec3 = [pos[0] + nvel[0] * h, pos[1] + nvel[1] * h, pos[2] + nvel[2] * h];
+  const half = 0.5 * h;
+  const a0 = softenedAccel(mu, softening, pos);
+  const vHalf: Vec3 = [vel[0] + a0[0] * half, vel[1] + a0[1] * half, vel[2] + a0[2] * half];
+  const npos: Vec3 = [pos[0] + vHalf[0] * h, pos[1] + vHalf[1] * h, pos[2] + vHalf[2] * h];
+  const a1 = softenedAccel(mu, softening, npos);
+  const nvel: Vec3 = [vHalf[0] + a1[0] * half, vHalf[1] + a1[1] * half, vHalf[2] + a1[2] * half];
   return { pos: npos, vel: nvel };
 }
 
@@ -512,6 +575,52 @@ export function orbitalStep(simDtSeconds: number): number {
   }
   const compressed = ORBITAL_TIME_UNIT * Math.log(1 + simDtSeconds / ORBITAL_REF);
   return Math.min(ORBITAL_MAX, Math.max(0, compressed));
+}
+
+/**
+ * PERIAPSIS distance of the conic a body is currently on, given its softened
+ * specific energy and specific angular momentum: `q = L² / (μ (1 + e))` with
+ * `e = √(1 + 2EL²/μ²)`.
+ *
+ * The closest approach — not the body's present distance — is where an orbit is
+ * hardest to integrate, because that is where it moves fastest. A planet sitting
+ * quietly at 3.2 AU can be diving to 1.0 AU inside the very next step, and a
+ * timestep chosen for 3.2 AU badly under-resolves the periapsis passage; that is
+ * precisely where the integrator was still manufacturing energy after the first
+ * CFL guard (a jumped 2.3 → ∞ AU in one step). Using `p/(1+e)` rather than
+ * `a(1−e)` keeps the formula finite for near-parabolic orbits, and it is valid
+ * for hyperbolic ones too. Pure; exported for unit testing.
+ */
+export function periapsisDistance(mu: number, pos: Vec3, vel: Vec3): number {
+  const r = magnitude(pos);
+  const v2 = vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2];
+  const lx = pos[1] * vel[2] - pos[2] * vel[1];
+  const ly = pos[2] * vel[0] - pos[0] * vel[2];
+  const lz = pos[0] * vel[1] - pos[1] * vel[0];
+  const l2 = lx * lx + ly * ly + lz * lz;
+  if (!(mu > 0) || !Number.isFinite(l2)) {
+    return r;
+  }
+  const energy = 0.5 * v2 - mu / Math.sqrt(r * r + SOFTENING * SOFTENING);
+  const ecc = Math.sqrt(Math.max(0, 1 + (2 * energy * l2) / (mu * mu)));
+  const q = l2 / (mu * (1 + ecc));
+  return Number.isFinite(q) ? Math.min(q, r) : r;
+}
+
+/**
+ * Largest integration substep (in orbital time) that still resolves an orbit
+ * whose closest approach to the star is `rMin`, per the
+ * {@link ORBIT_RESOLUTION} CFL condition `h · ω ≤ ORBIT_RESOLUTION` with
+ * `ω = √(mu / (r² + ε²)^1.5)`. Never exceeds {@link INTERNAL_DT}. Pure;
+ * exported for unit testing.
+ */
+export function stableSubstep(mu: number, softening: number, rMin: number): number {
+  const r2 = Math.max(rMin, 0) ** 2 + softening * softening;
+  const omega = Math.sqrt(Math.max(mu, 0) / Math.pow(r2, 1.5));
+  if (!(omega > 0) || !Number.isFinite(omega)) {
+    return INTERNAL_DT;
+  }
+  return Math.min(INTERNAL_DT, ORBIT_RESOLUTION / omega);
 }
 
 /**
@@ -696,6 +805,12 @@ export class TsFallbackKernel implements PhysicsKernel {
   });
   /** Pre-computed death outcome (supernova flag + remnant kind). */
   private fate: FateOutcome = { supernova: false, remnant: RemnantType.WhiteDwarf };
+  /**
+   * Whether the object being assembled is SUBSTELLAR (below the hydrogen-burning
+   * minimum mass). A brown dwarf never ignites, so it must never be walked
+   * through the main sequence, the red giant, or a death it cannot have.
+   */
+  private substellar = false;
   /** Core mass fraction at the last step, for {@link stageProgress}. */
   private coreFraction = 0;
   /**
@@ -743,6 +858,7 @@ export class TsFallbackKernel implements PhysicsKernel {
       this.durations[LifecycleStage.ProtostarCoalescence] +
       this.durations[LifecycleStage.FusionIgnition];
     this.fate = fateModel.determineFate(this.starMass, config.composition);
+    this.substellar = isSubstellar(this.starMass);
     this.coreFraction = this.coreMass / this.starMass;
 
     this.seedParticles(init.particleCount);
@@ -774,15 +890,23 @@ export class TsFallbackKernel implements PhysicsKernel {
     // grows the accreted core mass, which in turn drives the formation stages.
     const orbital = orbitalStep(dtSimSeconds);
     if (orbital > 0) {
-      const substeps = Math.min(MAX_SUBSTEPS, Math.max(1, Math.ceil(orbital / INTERNAL_DT)));
-      const h = orbital / substeps;
+      // Resolve the FASTEST orbit present, not a fixed timestep: otherwise a
+      // heavy, compact cloud under-samples its innermost orbit and the
+      // integrator invents the energy that ejects the planet (ORBIT_RESOLUTION).
+      const hMax = stableSubstep(this.mu, SOFTENING, this.innermostBodyRadius());
+      const substeps = Math.min(MAX_SUBSTEPS, Math.max(1, Math.ceil(orbital / hMax)));
+      // If even MAX_SUBSTEPS cannot resolve the step, advance LESS orbital time
+      // rather than integrating it inaccurately: the dynamics then run slower on
+      // screen, which is honest, instead of flinging bodies out of the system.
+      const advanced = Math.min(orbital, substeps * hMax);
+      const h = advanced / substeps;
       const forming = this.stage <= LifecycleStage.FusionIgnition;
       for (let s = 0; s < substeps; s += 1) {
         this.integrateParticles(h, forming);
         this.integrateBodies(h);
       }
-      this.accrete(this.stage, orbital);
-      this.ageParticles(orbital);
+      this.accrete(this.stage, advanced, h);
+      this.ageParticles(advanced);
     }
 
     // Drive the lifecycle: FORMATION from accreted core mass, STELLAR from time.
@@ -828,6 +952,13 @@ export class TsFallbackKernel implements PhysicsKernel {
    * stage onward (see {@link DEATH_PHASES}).
    */
   private hasShockBrokenOut(): boolean {
+    if (this.substellar) {
+      // A brown dwarf has no shock to break out: it never fuses hydrogen, so it
+      // never builds a core that can collapse. Without this guard it reached the
+      // Remnant stage and promptly blew a planetary nebula it cannot produce,
+      // sweeping away the disc and planets it should keep forever.
+      return false;
+    }
     if (this.stage > LifecycleStage.Death) {
       return true;
     }
@@ -839,7 +970,8 @@ export class TsFallbackKernel implements PhysicsKernel {
   /**
    * The mass (M☉) the central object has RIGHT NOW: the accreted core while the
    * star is still assembling, the finished star during its life, and only the
-   * compact remnant's mass once it has died — the star sheds the rest.
+   * compact remnant's mass once it has died — the star sheds the rest. (A brown
+   * dwarf sheds nothing, which `remnantMass` encodes by returning it in full.)
    */
   private currentStarMass(): number {
     if (this.stage < LifecycleStage.MainSequence) {
@@ -870,9 +1002,23 @@ export class TsFallbackKernel implements PhysicsKernel {
       this.emitStageEvent(SimEventType.ProtostarFormed);
     }
     if (this.stage === LifecycleStage.FusionIgnition && coreFrac >= IGNITION_CORE_FRACTION) {
-      this.stage = LifecycleStage.MainSequence;
-      this.stellarElapsed = 0;
-      this.emitStageEvent(SimEventType.FusionIgnition);
+      if (this.substellar) {
+        // Below the hydrogen-burning limit the contraction is halted by electron
+        // degeneracy before the core ever reaches ~10^7 K. Fusion NEVER starts,
+        // so no `FusionIgnition` event is emitted and there is no main sequence,
+        // no red giant and no death to walk through: the object is already the
+        // brown dwarf it will remain, and from here it only cools.
+        this.stage = LifecycleStage.Remnant;
+        this.stellarElapsed = 0;
+        this.emitStageEvent(SimEventType.RemnantFormed, {
+          remnant: this.fate.remnant,
+          supernova: false,
+        });
+      } else {
+        this.stage = LifecycleStage.MainSequence;
+        this.stellarElapsed = 0;
+        this.emitStageEvent(SimEventType.FusionIgnition);
+      }
     }
 
     // Stellar — sim-time driven; a single large dt can cross several boundaries.
@@ -971,7 +1117,12 @@ export class TsFallbackKernel implements PhysicsKernel {
           d[LifecycleStage.FusionIgnition] * this.stageProgress()
         );
       default:
-        return this.formationDuration + this.stellarElapsedTotal();
+        // A brown dwarf skips the main sequence, the red giant and the death
+        // entirely, so none of those durations may be added to its clock: it
+        // simply cools from the moment it finishes forming.
+        return this.substellar
+          ? this.formationDuration + this.stellarElapsed
+          : this.formationDuration + this.stellarElapsedTotal();
     }
   }
 
@@ -1051,10 +1202,47 @@ export class TsFallbackKernel implements PhysicsKernel {
    * covers in one integration substep — otherwise, around a massive (and
    * therefore fast) cloud, grains would "tunnel" straight through the capture
    * sphere between substeps and the star could never finish forming.
+   *
+   * Keyed on the ACTUAL substep `h` used this step (which the CFL guard may have
+   * shrunk well below {@link INTERNAL_DT}), so the zone is no larger than the
+   * physics requires.
    */
-  private get captureRadius(): number {
-    const infallPerSubstep = Math.sqrt(this.mu) * INTERNAL_DT;
+  private captureRadiusFor(h: number): number {
+    const infallPerSubstep = Math.sqrt(this.mu) * h;
     return Math.max(this.coreAccretionRadius, 2 * infallPerSubstep);
+  }
+
+  /**
+   * Closest approach to the star of ANY body currently integrated, in scene
+   * units — the point that sets the shortest dynamical time and therefore the
+   * integration substep. Uses each body's PERIAPSIS rather than its present
+   * distance, so an eccentric planet's fast periapsis passage is resolved before
+   * it happens instead of after it has already been flung outward. Visitors are
+   * included: a comet's perihelion passage decides whether it is captured or
+   * flies on, so integrating it coarsely would fake the outcome.
+   *
+   * NOT floored at the swallow radius: a body can be on a star-grazing orbit
+   * whose periapsis is far inside it yet still be caught mid-orbit by every
+   * swallow check, and sizing the step for the floor instead of for its real
+   * perihelion passage left exactly that passage under-resolved — the last
+   * source of manufactured energy (planets unbound at r ≈ 1.4 AU in the biggest
+   * clouds). No floor is needed to bound the cost either: the softening flattens
+   * the potential inside ε, so ω can never exceed √(μ/ε³) however small the
+   * periapsis gets.
+   */
+  private innermostBodyRadius(): number {
+    const mu = this.mu;
+    let rMin = Infinity;
+    for (const body of this.bodies) {
+      const q = periapsisDistance(mu, body.position, body.velocity);
+      if (q < rMin) {
+        rMin = q;
+      }
+    }
+    if (!Number.isFinite(rMin)) {
+      rMin = this.coreAccretionRadius;
+    }
+    return Math.max(rMin, 0);
   }
 
   // --- Seeding ---------------------------------------------------------------
@@ -1070,7 +1258,7 @@ export class TsFallbackKernel implements PhysicsKernel {
     const seedMu = this.mu;
     // Distribute the dust budget across the particles.
     const dustBudget =
-      this.cloudMass * (1 - CORE_SEED_FRACTION - PLANETESIMAL_COUNT * PLANETESIMAL_MASS_FRACTION);
+      this.cloudMass * (1 - CORE_SEED_FRACTION) - PLANETESIMAL_COUNT * PLANETESIMAL_SEED_MASS;
     const perParticle = count > 0 ? Math.max(dustBudget / count, 0) : 0;
     this.particles = [];
     for (let i = 0; i < count; i += 1) {
@@ -1078,7 +1266,8 @@ export class TsFallbackKernel implements PhysicsKernel {
       // with a modest vertical spread that dissipation collapses into a thin
       // disc. Concentration + sub-Keplerian spin let the cloud drain onto the
       // forming star over the formation phase.
-      const rho = extent * (0.015 + 0.585 * this.rng());
+      const rho =
+        extent * (DISC_INNER_FRACTION + (DISC_OUTER_FRACTION - DISC_INNER_FRACTION) * this.rng());
       const phi = 2 * Math.PI * this.rng();
       const x = rho * Math.cos(phi);
       const z = rho * Math.sin(phi);
@@ -1124,8 +1313,13 @@ export class TsFallbackKernel implements PhysicsKernel {
     // already at the snow line, so every planet was an ice/gas world and the
     // biggest one always formed closest to the star.
     const inner = Math.max(this.cloudExtent * 0.008, this.coreAccretionRadius * 1.4);
-    const outer = Math.max(inner * 6, this.cloudExtent * 0.75);
-    const mass = this.cloudMass * PLANETESIMAL_MASS_FRACTION;
+    // The outermost seed must sit INSIDE the dust disc it is supposed to grow
+    // from. `seedParticles` lays the cloud out to 0.6 × extent, so seeding to
+    // 0.75 × extent put the last one or two planetesimals beyond every grain in
+    // the simulation: they orbited empty space and stayed at their seed mass
+    // forever, an "outer planet" that had provably never accreted anything.
+    const outer = Math.max(inner * 6, this.cloudExtent * DISC_OUTER_FRACTION * 0.9);
+    const mass = PLANETESIMAL_SEED_MASS;
     const ratio =
       PLANETESIMAL_COUNT > 1 ? Math.pow(outer / inner, 1 / (PLANETESIMAL_COUNT - 1)) : 1;
     for (let i = 0; i < PLANETESIMAL_COUNT; i += 1) {
@@ -1242,10 +1436,10 @@ export class TsFallbackKernel implements PhysicsKernel {
    * overlapping bodies — the emergent growth that turns a disc into planets and
    * feeds the star. Momentum is conserved on every merge.
    */
-  private accrete(stage: LifecycleStage, orbitalDt: number): void {
+  private accrete(stage: LifecycleStage, orbitalDt: number, substep: number): void {
     const cloudMass = this.cloudMass;
     const survivors: Particle[] = [];
-    const captureRadius = this.captureRadius;
+    const captureRadius = this.captureRadiusFor(substep);
     const coreR2 = captureRadius * captureRadius;
     // How much mass the star can still take AT ALL. A star only ever assembles a
     // fraction of its birth cloud (see `starFormation.ts`); past that point its

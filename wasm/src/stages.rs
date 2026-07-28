@@ -20,6 +20,9 @@ pub enum LifecycleStage {
 
 /// Terminal compact-object types. Numeric values MUST match the TypeScript
 /// `RemnantType` enum ordering.
+///
+/// `BrownDwarf` is deliberately last so the existing numeric values — which are
+/// packed into the events buffer and decoded by the TS wrapper — keep meaning.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
 pub enum RemnantType {
@@ -27,6 +30,11 @@ pub enum RemnantType {
     NeutronStar = 1,
     Pulsar = 2,
     BlackHole = 3,
+    /// A SUBSTELLAR object: it never reached the core temperature hydrogen
+    /// fusion needs, so it is not the corpse of a star but an object that never
+    /// became one. Listed among the remnants because it is likewise a
+    /// degenerate body that simply cools forever.
+    BrownDwarf = 4,
 }
 
 /// Discrete simulation events. Numeric values MUST match the TypeScript
@@ -73,6 +81,15 @@ const TIMING_SOLAR_METALLICITY: f64 = 0.02;
 const METALLICITY_LIFETIME_COEFFICIENT: f64 = 2.0;
 
 // --- Fate thresholds (mirror FATE_THRESHOLDS in fateModel.ts) ---------------
+
+/// Hydrogen-burning minimum mass (M_sun): the least massive object that can ever
+/// sustain hydrogen fusion, ~0.08 M_sun (about 80 Jupiters) at solar composition.
+///
+/// Below it, ELECTRON DEGENERACY halts contraction before the core reaches the
+/// ~10^7 K hydrogen needs, so fusion never starts. The object is a brown dwarf:
+/// it burns its deuterium and then cools forever. It has no main sequence, no
+/// red giant and no death, so it must not be walked through them.
+pub const HYDROGEN_BURNING_MIN_MASS: f64 = 0.08;
 
 const SUPERNOVA_MIN_MASS: f64 = 8.0;
 const PULSAR_MIN_MASS: f64 = 12.0;
@@ -141,7 +158,16 @@ pub fn cloud_mass_for_star(stellar_mass: f64, metals: f64) -> f64 {
 pub fn remnant_mass(stellar_mass: f64, remnant: RemnantType) -> f64 {
     let m = stellar_mass.max(0.0);
     match remnant {
-        RemnantType::WhiteDwarf => (0.4 + 0.11 * m).clamp(0.15, CHANDRASEKHAR_MASS),
+        // A brown dwarf never dies, so it never sheds anything: it IS the object
+        // that formed. Unlike every other case, mass is retained in full.
+        RemnantType::BrownDwarf => m,
+        // The initial–final mass relation is calibrated on ≳0.8 M☉ progenitors;
+        // below that its constant term would leave a remnant HEAVIER than the
+        // star it came from (mass creation). Cap at 85% of the progenitor: a
+        // star always sheds its envelope on the way out.
+        RemnantType::WhiteDwarf => (0.4 + 0.11 * m)
+            .clamp(0.15, CHANDRASEKHAR_MASS)
+            .min(0.85 * m),
         RemnantType::NeutronStar | RemnantType::Pulsar => {
             (1.15 + 0.03 * m).clamp(CHANDRASEKHAR_MASS, TOV_MASS)
         }
@@ -165,10 +191,31 @@ pub fn effective_final_mass(mass: f64, metals: f64) -> f64 {
     (mass * retained).max(0.0)
 }
 
+/// Whether an object is SUBSTELLAR — below the hydrogen-burning minimum mass,
+/// so it never ignites and is a brown dwarf rather than a star (mirror of
+/// `isSubstellar`).
+///
+/// Tested against the RAW mass, not the wind-corrected one: the metallicity
+/// correction models line-driven winds, a property of hot massive stars. A
+/// 0.05 M_sun object has no such wind, so stripping mass from it before asking
+/// whether it can fuse would be physically backwards.
+#[must_use]
+pub fn is_substellar(mass: f64) -> bool {
+    mass < HYDROGEN_BURNING_MIN_MASS
+}
+
 /// Determine the death path from initial mass + composition (mirrors
 /// `determineFate`, FR-4).
 #[must_use]
 pub fn determine_fate(mass: f64, metals: f64) -> FateOutcome {
+    // Below the hydrogen-burning limit there is no death path at all, because
+    // there is never a star: the object stalls as a brown dwarf and cools.
+    if is_substellar(mass) {
+        return FateOutcome {
+            supernova: false,
+            remnant: RemnantType::BrownDwarf,
+        };
+    }
     let final_mass = effective_final_mass(mass, metals);
     if final_mass < SUPERNOVA_MIN_MASS {
         return FateOutcome {
@@ -270,6 +317,29 @@ mod tests {
         }
         // Monotonic: a bigger cloud still makes a bigger star.
         assert!(stellar_mass_from_cloud(50.0, 0.02) > stellar_mass_from_cloud(10.0, 0.02));
+    }
+
+    #[test]
+    fn a_remnant_is_never_heavier_than_the_star_it_came_from() {
+        // The initial-final mass relation M_f = 0.4 + 0.11 M_i is calibrated on
+        // >=0.8 M_sun progenitors; applied literally to a red dwarf its CONSTANT
+        // term dominates, so a 0.07 M_sun star "left behind" a 0.41 M_sun white
+        // dwarf - six times its own mass, created from nothing.
+        for m in [0.05_f64, 0.07, 0.1, 0.2, 0.4, 0.5, 0.8, 1.0, 3.0, 7.0] {
+            assert!(
+                remnant_mass(m, RemnantType::WhiteDwarf) < m,
+                "white dwarf from {m} M_sun is heavier than its progenitor"
+            );
+        }
+        for m in [10.0_f64, 15.0, 25.0, 50.0, 100.0] {
+            for remnant in [
+                RemnantType::NeutronStar,
+                RemnantType::Pulsar,
+                RemnantType::BlackHole,
+            ] {
+                assert!(remnant_mass(m, remnant) < m);
+            }
+        }
     }
 
     #[test]
