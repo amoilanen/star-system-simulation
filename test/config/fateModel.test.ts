@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   determineFate,
   effectiveFinalMass,
+  remnantMass,
   fateModel,
   FATE_THRESHOLDS,
   RemnantType,
@@ -55,7 +56,47 @@ describe('determineFate — mass boundaries at solar composition', () => {
       supernova: true,
       remnant: RemnantType.Pulsar,
     });
-    expect(determineFate(25, SOLAR).remnant).toBe(RemnantType.Pulsar);
+    expect(determineFate(20, SOLAR).remnant).toBe(RemnantType.Pulsar);
+  });
+});
+
+describe('determineFate — black-hole channel', () => {
+  it('collapses to a black hole above the TOV-limit progenitor mass', () => {
+    const fate = determineFate(FATE_THRESHOLDS.blackHoleMinMass, SOLAR);
+    expect(fate).toEqual({ supernova: true, remnant: RemnantType.BlackHole });
+  });
+
+  it('still forms a pulsar just below the black-hole threshold', () => {
+    expect(determineFate(FATE_THRESHOLDS.blackHoleMinMass - 0.1, SOLAR).remnant).toBe(
+      RemnantType.Pulsar,
+    );
+  });
+
+  it('collapses directly (no supernova) for the heaviest progenitors', () => {
+    const fate = determineFate(FATE_THRESHOLDS.directCollapseMinMass + 5, SOLAR);
+    expect(fate).toEqual({ supernova: false, remnant: RemnantType.BlackHole });
+  });
+});
+
+describe('remnantMass — the star never keeps all of itself', () => {
+  it('leaves a sub-Chandrasekhar white dwarf', () => {
+    expect(remnantMass(1, RemnantType.WhiteDwarf)).toBeLessThan(1);
+    expect(remnantMass(7, RemnantType.WhiteDwarf)).toBeLessThanOrEqual(
+      FATE_THRESHOLDS.chandrasekharMass,
+    );
+  });
+
+  it('keeps a neutron star between the Chandrasekhar and TOV limits', () => {
+    for (const m of [9, 15, 21]) {
+      const remnant = remnantMass(m, RemnantType.NeutronStar);
+      expect(remnant).toBeGreaterThanOrEqual(FATE_THRESHOLDS.chandrasekharMass);
+      expect(remnant).toBeLessThanOrEqual(FATE_THRESHOLDS.tovMass);
+    }
+  });
+
+  it('leaves a black hole far lighter than its progenitor', () => {
+    expect(remnantMass(30, RemnantType.BlackHole)).toBeLessThan(30);
+    expect(remnantMass(30, RemnantType.BlackHole)).toBeGreaterThan(FATE_THRESHOLDS.tovMass);
   });
 });
 

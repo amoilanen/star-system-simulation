@@ -12,6 +12,7 @@ function fakeState(marker: number): RenderState {
     bodyCount: 0,
     stage: LifecycleStage.MainSequence,
     stageProgress: marker,
+    cloudMass: 3.2,
     mass: 1,
     composition: { hydrogen: 0.74, helium: 0.24, metals: 0.02 },
     mu: 1,

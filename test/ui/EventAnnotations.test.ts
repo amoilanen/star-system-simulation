@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from 'vitest';
-import { EventAnnotations } from '../../src/ui/EventAnnotations';
+import { annotationMessageId, EventAnnotations } from '../../src/ui/EventAnnotations';
 import { createEvent, SimEventType } from '../../src/sim/events';
 import { RemnantType } from '../../src/config/fateModel';
 import { BodyType } from '../../src/sim/PhysicsKernel';
@@ -47,8 +47,24 @@ describe('EventAnnotations', () => {
       SimEventType.DeathEvent,
     ]) {
       const event = createEvent(type, 0);
-      expect(layer.resolve(event)).toBe(i18n.translate('fi', event.messageId));
+      expect(layer.resolve(event)).toBe(i18n.translate('fi', annotationMessageId(event)));
     }
+  });
+
+  it('names the death for what it actually is', () => {
+    const layer = new EventAnnotations({ container, locale: 'en', enabled: true });
+    // The two death paths could hardly be more different, so they must not share
+    // one bland "the star reaches the end of its life" line.
+    const supernova = createEvent(SimEventType.DeathEvent, 1, { supernova: true });
+    const nebula = createEvent(SimEventType.DeathEvent, 1, { supernova: false });
+    expect(annotationMessageId(supernova)).toBe('event.supernova');
+    expect(annotationMessageId(nebula)).toBe('event.planetaryNebula');
+    expect(layer.resolve(supernova)).toMatch(/supernova/i);
+    expect(layer.resolve(nebula)).toMatch(/nebula/i);
+    expect(layer.resolve(supernova)).not.toBe(layer.resolve(nebula));
+    // Non-death events are untouched.
+    const ignition = createEvent(SimEventType.FusionIgnition, 1);
+    expect(annotationMessageId(ignition)).toBe(ignition.messageId);
   });
 
   it('localizes enum payloads (remnant kind) into the message', () => {

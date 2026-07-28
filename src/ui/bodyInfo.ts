@@ -100,6 +100,8 @@ function remnantInfoMessages(remnant: RemnantType | null): BodyInfoMessages {
       return { titleId: 'info.neutronStar.title', descId: 'info.neutronStar.desc' };
     case RemnantType.Pulsar:
       return { titleId: 'info.pulsar.title', descId: 'info.pulsar.desc' };
+    case RemnantType.BlackHole:
+      return { titleId: 'info.blackHole.title', descId: 'info.blackHole.desc' };
     case RemnantType.WhiteDwarf:
     default:
       return { titleId: 'info.whiteDwarf.title', descId: 'info.whiteDwarf.desc' };

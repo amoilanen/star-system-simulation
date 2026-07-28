@@ -65,9 +65,18 @@ pub const GAS_DRAG: f64 = 0.28;
 /// form there. One scene unit is one AU.
 pub const SNOW_LINE_AU: f64 = 2.7;
 /// Dust retained per sweep INSIDE the snow line (rock/metal only).
-pub const ROCKY_ACCRETION_EFFICIENCY: f64 = 0.0001;
-/// Extra retention just beyond the snow line (ices + runaway gas capture).
-pub const GIANT_ACCRETION_EFFICIENCY: f64 = 0.02;
+pub const ROCKY_ACCRETION_EFFICIENCY: f64 = 3e-6;
+/// Base retention beyond the snow line (ices + runaway gas capture).
+pub const GIANT_ACCRETION_EFFICIENCY: f64 = 0.008;
+/// How steeply the giant-forming retention RISES with distance beyond the snow
+/// line, before `GIANT_EFOLD_AU` cuts it off again.
+///
+/// This exponent is what puts the gas giants where they belong. The RATE at
+/// which a body sweeps dust falls as ~r^-1.5 (the disc thins outward and orbits
+/// are slower), so a retention curve peaking AT the snow line handed the biggest
+/// planet to whichever seed sat closest to the star. Rising as (r/snow)^2.4
+/// over-compensates that gradient, so supply × retention peaks near ~6 AU.
+pub const GIANT_RISE_EXPONENT: f64 = 1.4;
 /// e-folding distance (AU) over which the giant-forming supply thins out.
 pub const GIANT_EFOLD_AU: f64 = 7.0;
 /// How strongly planetesimals feel the disc's vertical damping vs. the dust.
@@ -85,8 +94,9 @@ pub fn accretion_efficiency(distance_au: f64) -> f64 {
     if distance_au < SNOW_LINE_AU {
         return ROCKY_ACCRETION_EFFICIENCY;
     }
+    let rise = (distance_au / SNOW_LINE_AU).powf(GIANT_RISE_EXPONENT);
     let falloff = (-(distance_au - SNOW_LINE_AU) / GIANT_EFOLD_AU).exp();
-    ROCKY_ACCRETION_EFFICIENCY + GIANT_ACCRETION_EFFICIENCY * falloff
+    (ROCKY_ACCRETION_EFFICIENCY + GIANT_ACCRETION_EFFICIENCY * rise * falloff).min(1.0)
 }
 
 /// Compress the (astronomically scaled) stellar sim-time increment into a

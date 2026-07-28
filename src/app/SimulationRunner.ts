@@ -23,6 +23,7 @@ import { Clock, type ClockOptions } from '../sim/Clock';
 import type { SimulationEvent } from '../sim/events';
 import { BODY_STRIDE, PARTICLE_STRIDE, type PhysicsKernel } from '../sim/PhysicsKernel';
 import { StateHistory } from '../sim/StateHistory';
+import { stellarMassFromCloud } from '../config/starFormation';
 import { orbitalMu } from '../sim/TsFallbackKernel';
 import type { RenderState } from '../render/SceneManager';
 
@@ -84,6 +85,10 @@ export class SimulationRunner {
   private readonly kernel: PhysicsKernel;
   private readonly particleCount: number;
   private readonly remnantType: RemnantType;
+  /** Whether this star's death is a core-collapse supernova (staged visually). */
+  private readonly supernova: boolean;
+  /** Final mass (M☉) of the star this cloud assembles. */
+  private readonly stellarMass: number;
 
   /** Currently tracked lifecycle stage (mirrors the kernel's stage). */
   private stage: LifecycleStage = LifecycleStage.DustCloud;
@@ -91,6 +96,12 @@ export class SimulationRunner {
   private progress = 0;
   /** Latest physically meaningful elapsed sim time reported by the kernel. */
   private elapsed = 0;
+  /**
+   * Latest mass of the central object (M☉) reported by the kernel — the accreted
+   * core while forming, the star during its life, the remnant afterwards. Only a
+   * fraction of the configured CLOUD mass ever gets here.
+   */
+  private starMass = 0;
 
   /** Recorded render snapshots for time-travel / rewind. */
   private readonly history = new StateHistory(HISTORY_CAPACITY);
@@ -109,7 +120,13 @@ export class SimulationRunner {
     this.particleCount = options.particleCount ?? DEFAULT_PARTICLE_COUNT;
     this.clock = options.clock ?? new Clock({ pace: config.pace, ...options.clockOptions });
     const model = options.fateModel ?? defaultFateModel;
-    this.remnantType = model.determineFate(config.mass, config.composition).remnant;
+    // The death path follows the STAR's mass, which is only a fraction of the
+    // cloud the user configured (see `config/starFormation.ts`).
+    this.stellarMass = stellarMassFromCloud(config.mass, config.composition.metals);
+    const fate = model.determineFate(this.stellarMass, config.composition);
+    this.remnantType = fate.remnant;
+    this.supernova = fate.supernova;
+    this.starMass = this.stellarMass;
 
     this.kernel.init({ config, particleCount: this.particleCount });
   }
@@ -156,10 +173,12 @@ export class SimulationRunner {
 
     // Live stepping.
     const simDt = this.clock.advance(realDtSeconds);
-    const { events, stage, stageProgress, elapsedSimSeconds } = this.kernel.step(simDt);
+    const { events, stage, stageProgress, elapsedSimSeconds, starMassSolar } =
+      this.kernel.step(simDt);
     this.stage = stage;
     this.progress = stageProgress;
     this.elapsed = elapsedSimSeconds;
+    this.starMass = Number.isFinite(starMassSolar) ? starMassSolar : this.stellarMass;
     const state = this.buildState(stage);
     this.maybeRecord(dt, state);
     return { state, events, elapsed: this.elapsed, fromHistory: false };
@@ -177,6 +196,7 @@ export class SimulationRunner {
     this.stage = frame.state.stage;
     this.progress = frame.state.stageProgress;
     this.elapsed = frame.elapsed;
+    this.starMass = frame.state.mass;
     return { state: frame.state, events: [], elapsed: frame.elapsed, fromHistory: true };
   }
 
@@ -227,6 +247,7 @@ export class SimulationRunner {
     this.stage = LifecycleStage.DustCloud;
     this.progress = 0;
     this.elapsed = 0;
+    this.starMass = 0;
     this.history.clear();
     this.rewinding = false;
     this.recordAccumulator = 0;
@@ -248,10 +269,17 @@ export class SimulationRunner {
       bodyCount: Math.floor(bodies.length / BODY_STRIDE),
       stage,
       stageProgress: this.progress,
-      mass: this.config.mass,
+      // The STAR's mass, not the cloud's — the renderer and every label describe
+      // the object at the centre, which only ever assembles part of the cloud.
+      mass: this.starMass,
+      cloudMass: this.config.mass,
+      cloudExtent: this.config.cloudExtent,
+      // Let the renderer freeze its time-driven effects in step with the sim.
+      paused: this.clock.paused,
       composition: this.config.composition,
       mu: orbitalMu(this.config.mass),
       remnant: stage === LifecycleStage.Remnant ? this.remnantType : null,
+      supernova: this.supernova,
     };
   }
 }

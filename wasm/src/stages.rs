@@ -26,6 +26,7 @@ pub enum RemnantType {
     WhiteDwarf = 0,
     NeutronStar = 1,
     Pulsar = 2,
+    BlackHole = 3,
 }
 
 /// Discrete simulation events. Numeric values MUST match the TypeScript
@@ -75,8 +76,85 @@ const METALLICITY_LIFETIME_COEFFICIENT: f64 = 2.0;
 
 const SUPERNOVA_MIN_MASS: f64 = 8.0;
 const PULSAR_MIN_MASS: f64 = 12.0;
+/// Above this effective final STELLAR mass the core exceeds the TOV limit and
+/// collapses to a black hole (mirror of `blackHoleMinMass`).
+const BLACK_HOLE_MIN_MASS: f64 = 22.0;
+/// Above this the envelope is swallowed rather than expelled: direct collapse
+/// with no (or only a failed) supernova (mirror of `directCollapseMinMass`).
+const DIRECT_COLLAPSE_MIN_MASS: f64 = 40.0;
 const FATE_SOLAR_METALLICITY: f64 = 0.02;
 const METALS_MASS_LOSS_COEFFICIENT: f64 = 1.5;
+/// Chandrasekhar limit (M☉): the heaviest possible white dwarf.
+const CHANDRASEKHAR_MASS: f64 = 1.38;
+/// Tolman-Oppenheimer-Volkoff limit (M☉): the heaviest possible neutron star.
+const TOV_MASS: f64 = 2.2;
+
+// --- Star formation efficiency (mirror src/config/starFormation.ts) ---------
+
+/// Star formation efficiency of a 1 M☉ core.
+const SFE_BASE: f64 = 0.34;
+/// How the efficiency falls with cloud mass: eff proportional to M^-exponent.
+const SFE_MASS_EXPONENT: f64 = 0.08;
+const SFE_MIN: f64 = 0.16;
+const SFE_MAX: f64 = 0.42;
+const SFE_METALLICITY_COEFFICIENT: f64 = 1.2;
+
+/// Fraction of a cloud that ends up in the star (mirror of
+/// `starFormationEfficiency`).
+#[must_use]
+pub fn star_formation_efficiency(cloud_mass: f64, metals: f64) -> f64 {
+    let m = cloud_mass.max(1e-3);
+    let metal_excess = metals.max(0.0) - FATE_SOLAR_METALLICITY;
+    let metal_factor = (1.0 - SFE_METALLICITY_COEFFICIENT * metal_excess).clamp(0.7, 1.15);
+    (SFE_BASE * m.powf(-SFE_MASS_EXPONENT) * metal_factor).clamp(SFE_MIN, SFE_MAX)
+}
+
+/// Mass (M☉) of the star a cloud actually assembles — the rest ends up in the
+/// disc, in planets, or is blown back into the interstellar medium (mirror of
+/// `stellarMassFromCloud`). This is why a 40 M☉ cloud does NOT make a 40 M☉ star.
+#[must_use]
+pub fn stellar_mass_from_cloud(cloud_mass: f64, metals: f64) -> f64 {
+    let m = cloud_mass.max(0.0);
+    m * star_formation_efficiency(m, metals)
+}
+
+/// Cloud mass (M☉) needed to assemble a star of `stellar_mass` — the inverse of
+/// `stellar_mass_from_cloud` (mirror of `cloudMassForStar`), solved by fixed-point
+/// iteration because the efficiency itself depends on the cloud mass.
+#[cfg_attr(not(test), allow(dead_code))]
+#[must_use]
+pub fn cloud_mass_for_star(stellar_mass: f64, metals: f64) -> f64 {
+    let target = stellar_mass.max(0.0);
+    if target == 0.0 {
+        return 0.0;
+    }
+    let mut cloud = target / SFE_BASE;
+    for _ in 0..24 {
+        cloud = target / star_formation_efficiency(cloud, metals);
+    }
+    cloud
+}
+
+/// Mass (M☉) of the compact object a star of `stellar_mass` leaves behind
+/// (mirror of `remnantMass`). Only a fraction of the star survives its death.
+#[must_use]
+pub fn remnant_mass(stellar_mass: f64, remnant: RemnantType) -> f64 {
+    let m = stellar_mass.max(0.0);
+    match remnant {
+        RemnantType::WhiteDwarf => (0.4 + 0.11 * m).clamp(0.15, CHANDRASEKHAR_MASS),
+        RemnantType::NeutronStar | RemnantType::Pulsar => {
+            (1.15 + 0.03 * m).clamp(CHANDRASEKHAR_MASS, TOV_MASS)
+        }
+        RemnantType::BlackHole => {
+            let fallback = if m >= DIRECT_COLLAPSE_MIN_MASS {
+                0.75
+            } else {
+                0.35
+            };
+            (m * fallback).max(TOV_MASS * 1.5)
+        }
+    }
+}
 
 /// Effective final stellar mass after composition-driven mass loss (mirrors
 /// `effectiveFinalMass`).
@@ -96,6 +174,14 @@ pub fn determine_fate(mass: f64, metals: f64) -> FateOutcome {
         return FateOutcome {
             supernova: false,
             remnant: RemnantType::WhiteDwarf,
+        };
+    }
+    if final_mass >= BLACK_HOLE_MIN_MASS {
+        // Above the direct-collapse mass the envelope is swallowed instead of
+        // being expelled — the star simply winks out, leaving a black hole.
+        return FateOutcome {
+            supernova: final_mass < DIRECT_COLLAPSE_MIN_MASS,
+            remnant: RemnantType::BlackHole,
         };
     }
     if final_mass >= PULSAR_MIN_MASS {
@@ -167,6 +253,30 @@ mod tests {
         assert!(determine_fate(10.0, solar).supernova);
         assert_eq!(determine_fate(20.0, solar).remnant, RemnantType::Pulsar);
         assert!(determine_fate(20.0, solar).supernova);
+        // Above the TOV-limit progenitor mass nothing can halt the collapse.
+        assert_eq!(determine_fate(30.0, solar).remnant, RemnantType::BlackHole);
+        assert!(determine_fate(30.0, solar).supernova);
+        // ...and the heaviest progenitors collapse directly, with no supernova.
+        assert_eq!(determine_fate(60.0, solar).remnant, RemnantType::BlackHole);
+        assert!(!determine_fate(60.0, solar).supernova);
+    }
+
+    #[test]
+    fn only_a_fraction_of_the_cloud_reaches_the_star() {
+        for cloud in [1.0, 10.0, 40.0, 120.0] {
+            let star = stellar_mass_from_cloud(cloud, 0.02);
+            assert!(star < cloud * 0.45, "cloud {cloud} kept too much mass");
+            assert!(star > cloud * 0.15, "cloud {cloud} kept too little mass");
+        }
+        // Monotonic: a bigger cloud still makes a bigger star.
+        assert!(stellar_mass_from_cloud(50.0, 0.02) > stellar_mass_from_cloud(10.0, 0.02));
+    }
+
+    #[test]
+    fn remnant_keeps_only_part_of_the_star() {
+        assert!(remnant_mass(1.0, RemnantType::WhiteDwarf) < 1.0);
+        assert!(remnant_mass(15.0, RemnantType::NeutronStar) <= TOV_MASS);
+        assert!(remnant_mass(30.0, RemnantType::BlackHole) < 30.0);
     }
 
     #[test]

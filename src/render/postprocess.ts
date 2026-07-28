@@ -57,9 +57,13 @@ export function createPostProcessing(
   // the visible floor while the death shell and ignition flash still glow.
   const bloom = new UnrealBloomPass(
     new THREE.Vector2(width, height),
-    options.strength ?? 0.28,
+    options.strength ?? 0.26,
     options.radius ?? 0.45,
-    options.threshold ?? 0.55,
+    // Raised further for the compact remnants: a neutron star is drawn a dozen
+    // pixels across but is the brightest thing in the scene, so at a lower
+    // threshold it fed the coarsest bloom mip on its own and painted a faint
+    // grey RECTANGLE of glow around itself.
+    options.threshold ?? 0.72,
   );
   composer.addPass(bloom);
 

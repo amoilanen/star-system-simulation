@@ -37,7 +37,10 @@ import {
   type Vec3,
 } from '../../src/sim/PhysicsKernel';
 import { SimEventType } from '../../src/sim/events';
+import { DEATH_PHASES } from '../../src/sim/stages';
 import { LifecycleStage } from '../../src/config/fateModel';
+import { cloudMassForStar, stellarMassFromCloud } from '../../src/config/starFormation';
+import { GAS_GIANT_MIN_EARTH_MASSES, ICE_GIANT_MIN_EARTH_MASSES } from '../../src/ui/bodyInfo';
 import { Clock } from '../../src/sim/Clock';
 import { CATALOGS } from '../../src/i18n/i18n';
 import type { CloudComposition, SimulationConfig } from '../../src/config/SimulationConfig';
@@ -52,11 +55,19 @@ const LIFECYCLE_STEPS = 900;
 
 const SOLAR_COMPOSITION: CloudComposition = { hydrogen: 0.74, helium: 0.24, metals: 0.02 };
 
+/**
+ * Cloud mass (M☉) that assembles a SOLAR-mass star. Only ~a third of a cloud
+ * ever reaches the star (see `config/starFormation.ts`), so a test that wants
+ * the Sun's lifecycle has to start from a ~3 M☉ cloud — configuring `mass: 1`
+ * would leave a 0.34 M☉ red dwarf that outlives the universe.
+ */
+const SOLAR_CLOUD_MASS = cloudMassForStar(1, SOLAR_COMPOSITION.metals);
+
 function makeConfig(overrides: Partial<SimulationConfig> = {}): SimulationConfig {
   return {
     locale: 'en',
     composition: SOLAR_COMPOSITION,
-    mass: 1,
+    mass: SOLAR_CLOUD_MASS,
     cloudExtent: 50,
     pace: 0.5,
     showEventAnnotations: true,
@@ -408,12 +419,34 @@ describe('accretionEfficiency (snow line)', () => {
     expect(outside).toBeGreaterThan(inside * 50);
   });
 
-  it('declines with distance beyond the snow line (disc thins out)', () => {
-    const near = accretionEfficiency(3);
-    const mid = accretionEfficiency(10);
-    const far = accretionEfficiency(30);
-    expect(near).toBeGreaterThan(mid);
-    expect(mid).toBeGreaterThan(far);
+  it('keeps rising for a while beyond the snow line, then thins out', () => {
+    // Bug 2 ("gas giants form close to the star"): the curve must NOT peak at
+    // the snow line. Dust is swept at ~r^-1.5, so a retention curve that only
+    // fell off handed the biggest planet to the innermost seed.
+    expect(accretionEfficiency(10)).toBeGreaterThan(accretionEfficiency(3));
+    expect(accretionEfficiency(30)).toBeLessThan(accretionEfficiency(10));
+  });
+
+  it('peaks well beyond the snow line, not at it', () => {
+    let best = 0;
+    let bestAu = 0;
+    for (let au = 0.5; au <= 60; au += 0.1) {
+      const e = accretionEfficiency(au);
+      if (e > best) {
+        best = e;
+        bestAu = au;
+      }
+    }
+    // The giant-forming zone sits several AU OUTSIDE the snow line, which is
+    // what compensates the outward thinning of the disc.
+    expect(bestAu).toBeGreaterThan(SNOW_LINE_AU * 2);
+    expect(bestAu).toBeLessThan(20);
+  });
+
+  it('never retains more than the swept mass', () => {
+    for (let au = 0.1; au <= 200; au += 0.5) {
+      expect(accretionEfficiency(au)).toBeLessThanOrEqual(1);
+    }
   });
 
   it('returns 0 for degenerate distances', () => {
@@ -574,7 +607,7 @@ describe('TsFallbackKernel emergent physics invariants', () => {
       kernel.step(1e16);
     }
     const bodies = kernel.getBodyBuffer();
-    const mu = orbitalMu(1);
+    const mu = orbitalMu(SOLAR_CLOUD_MASS);
     const eccentricities: number[] = [];
     for (let i = 0; i < bodies.length / BODY_STRIDE; i += 1) {
       const base = i * BODY_STRIDE;
@@ -667,7 +700,8 @@ describe('TsFallbackKernel emergent physics invariants', () => {
 
     // The star's body-swallow zone; nothing should ever be found orbiting
     // inside it. Derived from the same expression the kernel uses.
-    const coreRadius = Math.min(2, Math.max(0.5, 50 * 0.02));
+    // Mirror of the kernel's `coreAccretionRadius` for a 50 AU cloud.
+    const coreRadius = Math.min(1.2, Math.max(0.4, 50 * 0.014));
     const swallowRadius = coreRadius * BODY_SWALLOW_FRACTION;
 
     for (let step = 0; step < 200; step += 1) {
@@ -735,7 +769,8 @@ describe('TsFallbackKernel emergent physics invariants', () => {
     const kernel = new TsFallbackKernel();
     kernel.init({ config: makeConfig(), particleCount: 100 });
     const bodies = kernel.getBodyBuffer();
-    const coreRadius = Math.min(2, Math.max(0.5, 50 * 0.02));
+    // Mirror of the kernel's `coreAccretionRadius` for a 50 AU cloud.
+    const coreRadius = Math.min(1.2, Math.max(0.4, 50 * 0.014));
     for (let i = 0; i < bodies.length / BODY_STRIDE; i += 1) {
       const base = i * BODY_STRIDE;
       const r = Math.hypot(bodies[base + BODY_OFFSET.x] ?? 0, bodies[base + BODY_OFFSET.z] ?? 0);
@@ -857,9 +892,13 @@ describe('bug 1 — nothing is left orbiting the remnant', () => {
       }
     }
     expect(debrisSeenAt).toBeGreaterThanOrEqual(0);
-    for (let i = 0; i < 60 && stage2 < LifecycleStage.Death; i += 1) {
-      stage2 = kernel2.step(1e16).stage;
+    // Drain on a much finer sim-dt so the star stays a red giant throughout: the
+    // debris must vanish through its OWN infall, not because the supernova blast
+    // later sweeps the system clean.
+    for (let i = 0; i < 60; i += 1) {
+      stage2 = kernel2.step(1e14).stage;
     }
+    expect(stage2).toBe(LifecycleStage.RedGiant);
     expect(internalParticles(kernel2).some((p) => p.kind === ParticleKind.Debris)).toBe(false);
     kernel2.dispose();
     kernel.dispose();
@@ -997,5 +1036,233 @@ describe('bug 3 — Solar-System proportions between bodies and their orbits', (
     // Still monotonic in mass, like the visual radius.
     expect(mergeRadius(1e-3, 1)).toBeGreaterThan(mergeRadius(1e-6, 1));
     expect(MIN_BODY_RADIUS).toBeLessThan(MAX_BODY_RADIUS);
+  });
+});
+
+describe('bug 2 — gas giants belong in the OUTER disc', () => {
+  /** Planets present once the star has ignited, sorted star-outward. */
+  function planetsAtIgnition(config: SimulationConfig): { au: number; earthMasses: number }[] {
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config, particleCount: 4000 });
+    let result = kernel.step(1e17);
+    for (let i = 0; i < LIFECYCLE_STEPS && result.stage < LifecycleStage.MainSequence; i += 1) {
+      result = kernel.step(1e17);
+    }
+    expect(result.stage).toBe(LifecycleStage.MainSequence);
+    const bodies = kernel.getBodyBuffer();
+    const planets: { au: number; earthMasses: number }[] = [];
+    for (let i = 0; i < bodies.length / BODY_STRIDE; i += 1) {
+      const base = i * BODY_STRIDE;
+      const type = Math.round(bodies[base + BODY_OFFSET.type] ?? 0) as BodyType;
+      if (type !== BodyType.Planet && type !== BodyType.Protoplanet) {
+        continue;
+      }
+      planets.push({
+        au: Math.hypot(
+          bodies[base + BODY_OFFSET.x] ?? 0,
+          bodies[base + BODY_OFFSET.y] ?? 0,
+          bodies[base + BODY_OFFSET.z] ?? 0,
+        ),
+        earthMasses: solarToEarthMasses(bodies[base + BODY_OFFSET.mass] ?? 0),
+      });
+    }
+    kernel.dispose();
+    return planets.sort((a, b) => a.au - b.au);
+  }
+
+  it('grows the most massive planet beyond the snow line, not next to the star', () => {
+    const planets = planetsAtIgnition(makeConfig());
+    expect(planets.length).toBeGreaterThan(4);
+
+    const heaviest = planets.reduce((a, b) => (b.earthMasses > a.earthMasses ? b : a));
+    // The reported bug: the biggest world used to be the innermost one.
+    expect(heaviest.au).toBeGreaterThan(SNOW_LINE_AU);
+    expect(heaviest.au).toBeLessThan(20);
+    // …and it is a genuine giant, not a slightly bigger rock.
+    expect(heaviest.earthMasses).toBeGreaterThan(GAS_GIANT_MIN_EARTH_MASSES);
+  });
+
+  it('leaves only small rocky worlds inside the snow line', () => {
+    const planets = planetsAtIgnition(makeConfig());
+    const inner = planets.filter((p) => p.au < SNOW_LINE_AU);
+    const outer = planets.filter((p) => p.au >= SNOW_LINE_AU);
+    expect(inner.length).toBeGreaterThan(0);
+    expect(outer.length).toBeGreaterThan(0);
+    for (const p of inner) {
+      expect(p.earthMasses).toBeLessThan(ICE_GIANT_MIN_EARTH_MASSES);
+    }
+    // Every inner world is dwarfed by the giants further out.
+    const heaviestInner = Math.max(...inner.map((p) => p.earthMasses));
+    const heaviestOuter = Math.max(...outer.map((p) => p.earthMasses));
+    expect(heaviestOuter).toBeGreaterThan(heaviestInner * 20);
+  });
+});
+
+describe('bug 6 — the cloud does not collapse into the star wholesale', () => {
+  it('caps the star at a fraction of its birth cloud', () => {
+    const cloud = 40;
+    const config = makeConfig({ mass: cloud });
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config, particleCount: 2000 });
+
+    // Formation is accretion-driven, so a tiny sim-dt still advances the orbital
+    // clock at full rate — and keeps this massive (short-lived) star from racing
+    // through its whole life before we can look at it.
+    const FORMATION_DT = 1e9;
+    let result = kernel.step(FORMATION_DT);
+    let peak = result.starMassSolar;
+    for (let i = 0; i < LIFECYCLE_STEPS && result.stage < LifecycleStage.MainSequence; i += 1) {
+      result = kernel.step(FORMATION_DT);
+      peak = Math.max(peak, result.starMassSolar);
+    }
+    expect(result.stage).toBe(LifecycleStage.MainSequence);
+
+    const expected = stellarMassFromCloud(cloud, SOLAR_COMPOSITION.metals);
+    // The whole point: a 40 M☉ cloud must NOT make a 40 M☉ star.
+    expect(expected).toBeLessThan(cloud * 0.45);
+    expect(peak).toBeCloseTo(expected, 5);
+
+    // Keep stepping: the star can never grow past its budget however much dust
+    // is still around — the rest is driven off by its own radiation.
+    for (let i = 0; i < 60; i += 1) {
+      result = kernel.step(FORMATION_DT);
+      expect(result.starMassSolar).toBeLessThanOrEqual(expected + 1e-9);
+    }
+    kernel.dispose();
+  });
+
+  it('reports the star growing from a seed rather than appearing fully formed', () => {
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config: makeConfig(), particleCount: 1500 });
+    const first = kernel.step(1e17).starMassSolar;
+    const final = stellarMassFromCloud(SOLAR_CLOUD_MASS, SOLAR_COMPOSITION.metals);
+    expect(first).toBeGreaterThan(0);
+    expect(first).toBeLessThan(final * 0.5);
+    kernel.dispose();
+  });
+
+  it('leaves only a compact remnant of the star behind', () => {
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config: makeConfig(), particleCount: 800 });
+    let result = kernel.step(1e17);
+    for (let i = 0; i < LIFECYCLE_STEPS && result.stage < LifecycleStage.Remnant; i += 1) {
+      result = kernel.step(1e17);
+    }
+    expect(result.stage).toBe(LifecycleStage.Remnant);
+    // A solar star leaves a ~0.5 M☉ white dwarf, not a 1 M☉ one.
+    expect(result.starMassSolar).toBeLessThan(0.8);
+    expect(result.starMassSolar).toBeGreaterThan(0.2);
+    kernel.dispose();
+  });
+});
+
+describe('the death is a watchable, physically staged sequence', () => {
+  /** Drive to the given stage with a deliberately enormous per-step sim dt. */
+  function driveTo(kernel: TsFallbackKernel, stage: LifecycleStage): number {
+    let steps = 0;
+    for (let i = 0; i < LIFECYCLE_STEPS; i += 1) {
+      const result = kernel.step(1e18);
+      steps += 1;
+      if (result.stage >= stage) {
+        return steps;
+      }
+    }
+    return -1;
+  }
+
+  it('never crosses the death in a single step, however fast the clock runs', () => {
+    // Reported: "the transition to the neutron star happens all of a sudden, the
+    // star just shrinks". The stellar clock is compressed by up to ~14 orders of
+    // magnitude, so one frame spanned far more than the ~10^4 yr the death lasts
+    // and the star jumped from red giant straight to remnant.
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config: makeConfig({ mass: cloudMassForStar(14, 0.02) }), particleCount: 1500 });
+
+    let deathSteps = 0;
+    let sawDeath = false;
+    let stage = LifecycleStage.DustCloud;
+    for (let i = 0; i < LIFECYCLE_STEPS && stage !== LifecycleStage.Remnant; i += 1) {
+      stage = kernel.step(1e18).stage;
+      if (stage === LifecycleStage.Death) {
+        sawDeath = true;
+        deathSteps += 1;
+      }
+    }
+    expect(sawDeath).toBe(true);
+    expect(stage).toBe(LifecycleStage.Remnant);
+    expect(deathSteps).toBeGreaterThan(DEATH_PHASES.minSteps * 0.9);
+    kernel.dispose();
+  });
+
+  it('reports a smoothly rising progress through the death rather than a jump', () => {
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config: makeConfig({ mass: cloudMassForStar(14, 0.02) }), particleCount: 800 });
+    expect(driveTo(kernel, LifecycleStage.Death)).toBeGreaterThan(0);
+
+    const samples: number[] = [];
+    for (let i = 0; i < DEATH_PHASES.minSteps; i += 1) {
+      const result = kernel.step(1e18);
+      if (result.stage !== LifecycleStage.Death) {
+        break;
+      }
+      samples.push(result.stageProgress);
+    }
+    expect(samples.length).toBeGreaterThan(DEATH_PHASES.minSteps * 0.8);
+    // Monotonic, and no single step swallows a large slice of the stage.
+    for (let i = 1; i < samples.length; i += 1) {
+      expect(samples[i]!).toBeGreaterThanOrEqual(samples[i - 1]!);
+      expect(samples[i]! - samples[i - 1]!).toBeLessThan(0.02);
+    }
+    kernel.dispose();
+  });
+
+  it('holds the blast until shock breakout, then throws an unbound shell', () => {
+    const cloud = cloudMassForStar(14, 0.02);
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config: makeConfig({ mass: cloud }), particleCount: 1500 });
+    expect(driveTo(kernel, LifecycleStage.Death)).toBeGreaterThan(0);
+
+    // The core is still imploding: nothing has been expelled yet.
+    expect(internalParticles(kernel).some((p) => p.kind === ParticleKind.Ejecta)).toBe(false);
+
+    let broke = false;
+    for (let i = 0; i < LIFECYCLE_STEPS && !broke; i += 1) {
+      const result = kernel.step(1e18);
+      broke =
+        result.stage !== LifecycleStage.Death || result.stageProgress >= DEATH_PHASES.shockBreakout;
+    }
+    const ejecta = internalParticles(kernel).filter((p) => p.kind === ParticleKind.Ejecta);
+    expect(ejecta.length).toBeGreaterThan(100);
+
+    // Every fragment is unbound, so the shell disperses and the remnant is left
+    // bare instead of ringed by fallback material.
+    const mu = orbitalMu(cloud);
+    for (const p of ejecta) {
+      const r = Math.hypot(p.x, p.y, p.z);
+      const speed = Math.hypot(p.vx, p.vy, p.vz);
+      expect(isBound(mu, r, speed)).toBe(false);
+    }
+    kernel.dispose();
+  });
+
+  it('keeps the expanding shell in frame long enough to be watched', () => {
+    // The shell has to sweep out THROUGH the planetary system, not leave it in a
+    // handful of frames: it is the whole death scene.
+    const cloud = cloudMassForStar(14, 0.02);
+    const kernel = new TsFallbackKernel();
+    kernel.init({ config: makeConfig({ mass: cloud }), particleCount: 1500 });
+    let stage = LifecycleStage.DustCloud;
+    for (let i = 0; i < LIFECYCLE_STEPS && stage !== LifecycleStage.Remnant; i += 1) {
+      stage = kernel.step(1e18).stage;
+    }
+    expect(stage).toBe(LifecycleStage.Remnant);
+    const radii = internalParticles(kernel).map((p) => Math.hypot(p.x, p.y, p.z));
+    expect(radii.length).toBeGreaterThan(500);
+    // Still a coherent SHELL — a narrow band of radii, not a filled ball.
+    const min = Math.min(...radii);
+    const max = Math.max(...radii);
+    expect(min).toBeGreaterThan(0);
+    expect(max / min).toBeLessThan(3);
+    kernel.dispose();
   });
 });

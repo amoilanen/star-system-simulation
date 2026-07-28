@@ -81,6 +81,8 @@ export class Hud {
   private readonly root: HTMLDivElement;
 
   private readonly pauseButton: HTMLButtonElement;
+  /** Big, unmissable "PAUSED" badge shown while the simulation is frozen. */
+  private readonly pausedBadge: HTMLDivElement;
   private rewindButton: HTMLButtonElement | null = null;
   private rewinding = false;
   private labelsInput: HTMLInputElement | null = null;
@@ -109,6 +111,15 @@ export class Hud {
     this.root = document.createElement('div');
     this.root.className = 'hud';
 
+    // Pause indicator. The pause CONTROL existed before, but nothing on screen
+    // confirmed the state, so a paused run was indistinguishable from a stalled
+    // one — this badge (plus the active button styling) makes it obvious.
+    this.pausedBadge = document.createElement('div');
+    this.pausedBadge.className = 'hud-paused';
+    this.pausedBadge.hidden = true;
+    this.translatables.set(this.pausedBadge, 'hud.paused');
+    options.container.appendChild(this.pausedBadge);
+
     // Status readouts.
     this.stageLabel = document.createElement('div');
     this.stageLabel.className = 'hud-stage';
@@ -136,8 +147,9 @@ export class Hud {
     this.speedLabel.className = 'hud-speed';
     paceField.appendChild(this.speedLabel);
 
-    // Transport + zoom buttons.
+    // Transport + zoom buttons. The pause button also advertises its shortcut.
     this.pauseButton = this.button('hud.pause', options.onTogglePause);
+    this.pauseButton.title = this.t('hud.pauseHint');
     // Rewind toggle: scrub backwards through recorded history, then resume.
     const onToggleRewind = options.onToggleRewind;
     if (onToggleRewind !== undefined) {
@@ -196,11 +208,16 @@ export class Hud {
     return this.labelsInput?.checked ?? false;
   }
 
-  /** Reflect the paused state (updates the pause/resume button label). */
+  /**
+   * Reflect the paused state: swap the button label, highlight the button and
+   * show/hide the on-screen PAUSED badge.
+   */
   setPaused(paused: boolean): void {
     this.paused = paused;
     this.translatables.set(this.pauseButton, paused ? 'hud.resume' : 'hud.pause');
     this.pauseButton.textContent = this.t(paused ? 'hud.resume' : 'hud.pause');
+    this.pauseButton.classList.toggle('hud-button--active', paused);
+    this.pausedBadge.hidden = !paused;
   }
 
   /** Reflect the rewinding state (updates the rewind button label + active style). */
@@ -289,6 +306,8 @@ export class Hud {
     for (const [element, messageId] of this.translatables) {
       element.textContent = this.t(messageId);
     }
+    this.pauseButton.title = this.t('hud.pauseHint');
+    this.setPaused(this.paused);
     this.setStage(this.stage);
     this.setBodyCount(this.bodyCount);
     this.setElapsedYears(this.elapsedYears);
@@ -352,5 +371,6 @@ export class Hud {
   /** Remove the HUD from the DOM. */
   destroy(): void {
     this.root.remove();
+    this.pausedBadge.remove();
   }
 }

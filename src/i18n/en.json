@@ -104,5 +104,14 @@
   "event.bodyConsumed": "A planet has spiralled into the star and been torn apart.",
   "hud.orbits": "Show orbits",
   "info.iceGiant.title": "Ice giant",
-  "info.iceGiant.desc": "A world of water, ammonia and methane ices around a rocky core, like Uranus or Neptune. It formed beyond the snow line but too far out to capture much gas."
+  "info.iceGiant.desc": "A world of water, ammonia and methane ices around a rocky core, like Uranus or Neptune. It formed beyond the snow line but too far out to capture much gas.",
+  "preset.blackHole": "Black-hole progenitor",
+  "remnant.blackHole": "black hole",
+  "setup.outcome": "→ forms a ~{star} M☉ star, which ends as a {remnant}. Most of the cloud never reaches the star.",
+  "info.blackHole.title": "Black hole",
+  "info.blackHole.desc": "The collapsed core of a very massive star, so dense that not even light escapes. What you see is the glowing accretion disc around its event horizon, not the object itself.",
+  "hud.paused": "PAUSED",
+  "hud.pauseHint": "Space",
+  "event.supernova": "The core collapses and the star tears itself apart in a supernova — brighter, for a moment, than the whole galaxy.",
+  "event.planetaryNebula": "The star gently sheds its outer layers into a glowing planetary nebula, laying its searing core bare."
 }

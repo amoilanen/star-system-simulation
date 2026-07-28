@@ -109,6 +109,10 @@ export function starSurfaceTemperatureK(
           return 6e5;
         case RemnantType.Pulsar:
           return 8e5;
+        case RemnantType.BlackHole:
+          // An event horizon has no surface at all; the number quoted is the
+          // Hawking temperature scale, which for a stellar-mass hole is ~1e-8 K.
+          return 0;
         case RemnantType.WhiteDwarf:
         default:
           return 15000;
@@ -152,6 +156,8 @@ export function starTitleId(stage: LifecycleStage, remnant: RemnantType | null):
           return 'info.neutronStar.title';
         case RemnantType.Pulsar:
           return 'info.pulsar.title';
+        case RemnantType.BlackHole:
+          return 'info.blackHole.title';
         case RemnantType.WhiteDwarf:
         default:
           return 'info.whiteDwarf.title';

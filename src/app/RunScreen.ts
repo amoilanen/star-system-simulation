@@ -82,6 +82,7 @@ export class RunScreen {
   };
   private readonly onPointerUp = (e: PointerEvent): void => this.handlePointerUp(e);
   private readonly onContextMenu = (e: MouseEvent): void => this.handleContextMenu(e);
+  private readonly onKeyDown = (e: KeyboardEvent): void => this.handleKeyDown(e);
 
   constructor(options: RunScreenOptions) {
     this.container = options.container;
@@ -175,6 +176,9 @@ export class RunScreen {
     this.scene.domElement.addEventListener('pointerup', this.onPointerUp);
     // Right-click a body to center the camera on it.
     this.scene.domElement.addEventListener('contextmenu', this.onContextMenu);
+    // Space / K pause anywhere on the run screen — the universal transport
+    // shortcut, so pausing never depends on finding the button first.
+    window.addEventListener('keydown', this.onKeyDown);
 
     this.scene.start((dt) => this.frame(dt));
   }
@@ -182,6 +186,7 @@ export class RunScreen {
   /** Tear down the run screen and release all resources. Idempotent. */
   destroy(): void {
     this.disposed = true;
+    window.removeEventListener('keydown', this.onKeyDown);
     if (this.scene !== null) {
       this.scene.domElement.removeEventListener('pointerdown', this.onPointerDown);
       this.scene.domElement.removeEventListener('pointerup', this.onPointerUp);
@@ -305,6 +310,32 @@ export class RunScreen {
   private handleTogglePause(): void {
     const paused = this.runner?.togglePause() ?? false;
     this.hud?.setPaused(paused);
+  }
+
+  /**
+   * Keyboard transport. Space (or K, the video-player convention) toggles pause;
+   * ignored while the user is typing into a form control so it never hijacks
+   * text entry.
+   */
+  private handleKeyDown(e: KeyboardEvent): void {
+    if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) {
+      return;
+    }
+    const target = e.target;
+    if (
+      target instanceof HTMLElement &&
+      (target.isContentEditable ||
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLSelectElement ||
+        target instanceof HTMLTextAreaElement)
+    ) {
+      return;
+    }
+    if (e.code === 'Space' || e.key === ' ' || e.key === 'k' || e.key === 'K') {
+      // Space would otherwise scroll the page / re-trigger the focused button.
+      e.preventDefault();
+      this.handleTogglePause();
+    }
   }
 
   /** Route a focus-selector change to the camera (star / free / a body). */

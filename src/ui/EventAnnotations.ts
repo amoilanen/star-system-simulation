@@ -10,7 +10,7 @@
 import { LifecycleStage, RemnantType } from '../config/fateModel';
 import type { Locale } from '../config/SimulationConfig';
 import { BodyType } from '../sim/PhysicsKernel';
-import type { SimEventType, SimulationEvent } from '../sim/events';
+import { SimEventType, type SimulationEvent } from '../sim/events';
 import { STAGE_ENTRY_EVENT } from '../sim/stages';
 import { i18n as sharedI18n, type I18n, type MessageParams } from '../i18n/i18n';
 import { STAGE_MESSAGE_IDS } from './Hud';
@@ -37,6 +37,7 @@ export const REMNANT_MESSAGE_IDS: Readonly<Record<RemnantType, string>> = {
   [RemnantType.WhiteDwarf]: 'remnant.whiteDwarf',
   [RemnantType.NeutronStar]: 'remnant.neutronStar',
   [RemnantType.Pulsar]: 'remnant.pulsar',
+  [RemnantType.BlackHole]: 'remnant.blackHole',
 };
 
 /** BodyType → i18n message id, for interpolating `{body}` into messages. */
@@ -74,6 +75,22 @@ export function annotationParams(
     params.id = data.bodyId;
   }
   return params;
+}
+
+/**
+ * The i18n key an event's annotation should actually use.
+ *
+ * Almost always the event's own `messageId`, but a star's death has two utterly
+ * different forms — a core-collapse SUPERNOVA or the quiet shedding of a
+ * planetary nebula — and the payload says which. Describing both as "the star
+ * reaches the end of its life" under-sells the most spectacular event in the
+ * simulation. Pure; exported for unit testing.
+ */
+export function annotationMessageId(event: SimulationEvent): string {
+  if (event.type === SimEventType.DeathEvent) {
+    return event.data?.supernova === true ? 'event.supernova' : 'event.planetaryNebula';
+  }
+  return event.messageId;
 }
 
 /** Options for constructing an {@link EventAnnotations} layer. */
@@ -126,7 +143,7 @@ export class EventAnnotations {
     }
     return this.i18n.translate(
       this.locale,
-      event.messageId,
+      annotationMessageId(event),
       annotationParams(event, this.i18n, this.locale),
     );
   }

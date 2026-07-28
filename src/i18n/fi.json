@@ -104,5 +104,14 @@
   "event.bodyConsumed": "Planeetta on kiertynyt tähteen ja repeytynyt kappaleiksi.",
   "hud.orbits": "Näytä radat",
   "info.iceGiant.title": "Jaattilaisplaneetta (jaa)",
-  "info.iceGiant.desc": "Vedesta, ammoniakista ja metaanijaasta koostuva maailma kivisen ytimen ymparilla, kuten Uranus tai Neptunus. Se syntyi lumirajan takana mutta liian kaukana kaapatakseen paljon kaasua."
+  "info.iceGiant.desc": "Vedesta, ammoniakista ja metaanijaasta koostuva maailma kivisen ytimen ymparilla, kuten Uranus tai Neptunus. Se syntyi lumirajan takana mutta liian kaukana kaapatakseen paljon kaasua.",
+  "preset.blackHole": "Mustan aukon esitähti",
+  "remnant.blackHole": "musta aukko",
+  "setup.outcome": "→ muodostaa noin {star} M☉ tähden, josta tulee lopulta {remnant}. Suurin osa pilvestä ei koskaan päädy tähteen.",
+  "info.blackHole.title": "Musta aukko",
+  "info.blackHole.desc": "Hyvin massiivisen tähden luhistunut ydin, niin tiheä ettei edes valo pääse pakoon. Näkyvissä on tapahtumahorisonttia kiertävä hehkuva kertymäkiekko, ei itse kohde.",
+  "hud.paused": "PYSÄYTETTY",
+  "hud.pauseHint": "Välilyönti",
+  "event.supernova": "Ydin luhistuu ja tähti repii itsensä kappaleiksi supernovassa — hetken ajan kirkkaampana kuin koko galaksi.",
+  "event.planetaryNebula": "Tähti työntää ulkokerroksensa hitaasti hehkuvaksi planetaariseksi sumuksi ja paljastaa polttavan ytimensä."
 }

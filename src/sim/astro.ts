@@ -147,6 +147,10 @@ export function coreTemperatureK(
         case RemnantType.NeutronStar:
         case RemnantType.Pulsar:
           return 1e9;
+        case RemnantType.BlackHole:
+          // No core, no surface: the accretion disc is the only hot thing left,
+          // and it reaches ~10^7 K near the innermost stable orbit.
+          return 1e7;
         case RemnantType.WhiteDwarf:
         default:
           return 1e7;

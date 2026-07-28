@@ -52,6 +52,34 @@ describe('Hud', () => {
     expect(button.textContent).toBe(i18n.translate('en', 'hud.pause'));
   });
 
+  it('shows an unmissable PAUSED badge and highlights the button while paused', () => {
+    const { hud } = makeHud(container);
+    const badge = container.querySelector('.hud-paused') as HTMLElement;
+    const button = [...hud.element.querySelectorAll('button')].find(
+      (b) => b.textContent === i18n.translate('en', 'hud.pause'),
+    ) as HTMLButtonElement;
+
+    expect(badge).toBeTruthy();
+    expect(badge.hidden).toBe(true);
+    expect(button.classList.contains('hud-button--active')).toBe(false);
+
+    hud.setPaused(true);
+    expect(badge.hidden).toBe(false);
+    expect(badge.textContent).toBe(i18n.translate('en', 'hud.paused'));
+    expect(button.classList.contains('hud-button--active')).toBe(true);
+    expect(hud.isPaused).toBe(true);
+
+    hud.setPaused(false);
+    expect(badge.hidden).toBe(true);
+    expect(button.classList.contains('hud-button--active')).toBe(false);
+  });
+
+  it('removes the paused badge on destroy', () => {
+    const { hud } = makeHud(container);
+    hud.destroy();
+    expect(container.querySelector('.hud-paused')).toBeNull();
+  });
+
   it('invokes callbacks from the controls', () => {
     const { hud, callbacks } = makeHud(container);
     const paceInput = hud.element.querySelector('input[type="range"]') as HTMLInputElement;

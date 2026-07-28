@@ -17,7 +17,47 @@ import {
   type SimulationConfig,
 } from '../config/SimulationConfig';
 import { DEFAULT_PRESET_ID, PRESETS, type SimulationPreset } from '../config/presets';
+import { determineFate, RemnantType } from '../config/fateModel';
+import { stellarMassFromCloud } from '../config/starFormation';
 import { i18n as sharedI18n, type I18n } from '../i18n/i18n';
+
+/**
+ * Cloud-mass bounds of the setup slider, in solar masses.
+ *
+ * The range is deliberately WIDE — and logarithmic, see {@link RangeControl} —
+ * because the cloud only turns about a third of itself into a star: reaching the
+ * ~22 M☉ stellar mass where core collapse produces a BLACK HOLE takes a cloud of
+ * roughly 90 M☉, which the old 40 M☉ ceiling could never supply. The bottom end
+ * reaches the sub-stellar regime so the full spectrum is explorable.
+ */
+export const MASS_MIN = 0.2;
+export const MASS_MAX = 250;
+
+/** Slider positions across the logarithmic mass range (finer ⇒ smoother drag). */
+const LOG_SLIDER_STEPS = 2000;
+
+/** i18n id naming each remnant kind, for the setup-screen fate preview. */
+const REMNANT_MESSAGE_IDS: Readonly<Record<RemnantType, string>> = {
+  [RemnantType.WhiteDwarf]: 'remnant.whiteDwarf',
+  [RemnantType.NeutronStar]: 'remnant.neutronStar',
+  [RemnantType.Pulsar]: 'remnant.pulsar',
+  [RemnantType.BlackHole]: 'remnant.blackHole',
+};
+
+/**
+ * A numeric slider whose VALUE may be spaced logarithmically over its range,
+ * decoupling the DOM position from the physical value. A linear slider spanning
+ * 0.2–250 M☉ would spend 99% of its travel above 3 M☉, making every ordinary
+ * star impossible to dial in; a logarithmic one gives each decade equal room.
+ */
+interface RangeControl {
+  /** The underlying `<input type="range">` (position space). */
+  readonly input: HTMLInputElement;
+  /** Current physical value. */
+  get(): number;
+  /** Set the physical value (clamped into range). */
+  set(value: number): void;
+}
 
 /** Raw, un-normalized state gathered from the form controls. */
 export interface SetupFormState {
@@ -86,13 +126,15 @@ export class SetupForm {
   // Controls kept for reading values + live re-translation.
   private readonly localeSelect: HTMLSelectElement;
   private readonly presetSelect: HTMLSelectElement;
-  private readonly massInput: HTMLInputElement;
-  private readonly extentInput: HTMLInputElement;
-  private readonly hydrogenInput: HTMLInputElement;
-  private readonly heliumInput: HTMLInputElement;
-  private readonly metalsInput: HTMLInputElement;
-  private readonly paceInput: HTMLInputElement;
+  private readonly massInput: RangeControl;
+  private readonly extentInput: RangeControl;
+  private readonly hydrogenInput: RangeControl;
+  private readonly heliumInput: RangeControl;
+  private readonly metalsInput: RangeControl;
+  private readonly paceInput: RangeControl;
   private readonly showEventsInput: HTMLInputElement;
+  /** Live "this cloud makes an X M☉ star that ends as a Y" preview. */
+  private readonly outcomeHint: HTMLParagraphElement;
 
   /** message id → label element, re-translated whenever the locale changes. */
   private readonly translatables = new Map<HTMLElement, string>();
@@ -132,8 +174,15 @@ export class SetupForm {
     const extentFmt = (v: number): string => `${Math.round(v)} AU`;
     const pctFmt = (v: number): string => `${Math.round(v * 100)}%`;
 
-    this.massInput = this.appendRange('setup.mass', 0.1, 40, 0.1, preset.mass, { format: massFmt });
-    this.extentInput = this.appendRange('setup.cloudExtent', 10, 150, 1, preset.cloudExtent, {
+    this.massInput = this.appendRange('setup.mass', MASS_MIN, MASS_MAX, 0.1, preset.mass, {
+      format: massFmt,
+      log: true,
+    });
+    // The headline of the whole setup screen: what this cloud actually becomes.
+    // Without it the mass slider is misleading, because only ~a third of the
+    // cloud ends up in the star.
+    this.outcomeHint = this.appendHint('setup.outcome');
+    this.extentInput = this.appendRange('setup.cloudExtent', 10, 250, 1, preset.cloudExtent, {
       format: extentFmt,
     });
 
@@ -169,6 +218,11 @@ export class SetupForm {
       maxLabelId: 'setup.pace.fast',
     });
 
+    // Keep the outcome preview in step with every control that feeds it.
+    for (const control of [this.massInput, this.metalsInput]) {
+      control.input.addEventListener('input', () => this.updateOutcomeHint());
+    }
+
     this.showEventsInput = this.appendCheckbox('setup.showEvents', false);
 
     this.appendSubmit('setup.start');
@@ -189,6 +243,27 @@ export class SetupForm {
     options.container.appendChild(this.root);
   }
 
+  /**
+   * Refresh the "→ star ≈ X M☉ · ends as a Y" line from the current controls.
+   * This is the only place the setup screen tells the user that the cloud mass
+   * is NOT the star's mass.
+   */
+  private updateOutcomeHint(): void {
+    const cloudMass = this.massInput.get();
+    const metals = this.metalsInput.get();
+    const starMass = stellarMassFromCloud(cloudMass, metals);
+    const composition = normalizeComposition({
+      hydrogen: Math.max(this.hydrogenInput.get(), 1e-9),
+      helium: this.heliumInput.get(),
+      metals,
+    });
+    const fate = determineFate(starMass, composition);
+    this.outcomeHint.textContent = this.i18n.translate(this.locale, 'setup.outcome', {
+      star: starMass >= 10 ? Math.round(starMass) : Number(starMass.toPrecision(2)),
+      remnant: this.t(REMNANT_MESSAGE_IDS[fate.remnant] ?? 'remnant.whiteDwarf'),
+    });
+  }
+
   /** The form's root element (for testing / manual mounting). */
   get element(): HTMLFormElement {
     return this.root;
@@ -204,13 +279,13 @@ export class SetupForm {
     return {
       locale: this.localeSelect.value as Locale,
       presetId: this.presetId,
-      mass: Number(this.massInput.value),
-      cloudExtent: Number(this.extentInput.value),
-      pace: Number(this.paceInput.value),
+      mass: this.massInput.get(),
+      cloudExtent: this.extentInput.get(),
+      pace: this.paceInput.get(),
       composition: {
-        hydrogen: Number(this.hydrogenInput.value),
-        helium: Number(this.heliumInput.value),
-        metals: Number(this.metalsInput.value),
+        hydrogen: this.hydrogenInput.get(),
+        helium: this.heliumInput.get(),
+        metals: this.metalsInput.get(),
       },
       showEventAnnotations: this.showEventsInput.checked,
     };
@@ -224,15 +299,16 @@ export class SetupForm {
     }
     this.presetId = preset.id;
     this.presetSelect.value = preset.id;
-    this.massInput.value = String(preset.mass);
-    this.extentInput.value = String(preset.cloudExtent);
-    this.hydrogenInput.value = String(preset.composition.hydrogen);
-    this.heliumInput.value = String(preset.composition.helium);
-    this.metalsInput.value = String(preset.composition.metals);
-    this.paceInput.value = String(preset.pace);
+    this.massInput.set(preset.mass);
+    this.extentInput.set(preset.cloudExtent);
+    this.hydrogenInput.set(preset.composition.hydrogen);
+    this.heliumInput.set(preset.composition.helium);
+    this.metalsInput.set(preset.composition.metals);
+    this.paceInput.set(preset.pace);
     for (const update of this.valueUpdaters) {
       update();
     }
+    this.updateOutcomeHint();
   }
 
   /** Re-translate every registered label into the active locale. */
@@ -240,6 +316,8 @@ export class SetupForm {
     for (const [element, messageId] of this.translatables) {
       element.textContent = this.t(messageId);
     }
+    // The outcome line is interpolated, not a static label.
+    this.updateOutcomeHint();
     // <option> labels are translated in place too.
     for (const option of this.localeSelect.options) {
       option.textContent = this.t(`setup.language.${option.value}`);
@@ -264,11 +342,12 @@ export class SetupForm {
     this.root.appendChild(el);
   }
 
-  private appendHint(messageId: string): void {
+  private appendHint(messageId: string): HTMLParagraphElement {
     const el = document.createElement('p');
     el.className = 'setup-hint';
     this.translatables.set(el, messageId);
     this.root.appendChild(el);
+    return el;
   }
 
   private appendSelect(
@@ -295,16 +374,46 @@ export class SetupForm {
     max: number,
     step: number,
     value: number,
-    opts?: { minLabelId?: string; maxLabelId?: string; format?: (v: number) => string },
-  ): HTMLInputElement {
+    opts?: {
+      minLabelId?: string;
+      maxLabelId?: string;
+      format?: (v: number) => string;
+      /** Space the values logarithmically over `[min, max]` (min must be > 0). */
+      log?: boolean;
+    },
+  ): RangeControl {
     const field = this.field(labelId);
     const input = document.createElement('input');
     input.type = 'range';
-    input.min = String(min);
-    input.max = String(max);
-    input.step = String(step);
-    input.value = String(value);
+    const logarithmic = opts?.log === true && min > 0;
+    // A log slider works in POSITION space (0..LOG_SLIDER_STEPS) and converts;
+    // a plain one uses the value directly.
+    const logMin = Math.log(min);
+    const logSpan = Math.log(max) - logMin;
+    const toValue = (position: number): number =>
+      logarithmic ? Math.exp(logMin + (position / LOG_SLIDER_STEPS) * logSpan) : position;
+    const toPosition = (v: number): number => {
+      const clamped = Math.min(max, Math.max(min, v));
+      return logarithmic ? ((Math.log(clamped) - logMin) / logSpan) * LOG_SLIDER_STEPS : clamped;
+    };
+    input.min = String(logarithmic ? 0 : min);
+    input.max = String(logarithmic ? LOG_SLIDER_STEPS : max);
+    input.step = String(logarithmic ? 1 : step);
+    input.value = String(toPosition(value));
     field.appendChild(input);
+
+    const control: RangeControl = {
+      input,
+      get: () => {
+        const raw = toValue(Number(input.value));
+        // Snap to the control's own step so the read-out and the emitted config
+        // agree and never show 3.2000000000000004 M☉.
+        return logarithmic ? Math.round(raw / step) * step : raw;
+      },
+      set: (v: number) => {
+        input.value = String(toPosition(v));
+      },
+    };
 
     // Live numeric read-out that tracks the slider (professional touch).
     if (opts?.format) {
@@ -312,7 +421,7 @@ export class SetupForm {
       const output = document.createElement('output');
       output.className = 'setup-value';
       const update = (): void => {
-        output.textContent = format(Number(input.value));
+        output.textContent = format(control.get());
       };
       input.addEventListener('input', update);
       this.valueUpdaters.push(update);
@@ -330,7 +439,7 @@ export class SetupForm {
       scale.append(lo, hi);
       field.appendChild(scale);
     }
-    return input;
+    return control;
   }
 
   /** Add the tagline shown under the main heading. */

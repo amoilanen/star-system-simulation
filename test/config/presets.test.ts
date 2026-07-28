@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { PRESETS, DEFAULT_PRESET_ID, configFromPreset } from '../../src/config/presets';
 import { isValidComposition } from '../../src/config/SimulationConfig';
 import { determineFate, RemnantType } from '../../src/config/fateModel';
+import { stellarMassFromCloud } from '../../src/config/starFormation';
 
 describe('presets', () => {
   it('exposes sun-like as the default preset', () => {
@@ -38,15 +39,36 @@ describe('presets', () => {
   });
 
   it('presets span the intended death paths for educational contrast', () => {
-    const sunLike = configFromPreset('sun-like');
-    const lowMass = configFromPreset('low-mass');
-    const highMass = configFromPreset('high-mass');
+    // Fates follow the STAR's mass, and a cloud only turns ~a third of itself
+    // into a star (see `starFormation.ts`) — so the preset must be resolved
+    // through that conversion, exactly as the runner does.
+    const fateOf = (id: string): ReturnType<typeof determineFate> => {
+      const config = configFromPreset(id);
+      const star = stellarMassFromCloud(config.mass, config.composition.metals);
+      return determineFate(star, config.composition);
+    };
 
-    expect(determineFate(sunLike.mass, sunLike.composition).remnant).toBe(RemnantType.WhiteDwarf);
-    expect(determineFate(lowMass.mass, lowMass.composition).remnant).toBe(RemnantType.WhiteDwarf);
+    expect(fateOf('sun-like').remnant).toBe(RemnantType.WhiteDwarf);
+    expect(fateOf('low-mass').remnant).toBe(RemnantType.WhiteDwarf);
 
-    const highFate = determineFate(highMass.mass, highMass.composition);
+    const highFate = fateOf('high-mass');
     expect(highFate.supernova).toBe(true);
     expect(highFate.remnant).toBe(RemnantType.Pulsar);
+
+    // A black hole must be REACHABLE from the setup screen (reported bug 1).
+    expect(fateOf('black-hole').remnant).toBe(RemnantType.BlackHole);
+  });
+
+  it('states cloud masses that really do assemble the intended stars', () => {
+    const starOf = (id: string): number => {
+      const config = configFromPreset(id);
+      return stellarMassFromCloud(config.mass, config.composition.metals);
+    };
+    expect(starOf('sun-like')).toBeCloseTo(1, 1);
+    expect(starOf('low-mass')).toBeCloseTo(0.5, 1);
+    // The cloud is always several times heavier than the star it makes.
+    for (const id of Object.keys(PRESETS)) {
+      expect(PRESETS[id]!.mass).toBeGreaterThan(starOf(id) * 2);
+    }
   });
 });

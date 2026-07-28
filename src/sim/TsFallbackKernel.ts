@@ -26,10 +26,17 @@
 // parity.
 
 import type { CloudComposition, SimulationConfig } from '../config/SimulationConfig';
-import { LifecycleStage, RemnantType, fateModel, type FateOutcome } from '../config/fateModel';
+import {
+  LifecycleStage,
+  RemnantType,
+  fateModel,
+  remnantMass,
+  type FateOutcome,
+} from '../config/fateModel';
+import { stellarMassFromCloud } from '../config/starFormation';
 import { auToScene, sceneToAu } from './astro';
 import { EventBus, SimEventType } from './events';
-import { stageDurations } from './stages';
+import { DEATH_PHASES, stageDurations } from './stages';
 import {
   BODY_OFFSET,
   BODY_STRIDE,
@@ -116,10 +123,24 @@ export const PLANETESIMAL_COUNT = 12;
 export const SNOW_LINE_AU = 2.7;
 
 /** Dust a planetesimal retains per sweep INSIDE the snow line (rock only). */
-export const ROCKY_ACCRETION_EFFICIENCY = 0.0001;
+export const ROCKY_ACCRETION_EFFICIENCY = 3e-6;
 
-/** Extra retention just beyond the snow line (ices + runaway gas capture). */
-export const GIANT_ACCRETION_EFFICIENCY = 0.02;
+/** Base retention beyond the snow line (ices + runaway gas capture). */
+export const GIANT_ACCRETION_EFFICIENCY = 0.008;
+
+/**
+ * How steeply the giant-forming retention RISES with distance beyond the snow
+ * line, before {@link GIANT_EFOLD_AU} cuts it off again.
+ *
+ * This exponent is what puts the gas giants where they belong. The RATE at which
+ * a body sweeps dust falls as ~r^-1.5 (the disc thins outward and orbits are
+ * slower), so a retention curve that merely peaked AT the snow line handed the
+ * biggest planet to whichever seed sat closest to the star — the reported bug:
+ * "gas giants form close to the star". Rising as (r/snow)^1.4 over-compensates
+ * that gradient, so the product (supply × retention) peaks near ~6 AU: the
+ * Jupiter zone, just outside the snow line but well clear of the inner system.
+ */
+export const GIANT_RISE_EXPONENT = 1.4;
 
 /** e-folding distance (AU) over which the giant-forming supply thins out. */
 export const GIANT_EFOLD_AU = 7;
@@ -132,19 +153,36 @@ export const GIANT_EFOLD_AU = 7;
 export const BODY_DAMP_FRACTION = 0.02;
 
 /**
- * Core mass fractions (accreted mass / total cloud mass) at which the FORMATION
- * stages advance. These are physics-driven — the star ignites once the core has
- * gravitationally gathered enough of the cloud — so formation is always visible
- * and independent of the (astronomically longer) stellar clock. Mirror in Rust.
+ * Core mass fractions (accreted mass / FINAL STELLAR mass) at which the
+ * FORMATION stages advance. These are physics-driven — the star ignites once the
+ * core has gravitationally gathered nearly all the mass it will ever have — so
+ * formation is always visible and independent of the (astronomically longer)
+ * stellar clock.
+ *
+ * NB these are fractions of the star's final mass, NOT of the cloud: the star
+ * only ever assembles a fraction of the cloud (see `starFormation.ts`), so a
+ * threshold expressed against the cloud mass could never be reached. Mirror in
+ * Rust.
  */
-export const PROTOSTAR_CORE_FRACTION = 0.1;
-export const FUSION_CORE_FRACTION = 0.3;
-export const IGNITION_CORE_FRACTION = 0.5;
+export const PROTOSTAR_CORE_FRACTION = 0.2;
+export const FUSION_CORE_FRACTION = 0.55;
+export const IGNITION_CORE_FRACTION = 0.9;
+
+/**
+ * Radiation-pressure-to-gravity ratio (β) felt by leftover dust ONCE THE STAR
+ * HAS IGNITED. β > 1 means the young star pushes harder than it pulls, so the
+ * residual cloud is blown back into interstellar space instead of continuing to
+ * rain onto the star — the real reason a main-sequence star is not still sitting
+ * inside its birth nebula, and the reason the star's final mass is only a
+ * fraction of the cloud it formed from.
+ */
+export const IGNITED_RADIATION_BETA = 1.16;
 
 /**
  * Maximum rate at which the protostar can swallow dust, as a FRACTION OF THE
- * CLOUD MASS per unit of orbital time (Ṁ, scaled by cloud mass so heavy clouds
- * both need and accrete more).
+ * STAR'S FINAL MASS per unit of orbital time (Ṁ). Scaling it to the star's mass
+ * rather than the cloud's keeps formation the same number of frames whatever
+ * cloud the user configured.
  *
  * This is the single most important pacing constant for formation, and it is
  * real physics, not a fudge: a protostar cannot accrete material as fast as
@@ -159,7 +197,7 @@ export const IGNITION_CORE_FRACTION = 0.5;
  * Dust that arrives faster than the cap simply stays in the visible inner disc
  * and is accreted over the following steps.
  */
-export const CORE_ACCRETION_RATE = 0.0055;
+export const CORE_ACCRETION_RATE = 0.008;
 
 /** Sim seconds between visiting comet/asteroid spawns. */
 const VISITOR_SPAWN_INTERVAL = 8e15;
@@ -170,8 +208,8 @@ const MAX_VISITORS = 10;
 /** Fraction of the cloud mass pre-seeded into the central protostar core. */
 const CORE_SEED_FRACTION = 0.04;
 
-/** Fraction of the cloud mass in each planetesimal seed (~3 M⊕ for 1 M☉). */
-const PLANETESIMAL_MASS_FRACTION = 1e-5;
+/** Fraction of the cloud mass in each planetesimal seed (~1 M⊕ for a solar cloud). */
+const PLANETESIMAL_MASS_FRACTION = 1e-6;
 
 /**
  * Fraction of swept dust a planetesimal RETAINS at `distanceAu`; the remainder
@@ -192,8 +230,9 @@ export function accretionEfficiency(distanceAu: number): number {
   if (distanceAu < SNOW_LINE_AU) {
     return ROCKY_ACCRETION_EFFICIENCY;
   }
+  const rise = Math.pow(distanceAu / SNOW_LINE_AU, GIANT_RISE_EXPONENT);
   const falloff = Math.exp(-(distanceAu - SNOW_LINE_AU) / GIANT_EFOLD_AU);
-  return ROCKY_ACCRETION_EFFICIENCY + GIANT_ACCRETION_EFFICIENCY * falloff;
+  return Math.min(1, ROCKY_ACCRETION_EFFICIENCY + GIANT_ACCRETION_EFFICIENCY * rise * falloff);
 }
 
 /**
@@ -223,11 +262,19 @@ export const MAX_BODY_RADIUS = 0.016;
 export const COMET_RADIUS = 0.008;
 export const ASTEROID_RADIUS = 0.006;
 
-/** Particles beyond this multiple of the cloud extent are considered escaped. */
+/** Dust/debris beyond this multiple of the cloud extent is considered escaped. */
 const ESCAPE_EXTENT_FACTOR = 2.4;
 
+/**
+ * Death EJECTA is followed far further out than ordinary dust. The expanding
+ * shell IS the death scene, so it must stay in the buffer while it sweeps
+ * outward through the planetary system and on past it — culling it at the dust
+ * radius made the supernova vanish moments after it went off.
+ */
+const EJECTA_ESCAPE_EXTENT_FACTOR = 9;
+
 /** Number of ejecta particles thrown out when the star dies (nebula/supernova). */
-const EJECTA_COUNT = 1200;
+const EJECTA_COUNT = 2200;
 
 /** Debris fragments spawned when a body is tidally disrupted by the star. */
 const DEBRIS_PER_BODY = 140;
@@ -249,13 +296,30 @@ export const DEBRIS_LIFETIME = 6;
 export const DEBRIS_DRAG = 0.6;
 
 /**
- * Minimum death-ejecta speed as a multiple of the LOCAL ESCAPE SPEED. Real
- * planetary-nebula and supernova ejecta always exceeds escape velocity — that is
- * why the shell disperses and leaves a bare remnant instead of settling into a
- * ring around it. Enforcing it here guarantees no ejecta can end up orbiting the
- * white dwarf/neutron star.
+ * How far the death shell coasts, in multiples of the cloud extent, over the
+ * span of the DEATH stage. A supernova's shell is driven out by one violent
+ * shock; a planetary nebula merely drifts away.
+ *
+ * The shell's speed is specified ASYMPTOTICALLY and GEOMETRICALLY, which fixes
+ * two things at once. Asymptotically: the fragment's total specific energy is
+ * exactly v∞²/2 > 0, so it is provably unbound and no part of the shell can
+ * settle into a ring around the remnant. (Launching at a marginal ~1.2× the
+ * local escape speed instead left it so close to zero energy that the
+ * integrator's own truncation error near the star could rob it of enough energy
+ * to fall back.) Geometrically: the shell sweeps the same fraction of the system
+ * over the same number of frames whatever the star's mass, so the death scene is
+ * framed identically for a red dwarf and for a black-hole progenitor — tying it
+ * to the orbital speed instead made massive systems fling their shell off-screen
+ * before the star had finished dying.
  */
-export const EJECTA_ESCAPE_MARGIN = 1.25;
+export const EJECTA_SHELL_REACH = { supernova: 5.5, nebula: 2.2 } as const;
+
+/**
+ * Radius (scene units) at which the ejecta shell is launched — outside the
+ * softened core, where the integrator resolves the motion comfortably, and about
+ * where a red supergiant's photosphere actually sits when the shock breaks out.
+ */
+const EJECTA_LAUNCH_RADIUS = { min: 3, max: 6 } as const;
 
 /**
  * Reach of the red giant's photosphere, in AU, for a 1 M☉ star (scaled by mass).
@@ -587,7 +651,16 @@ export class TsFallbackKernel implements PhysicsKernel {
 
   private cloudExtent = 50;
   private cloudMass = 1;
+  /**
+   * Mass (M☉) the star will actually assemble — a fraction of the cloud (see
+   * `starFormation.ts`). Core accretion is capped here: once the star reaches
+   * it, its own radiation blows the rest of the cloud away instead of letting it
+   * fall in. This is what stops a 40 M☉ cloud from producing a 40 M☉ star.
+   */
+  private starMass = 1;
   private coreMass = 0;
+  /** Cloud mass blown back into interstellar space by the ignited star. */
+  private dispersedMass = 0;
   /**
    * Mass that has left the dust pool but has NOT yet reached the star: the inner
    * accretion disc. Dust swept up by a planetesimal but not retained by it flows
@@ -642,11 +715,17 @@ export class TsFallbackKernel implements PhysicsKernel {
 
     this.cloudExtent = config.cloudExtent;
     this.cloudMass = Math.max(config.mass, Number.EPSILON);
+    this.starMass = Math.max(
+      stellarMassFromCloud(this.cloudMass, config.composition.metals),
+      Number.EPSILON,
+    );
     this.coreMass = this.cloudMass * CORE_SEED_FRACTION;
+    this.dispersedMass = 0;
     this.discReservoir = 0;
-    // Small capture zone (AU) so planets can orbit INSIDE the snow line; dust
-    // still reaches the star by spiralling in under gas drag.
-    this.coreAccretionRadius = Math.min(2, Math.max(0.5, config.cloudExtent * 0.02));
+    // Small capture zone (AU) so several planets can orbit INSIDE the snow line
+    // (that is where the terrestrial worlds belong); dust still reaches the star
+    // by spiralling in under gas drag.
+    this.coreAccretionRadius = Math.min(1.2, Math.max(0.4, config.cloudExtent * 0.014));
     this.bodySwallowRadius = this.coreAccretionRadius * BODY_SWALLOW_FRACTION;
     this.ejectRadius = config.cloudExtent * 1.5;
     this.simTime = 0;
@@ -656,13 +735,15 @@ export class TsFallbackKernel implements PhysicsKernel {
 
     this.stage = LifecycleStage.DustCloud;
     this.stellarElapsed = 0;
-    this.durations = stageDurations(config.mass, config.composition);
+    // Stellar timing and the death path follow the STAR's mass, not the cloud's:
+    // a 40 M☉ cloud makes a ~10 M☉ star, which lives far longer than a 40 M☉ one.
+    this.durations = stageDurations(this.starMass, config.composition);
     this.formationDuration =
       this.durations[LifecycleStage.DustCloud] +
       this.durations[LifecycleStage.ProtostarCoalescence] +
       this.durations[LifecycleStage.FusionIgnition];
-    this.fate = fateModel.determineFate(config.mass, config.composition);
-    this.coreFraction = this.coreMass / this.cloudMass;
+    this.fate = fateModel.determineFate(this.starMass, config.composition);
+    this.coreFraction = this.coreMass / this.starMass;
 
     this.seedParticles(init.particleCount);
     this.seedPlanetesimals();
@@ -683,6 +764,7 @@ export class TsFallbackKernel implements PhysicsKernel {
         stage: this.stage,
         stageProgress: this.stageProgress(),
         elapsedSimSeconds: this.elapsedSimSeconds(),
+        starMassSolar: this.currentStarMass(),
       };
     }
 
@@ -704,18 +786,21 @@ export class TsFallbackKernel implements PhysicsKernel {
     }
 
     // Drive the lifecycle: FORMATION from accreted core mass, STELLAR from time.
-    this.coreFraction = this.coreMass / Math.max(this.cloudMass, Number.EPSILON);
+    this.coreFraction = this.coreMass / Math.max(this.starMass, Number.EPSILON);
     this.advanceStages(dtSimSeconds, this.coreFraction);
 
     // Once the star ignites, the surviving planetesimals are full planets.
     if (this.stage >= LifecycleStage.FusionIgnition) {
       this.promotePlanets();
     }
-    // When the star dies, sweep away everything still circling it (a real
-    // system's disc and any tidal debris are long gone by the remnant stage —
-    // otherwise they would be seen orbiting forever right next to the white
-    // dwarf) and throw a shell of ejecta outward.
-    if (this.stage >= LifecycleStage.Death && !this.ejectaDone) {
+    // The shell is thrown at SHOCK BREAKOUT, not at the instant the star enters
+    // its death throes: the core spends the first moments imploding, and only
+    // when the rebound shock reaches the surface is anything actually expelled.
+    // The renderer draws its flash on the same fraction, so the ejecta appears
+    // exactly when the star flares. (Everything still circling the star is swept
+    // away at the same moment — a real system's disc and any tidal debris are
+    // long gone by the remnant stage, and the blast would clear them anyway.)
+    if (!this.ejectaDone && this.hasShockBrokenOut()) {
       this.dissipateDiscMaterial();
       this.spawnEjecta();
       this.ejectaDone = true;
@@ -733,7 +818,37 @@ export class TsFallbackKernel implements PhysicsKernel {
       stage: this.stage,
       stageProgress: this.stageProgress(),
       elapsedSimSeconds: this.elapsedSimSeconds(),
+      starMassSolar: this.currentStarMass(),
     };
+  }
+
+  /**
+   * Whether the rebound shock has reached the surface, so the star is now
+   * actually blowing its envelope off. True from partway through the Death
+   * stage onward (see {@link DEATH_PHASES}).
+   */
+  private hasShockBrokenOut(): boolean {
+    if (this.stage > LifecycleStage.Death) {
+      return true;
+    }
+    return (
+      this.stage === LifecycleStage.Death && this.stageProgress() >= DEATH_PHASES.shockBreakout
+    );
+  }
+
+  /**
+   * The mass (M☉) the central object has RIGHT NOW: the accreted core while the
+   * star is still assembling, the finished star during its life, and only the
+   * compact remnant's mass once it has died — the star sheds the rest.
+   */
+  private currentStarMass(): number {
+    if (this.stage < LifecycleStage.MainSequence) {
+      return Math.min(this.coreMass, this.starMass);
+    }
+    if (this.stage === LifecycleStage.Remnant) {
+      return remnantMass(this.starMass, this.fate.remnant);
+    }
+    return this.starMass;
   }
 
   /**
@@ -767,7 +882,10 @@ export class TsFallbackKernel implements PhysicsKernel {
       Number.isFinite(simDt) &&
       simDt > 0
     ) {
-      this.stellarElapsed += simDt;
+      // Bound how much of the DEATH stage a single step may consume, so the
+      // collapse → flash → expanding fireball sequence is always watchable
+      // instead of being crossed whole inside one frame (see DEATH_PHASES).
+      this.stellarElapsed += this.stage === LifecycleStage.Death ? this.deathStep(simDt) : simDt;
       let guard = 0;
       while (guard < 8) {
         guard += 1;
@@ -783,6 +901,11 @@ export class TsFallbackKernel implements PhysicsKernel {
           this.emitStageEvent(SimEventType.RedGiantOnset);
         } else if (this.stage === LifecycleStage.RedGiant) {
           this.stage = LifecycleStage.Death;
+          // Whatever time was left over from the red giant must NOT be carried
+          // into the death: at a fast pace it is astronomically more than the
+          // death lasts and would fling the star straight through to the
+          // remnant in the same step it entered.
+          this.stellarElapsed = Math.min(this.stellarElapsed, this.deathStep(Infinity));
           this.emitStageEvent(SimEventType.DeathEvent, { supernova: this.fate.supernova });
         } else if (this.stage === LifecycleStage.Death) {
           this.stage = LifecycleStage.Remnant;
@@ -799,6 +922,20 @@ export class TsFallbackKernel implements PhysicsKernel {
         }
       }
     }
+  }
+
+  /**
+   * How much sim time one step may advance the DEATH stage: at most a
+   * {@link DEATH_PHASES.minSteps} fraction of the stage. At a slow pace `simDt`
+   * is far below the cap and the death runs at its true rate; only when the
+   * compressed clock would otherwise skip the whole event does the cap bite.
+   */
+  private deathStep(simDt: number): number {
+    const dur = this.durations[LifecycleStage.Death];
+    if (!Number.isFinite(dur) || dur <= 0) {
+      return simDt;
+    }
+    return Math.min(simDt, dur / DEATH_PHASES.minSteps);
   }
 
   /** Emit a lifecycle event stamped with the current sim time. */
@@ -941,7 +1078,7 @@ export class TsFallbackKernel implements PhysicsKernel {
       // with a modest vertical spread that dissipation collapses into a thin
       // disc. Concentration + sub-Keplerian spin let the cloud drain onto the
       // forming star over the formation phase.
-      const rho = extent * (0.04 + 0.56 * this.rng());
+      const rho = extent * (0.015 + 0.585 * this.rng());
       const phi = 2 * Math.PI * this.rng();
       const x = rho * Math.cos(phi);
       const z = rho * Math.sin(phi);
@@ -981,8 +1118,13 @@ export class TsFallbackKernel implements PhysicsKernel {
     // including our own, via the Titius–Bode pattern — space their planets by
     // roughly constant ratios, because that is the spacing at which neighbouring
     // feeding zones stop overlapping.
-    const inner = Math.max(this.cloudExtent * 0.02, this.coreAccretionRadius * 1.3);
-    const outer = Math.max(inner * 4, this.cloudExtent * 0.8);
+    // The innermost seed sits just outside the star's dust-capture zone, which is
+    // now small enough (≈0.7 AU for a 50 AU cloud) that FOUR seeds land inside
+    // the 2.7 AU snow line — the terrestrial zone. Previously the first seed was
+    // already at the snow line, so every planet was an ice/gas world and the
+    // biggest one always formed closest to the star.
+    const inner = Math.max(this.cloudExtent * 0.008, this.coreAccretionRadius * 1.4);
+    const outer = Math.max(inner * 6, this.cloudExtent * 0.75);
     const mass = this.cloudMass * PLANETESIMAL_MASS_FRACTION;
     const ratio =
       PLANETESIMAL_COUNT > 1 ? Math.pow(outer / inner, 1 / (PLANETESIMAL_COUNT - 1)) : 1;
@@ -1034,9 +1176,14 @@ export class TsFallbackKernel implements PhysicsKernel {
     // Debris from a disrupted body is shocked, self-colliding material on its
     // way into the star, so it bleeds angular momentum far faster than disc gas.
     const debrisDrag = Math.max(0, 1 - DEBRIS_DRAG * h);
+    // Once fusion has ignited, the star's radiation pressure exceeds its pull on
+    // the leftover grains (β > 1), so the residual cloud is driven OUT instead of
+    // continuing to fall in. Only the dust feels this; ejecta and tidal debris
+    // are dense, optically thick material.
+    const dustGravity = forming ? 1 : 1 - IGNITED_RADIATION_BETA;
     for (const p of this.particles) {
-      const a = softenedAccel(mu, SOFTENING, [p.x, p.y, p.z]);
       const dust = p.kind === ParticleKind.Dust;
+      const a = softenedAccel(dust ? mu * dustGravity : mu, SOFTENING, [p.x, p.y, p.z]);
       const drag = dust ? dustDrag : p.kind === ParticleKind.Debris ? debrisDrag : 1;
       // Vertical dissipation is a DISC phenomenon (grain-on-grain collisions in a
       // dense midplane). Applying it to the death shell would squash a spherical
@@ -1100,16 +1247,31 @@ export class TsFallbackKernel implements PhysicsKernel {
     const survivors: Particle[] = [];
     const captureRadius = this.captureRadius;
     const coreR2 = captureRadius * captureRadius;
+    // How much mass the star can still take AT ALL. A star only ever assembles a
+    // fraction of its birth cloud (see `starFormation.ts`); past that point its
+    // own radiation drives the rest away, so the remaining dust is dispersed
+    // rather than swallowed. This is what makes a 40 M☉ cloud yield a ~10 M☉
+    // star instead of a 40 M☉ one.
+    const capacity = Math.max(0, this.starMass - this.coreMass);
+    const starFull = capacity <= 0;
     // Angular-momentum-regulated accretion budget for this step: the star can
     // only take so much mass per unit time (see CORE_ACCRETION_RATE). Dust that
     // arrives faster stays in the inner disc and is swallowed on later steps.
-    let coreBudget = CORE_ACCRETION_RATE * cloudMass * Math.max(orbitalDt, 0);
+    let coreBudget = Math.min(
+      capacity,
+      CORE_ACCRETION_RATE * this.starMass * Math.max(orbitalDt, 0),
+    );
 
     // Material already waiting in the inner disc reaches the star first.
     const fromReservoir = Math.min(this.discReservoir, coreBudget);
     this.discReservoir -= fromReservoir;
     this.coreMass += fromReservoir;
     coreBudget -= fromReservoir;
+    if (starFull && this.discReservoir > 0) {
+      // The star can take no more: the inner disc is photo-evaporated away.
+      this.dispersedMass += this.discReservoir;
+      this.discReservoir = 0;
+    }
     // Precompute each body's squared accretion radius.
     const bodyR2 = this.bodies.map((b) =>
       b.type === BodyType.Protoplanet || b.type === BodyType.Planet
@@ -1123,6 +1285,12 @@ export class TsFallbackKernel implements PhysicsKernel {
         if (coreBudget >= p.mass) {
           coreBudget -= p.mass;
           this.coreMass += p.mass; // swallowed by the protostar
+          continue;
+        }
+        if (starFull) {
+          // The star has all the mass it will ever have; anything still falling
+          // in is blown back out by its radiation rather than accreted.
+          this.dispersedMass += p.mass;
           continue;
         }
         // Over the accretion rate limit: the grain waits in the inner disc
@@ -1215,9 +1383,9 @@ export class TsFallbackKernel implements PhysicsKernel {
     this.bodies = survivors;
   }
 
-  /** Red-giant photospheric reach in scene units (∝ mass^0.3). */
+  /** Red-giant photospheric reach in scene units (∝ stellar mass^0.3). */
   private redGiantEngulfRadius(): number {
-    return auToScene(REDGIANT_ENGULF_AU * Math.pow(Math.max(this.cloudMass, 0.1), 0.3));
+    return auToScene(REDGIANT_ENGULF_AU * Math.pow(Math.max(this.starMass, 0.1), 0.3));
   }
 
   /**
@@ -1227,7 +1395,13 @@ export class TsFallbackKernel implements PhysicsKernel {
    * crowded around the tiny remnant, which is not physically plausible.
    */
   private expandOrbitsAfterMassLoss(): void {
-    const retained = this.fate.supernova ? 0.16 : 0.55;
+    // How much of the star actually survives as the compact object — the single
+    // source of truth is the fate model, so the orbital widening the planets feel
+    // matches the remnant mass reported in the UI.
+    const retained = Math.min(
+      1,
+      Math.max(0.02, remnantMass(this.starMass, this.fate.remnant) / this.starMass),
+    );
     const f = Math.min(REMNANT_ORBIT_EXPANSION_MAX, Math.max(1, 1 / retained));
     const vScale = 1 / Math.sqrt(f);
     for (const body of this.bodies) {
@@ -1351,14 +1525,17 @@ export class TsFallbackKernel implements PhysicsKernel {
     }
   }
 
-  /** Remove dust that has escaped far beyond the system (keeps counts bounded). */
+  /** Remove particles that have escaped far beyond the system (bounds counts). */
   private cullParticles(): void {
-    const escape = this.cloudExtent * ESCAPE_EXTENT_FACTOR;
-    const escape2 = escape * escape;
+    const dust = this.cloudExtent * ESCAPE_EXTENT_FACTOR;
+    const dust2 = dust * dust;
+    const ejecta = this.cloudExtent * EJECTA_ESCAPE_EXTENT_FACTOR;
+    const ejecta2 = ejecta * ejecta;
     let changed = false;
     const survivors: Particle[] = [];
     for (const p of this.particles) {
-      if (p.x * p.x + p.y * p.y + p.z * p.z <= escape2) {
+      const limit2 = p.kind === ParticleKind.Ejecta ? ejecta2 : dust2;
+      if (p.x * p.x + p.y * p.y + p.z * p.z <= limit2) {
         survivors.push(p);
       } else {
         changed = true;
@@ -1395,23 +1572,35 @@ export class TsFallbackKernel implements PhysicsKernel {
   private spawnEjecta(): void {
     const budget = Math.max(0, MAX_PARTICLES - this.particles.length);
     const n = Math.min(EJECTA_COUNT, budget);
-    // Faster shell for a supernova; gentler for a quiet envelope ejection.
-    const violent = this.cloudMass >= 8;
-    const baseSpeed = (violent ? 26 : 12) * Math.sqrt(this.mu / (this.cloudExtent + 1));
+    const violent = this.fate.supernova;
+    // A supernova's envelope is accelerated by a single shock into a layered,
+    // velocity-stratified shell; a planetary nebula is puffed off gently over
+    // millennia, so it is slower and more ragged.
+    // Orbital time the death stage spans at the fastest pace: the bounded number
+    // of steps times the bounded orbital time each may advance.
+    const deathSpan = DEATH_PHASES.minSteps * ORBITAL_MAX;
+    const reach = violent ? EJECTA_SHELL_REACH.supernova : EJECTA_SHELL_REACH.nebula;
+    const terminal = (reach * this.cloudExtent) / deathSpan;
+    const spread = violent ? 0.5 : 0.28;
+    const launchSpan = EJECTA_LAUNCH_RADIUS.max - EJECTA_LAUNCH_RADIUS.min;
     for (let i = 0; i < n; i += 1) {
       const cosT = 2 * this.rng() - 1;
       const sinT = Math.sqrt(Math.max(0, 1 - cosT * cosT));
       const phi = 2 * Math.PI * this.rng();
       const dir: Vec3 = [sinT * Math.cos(phi), cosT, sinT * Math.sin(phi)];
-      const r0 = 1 + this.rng() * 2;
-      // Never below the local escape speed: real nebula/supernova ejecta is
-      // unbound, which is why the shell disperses and leaves a BARE remnant
-      // instead of settling into a ring of particles around it.
+      const r0 = EJECTA_LAUNCH_RADIUS.min + this.rng() * launchSpan;
+      // Launch fast enough that, after climbing out of the star's potential
+      // well, the fragment is still coasting at `vInfinity` — i.e. unbound with
+      // a known asymptotic speed.
       const escapeSpeed = Math.sqrt((2 * this.mu) / Math.max(r0, Number.EPSILON));
-      const speed = Math.max(
-        baseSpeed * (0.6 + 0.8 * this.rng()),
-        EJECTA_ESCAPE_MARGIN * escapeSpeed,
-      );
+      const roll = this.rng();
+      const vInfinity = terminal * (1 + spread * roll);
+      const speed = Math.hypot(vInfinity, escapeSpeed);
+      // Velocity stratification: a supernova's ejecta is layered, and the fastest
+      // outermost material is the hottest — so the shell shades from a blue-white
+      // leading edge through white to a cooler red-orange interior, which is what
+      // gives a real remnant its colour structure.
+      const heat = violent ? roll : roll * 0.5;
       this.particles.push({
         x: dir[0] * r0,
         y: dir[1] * r0,
@@ -1419,10 +1608,10 @@ export class TsFallbackKernel implements PhysicsKernel {
         vx: dir[0] * speed,
         vy: dir[1] * speed,
         vz: dir[2] * speed,
-        r: violent ? 1.0 : 0.9,
-        g: violent ? 0.7 : 0.5,
-        b: violent ? 0.5 : 0.9,
-        size: 1.6,
+        r: violent ? 1.0 - 0.35 * heat : 0.95,
+        g: violent ? 0.45 + 0.45 * heat : 0.55,
+        b: violent ? 0.3 + 0.7 * heat : 0.85,
+        size: violent ? 1.5 + 0.8 * heat : 1.6,
         mass: 0,
         kind: ParticleKind.Ejecta,
         ttl: Infinity,

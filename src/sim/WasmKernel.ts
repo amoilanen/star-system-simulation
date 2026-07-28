@@ -30,6 +30,7 @@ export interface WasmKernelHandle {
   stage(): number;
   stage_progress(): number;
   elapsed_sim_seconds(): number;
+  star_mass_solar(): number;
   free(): void;
 }
 
@@ -81,6 +82,7 @@ export class WasmKernel implements PhysicsKernel {
       stage: handle.stage() as LifecycleStage,
       stageProgress: handle.stage_progress(),
       elapsedSimSeconds: handle.elapsed_sim_seconds(),
+      starMassSolar: handle.star_mass_solar(),
     };
   }
 

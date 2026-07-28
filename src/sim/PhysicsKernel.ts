@@ -53,6 +53,17 @@ export interface StepResult {
    * a few dozen years.
    */
   elapsedSimSeconds: number;
+  /**
+   * Mass of the central object RIGHT NOW, in solar masses.
+   *
+   * This is NOT the configured cloud mass: only a fraction of a cloud ever
+   * reaches the star (see `config/starFormation.ts`), so this ramps up with the
+   * accreted core during formation, settles at the star's final mass for its
+   * life, and drops to the compact remnant's mass once the star has died.
+   * Everything stellar the user sees (temperature, radius, label mass) is
+   * derived from this value.
+   */
+  starMassSolar: number;
 }
 
 // --- Particle buffer layout (interleaved Float32Array) ----------------------

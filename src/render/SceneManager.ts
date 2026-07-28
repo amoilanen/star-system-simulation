@@ -35,10 +35,18 @@ export interface RenderState {
   stage: LifecycleStage;
   /** Normalized progress 0..1 through the current stage (smooth transitions). */
   stageProgress: number;
-  /** Cloud mass in M☉ (drives main-sequence temperature/radius). */
+  /**
+   * The CENTRAL OBJECT's current mass in M☉ — the accreted protostellar core, the
+   * finished star, or the compact remnant (drives temperature/radius/labels).
+   * Only a fraction of {@link RenderState.cloudMass} ever ends up here.
+   */
   mass: number;
+  /** The configured birth-cloud mass in M☉ (for reference/UI only). */
+  cloudMass: number;
   /** Cloud composition (drives the star's colour tint with metallicity). */
   composition: CloudComposition;
+  /** Whether the simulation is paused — freezes every time-based visual effect. */
+  paused?: boolean;
   /**
    * Central gravitational parameter the kernel integrates against, so the
    * orbit overlay can reconstruct the exact conics the bodies are following.
@@ -46,6 +54,17 @@ export interface RenderState {
   mu: number;
   /** Terminal remnant kind, or null before the remnant stage. */
   remnant: RemnantType | null;
+  /**
+   * Whether this star's death is (or was) a core-collapse SUPERNOVA rather than
+   * a quiet planetary-nebula shedding. Known from the fate model long before the
+   * star dies, because the death scene has to be staged differently for each.
+   */
+  supernova?: boolean;
+  /**
+   * Radius of the birth cloud in scene units, so the death's blast shell can be
+   * scaled to the system it is tearing through rather than to the star.
+   */
+  cloudExtent?: number;
 }
 
 /** Options for {@link SceneManager}. */
@@ -211,6 +230,11 @@ export class SceneManager {
   /** Render a single frame from the given state and elapsed real time. */
   render(state: RenderState, realDtSeconds: number): void {
     const dt = Number.isFinite(realDtSeconds) && realDtSeconds > 0 ? realDtSeconds : 0;
+    // While paused the SIMULATION is frozen, so every time-driven visual must
+    // freeze with it — a churning stellar surface, sweeping pulsar beams and
+    // orbiting moons on an otherwise motionless system read as "not paused".
+    // The camera keeps its own real dt so orbiting/zooming still works.
+    const animDt = state.paused === true ? 0 : dt;
 
     // Dust is now PHYSICALLY depleted by the kernel (accreted onto the star and
     // planets, or blown out as ejecta at death), so the particle buffer already
@@ -218,13 +242,13 @@ export class SceneManager {
     // brightness ease keeps the residual circumstellar disc from over-glowing
     // while the freshly-ejected death shell (bright by its own colour) still pops.
     this.particleField.update(state.particles, state.particleCount);
-    const ease = dt > 0 ? Math.min(1, dt * 1.5) : 1;
+    const ease = animDt > 0 ? Math.min(1, animDt * 1.5) : 1;
     const targetDust = dustBrightnessForStage(state.stage);
     this.dustBrightness += (targetDust - this.dustBrightness) * ease;
     this.particleField.setBrightness(this.dustBrightness);
 
     const viewportHeightPx = this.renderer.domElement.clientHeight || this.container.clientHeight;
-    this.bodyRenderer.update(state.bodies, state.bodyCount, dt, this.camera, viewportHeightPx);
+    this.bodyRenderer.update(state.bodies, state.bodyCount, animDt, this.camera, viewportHeightPx);
     this.orbits.update(state.bodies, state.bodyCount, state.mu);
 
     const appearance = starAppearance(
@@ -233,12 +257,15 @@ export class SceneManager {
       state.stageProgress,
       state.remnant,
       state.composition,
+      state.supernova === true,
+      state.cloudExtent,
     );
-    this.starRenderer.update(appearance, dt, this.camera, viewportHeightPx);
+    this.starRenderer.update(appearance, animDt, this.camera, viewportHeightPx);
     this.starLight.visible = appearance.visible;
     this.starLight.color.setRGB(appearance.color.r, appearance.color.g, appearance.color.b);
-    // Keep planet illumination modest so lit bodies never bloom like the star.
-    this.starLight.intensity = appearance.visible ? 1.1 + appearance.glow * 0.5 : 0;
+    // Keep planet illumination modest so lit bodies never bloom like the star —
+    // and so a planet's own albedo colour survives instead of washing to white.
+    this.starLight.intensity = appearance.visible ? 0.95 + appearance.glow * 0.35 : 0;
     this.lastStarRadius = appearance.radius || 1;
 
     // Cache body state so focus/follow can locate bodies by id between frames.
@@ -294,9 +321,14 @@ export class SceneManager {
     this.frameProvider = null;
   }
 
-  /** Show or hide the orbital-path overlay for every body. */
+  /**
+   * Show or hide the orbital-path overlay for every body — including the moons'
+   * orbits around their planets, which are drawn by the body renderer because
+   * only it knows the planets' DRAWN (apparent-size-floored) radii.
+   */
   setOrbitsEnabled(enabled: boolean): void {
     this.orbits.setEnabled(enabled);
+    this.bodyRenderer.setMoonOrbitsVisible(enabled);
   }
 
   /** Whether the orbital-path overlay is currently drawn. */

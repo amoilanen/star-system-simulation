@@ -7,6 +7,7 @@
 // selected remnant. StarRenderer feeds these into its GLSL uniforms.
 
 import { LifecycleStage, RemnantType } from '../config/fateModel';
+import { DEATH_PHASES } from '../sim/stages';
 import type { CloudComposition } from '../config/SimulationConfig';
 
 /** Linear RGB triple in [0, 1]. */
@@ -22,10 +23,33 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 /**
+ * How far the rendered star colours are pushed AWAY from white, relative to the
+ * true blackbody chromaticity (1 = physically exact).
+ *
+ * A real O-star radiates (0.79, 0.86, 1.00) — technically blue, but so close to
+ * white that after ACES tone-mapping and the bloom pass it reads as a plain
+ * white ball, which is why "I have never once seen a blueish star". Human
+ * observers have the same problem through a telescope; the vivid blues and reds
+ * of astrophotography come from exactly this kind of saturation stretch. The
+ * hue is never invented — only its distance from grey is amplified.
+ */
+export const SPECTRAL_SATURATION = 1.9;
+
+/** Rec. 709 relative luminance of a linear RGB triple. */
+function luminance(r: number, g: number, b: number): number {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/**
  * Blackbody-approximation color ramp (Tanner Helland approximation), mapping an
- * effective temperature in Kelvin to a normalized linear RGB triple. Cool stars
- * are red/orange, ~6600 K is near-white, and hot stars trend blue-white. Pure;
- * exported for unit testing at the key temperatures used across the lifecycle.
+ * effective temperature in Kelvin to a normalized linear RGB triple, with the
+ * chroma stretched by {@link SPECTRAL_SATURATION} and the result normalized so
+ * its brightest channel is 1 — the star's BRIGHTNESS is carried separately by
+ * `surfaceLum`/`glow`, so this function only has to carry the hue.
+ *
+ * Cool stars are deep orange-red, ~6600 K is white, and hot stars are
+ * unmistakably blue. Pure; exported for unit testing at the key temperatures
+ * used across the lifecycle.
  */
 export function blackbodyColor(temperatureK: number): Rgb {
   // The approximation is defined for ~1000–40000 K; clamp into that domain.
@@ -51,10 +75,23 @@ export function blackbodyColor(temperatureK: number): Rgb {
     b = 138.5177312231 * Math.log(t - 10) - 305.0447927307;
   }
 
+  const lr = clamp(r, 0, 255) / 255;
+  const lg = clamp(g, 0, 255) / 255;
+  const lb = clamp(b, 0, 255) / 255;
+
+  // Stretch each channel away from the triple's own luminance (a pure chroma
+  // boost: a neutral colour stays neutral, so ~6600 K remains white).
+  const y = luminance(lr, lg, lb);
+  const sr = Math.max(0, y + (lr - y) * SPECTRAL_SATURATION);
+  const sg = Math.max(0, y + (lg - y) * SPECTRAL_SATURATION);
+  const sb = Math.max(0, y + (lb - y) * SPECTRAL_SATURATION);
+
+  // Re-normalize to the brightest channel so the hue survives at any exposure.
+  const peak = Math.max(sr, sg, sb, Number.EPSILON);
   return {
-    r: clamp(r, 0, 255) / 255,
-    g: clamp(g, 0, 255) / 255,
-    b: clamp(b, 0, 255) / 255,
+    r: clamp(sr / peak, 0, 1),
+    g: clamp(sg / peak, 0, 1),
+    b: clamp(sb / peak, 0, 1),
   };
 }
 
@@ -79,16 +116,78 @@ export interface StarAppearance {
   surfaceLum: number;
   /** Whether a rotating pulsar beam should be rendered (pulsar remnant only). */
   pulsarBeam: boolean;
+  /**
+   * How much animated surface granulation the star shader applies, 0..1.
+   *
+   * Real stars have a boiling, mottled photosphere; a neutron star's surface is
+   * a smooth, degenerate, magnetically-locked crust. Rendering the same noisy
+   * convection on a body drawn a few pixels across is what made the neutron star
+   * look like a speckled blob rather than a searing point of light.
+   */
+  surfaceDetail: number;
+  /**
+   * Render the neutron star's magnetosphere: a tilted, rapidly rotating ring of
+   * synchrotron-bright plasma. This (not the surface) is what actually makes a
+   * neutron star spectacular — see the Crab pulsar's wind nebula.
+   */
+  magnetosphere: boolean;
+  /**
+   * Render as a BLACK HOLE: a genuinely black event horizon framed by a photon
+   * ring and a hot accretion disc. It has no photosphere, so `color`/`glow`
+   * describe the disc rather than a surface.
+   */
+  blackHole: boolean;
+  /**
+   * Brightness of the expanding BLAST SHELL, 0..1 (0 = not drawn). The shell is
+   * the shock front ploughing into the surrounding gas: optically thin, so it is
+   * drawn limb-brightened, exactly as a real supernova remnant appears.
+   */
+  shockwave: number;
+  /** Radius of that shell in scene units (grows for the whole death sequence). */
+  shockwaveRadius: number;
+  /** Colour of the shell, hottest at breakout and cooling as it expands. */
+  shockwaveColor: Rgb;
 }
+
+/** Appearance fields shared by every "nothing to see here" state. */
+const HIDDEN_STAR: StarAppearance = {
+  visible: false,
+  temperatureK: 0,
+  color: { r: 0, g: 0, b: 0 },
+  radius: 0,
+  glow: 0,
+  surfaceLum: 0,
+  pulsarBeam: false,
+  surfaceDetail: 0,
+  magnetosphere: false,
+  blackHole: false,
+  shockwave: 0,
+  shockwaveRadius: 0,
+  shockwaveColor: { r: 0, g: 0, b: 0 },
+};
+
+/** Fields every ordinary (non-remnant, non-exploding) star shares. */
+const NO_BLAST = {
+  magnetosphere: false,
+  blackHole: false,
+  shockwave: 0,
+  shockwaveRadius: 0,
+  shockwaveColor: { r: 0, g: 0, b: 0 },
+} as const;
 
 /**
  * Main-sequence effective temperature from mass (M☉), following the real
  * qualitative ordering: more massive stars are hotter/bluer. Illustrative, not a
  * stellar-structure solution (PRD A1). Sun (1 M☉) maps near 5800 K.
+ *
+ * The exponent is 0.6, not 0.5: the observed main sequence runs ~3800 K at
+ * 0.5 M☉, 5772 K at 1, ~9600 K at 2, ~17 000 K at 5 and ~35 000 K at 20 M☉,
+ * which a square root under-predicts badly at the top end — one reason the hot,
+ * blue stars never looked hot or blue.
  */
 export function mainSequenceTemperature(mass: number): number {
   const m = Math.max(mass, 1e-3);
-  return clamp(5800 * Math.pow(m, 0.5), 2500, 40000);
+  return clamp(5800 * Math.pow(m, 0.6), 2400, 45000);
 }
 
 /**
@@ -124,6 +223,13 @@ export const RED_GIANT_SWELL = 26;
  */
 export const WHITE_DWARF_RADIUS = 0.018;
 export const NEUTRON_STAR_RADIUS = 0.012;
+
+/**
+ * Drawn radius of a black hole's EVENT HORIZON, in scene units. A 10 M☉ hole is
+ * 30 km across (2e-7 AU) — utterly invisible at true scale — so it is drawn at
+ * the smallest size whose photon ring and accretion disc still read.
+ */
+export const BLACK_HOLE_RADIUS = 0.03;
 
 /**
  * Composition-driven temperature multiplier (illustrative). Metal-rich gas is
@@ -170,6 +276,8 @@ export function starAppearance(
   progress: number,
   remnant: RemnantType | null = null,
   composition: CloudComposition | null = null,
+  supernova = false,
+  systemScale = DEFAULT_SYSTEM_SCALE,
 ): StarAppearance {
   const p = clamp(progress, 0, 1);
   const msTemp = mainSequenceTemperature(mass) * compositionTempFactor(composition);
@@ -177,15 +285,7 @@ export function starAppearance(
 
   switch (stage) {
     case LifecycleStage.DustCloud:
-      return {
-        visible: false,
-        temperatureK: 0,
-        color: { r: 0, g: 0, b: 0 },
-        radius: 0,
-        glow: 0,
-        surfaceLum: 0,
-        pulsarBeam: false,
-      };
+      return HIDDEN_STAR;
 
     case LifecycleStage.ProtostarCoalescence: {
       // A cool, dim, contracting protostar warming from ~1200 K toward ~2800 K.
@@ -202,6 +302,9 @@ export function starAppearance(
         // Dim, deep-red glowing ball of gas — keep the disk well below white-out.
         surfaceLum: 0.4 + 0.15 * p,
         pulsarBeam: false,
+        // Vigorously convective and blotchy while it contracts.
+        surfaceDetail: 1,
+        ...NO_BLAST,
       };
     }
 
@@ -216,6 +319,8 @@ export function starAppearance(
         glow: 0.8 + 0.6 * p,
         surfaceLum: 0.55 + 0.35 * p,
         pulsarBeam: false,
+        surfaceDetail: 1,
+        ...NO_BLAST,
       };
     }
 
@@ -230,8 +335,14 @@ export function starAppearance(
         color: blackbodyColor(temperatureK),
         radius: msRadius,
         glow: 1.0,
-        surfaceLum: 0.9,
+        // Kept well below 1 so the blackbody hue survives the ACES tone-map,
+        // which compresses (and desaturates) anything approaching white: a hot
+        // star must read BLUE, not as another white ball (reported bug 5). The
+        // brightness the eye expects comes from the corona halo and bloom.
+        surfaceLum: 0.7,
         pulsarBeam: false,
+        surfaceDetail: 1,
+        ...NO_BLAST,
       };
     }
 
@@ -253,40 +364,218 @@ export function starAppearance(
         // tone-map instead of saturating to white at the bright core.
         surfaceLum: 0.45 - 0.2 * cool,
         pulsarBeam: false,
+        surfaceDetail: 1,
+        ...NO_BLAST,
       };
     }
 
-    case LifecycleStage.Death: {
-      // Peak brightness (supernova flash / envelope ejection): the swollen giant
-      // collapses from its red-giant size down toward the compact remnant.
-      const temperatureK = 8000;
-      const radius = msRadius * RED_GIANT_SWELL * (1 - 0.94 * p);
-      return {
-        visible: true,
-        temperatureK,
-        color: blackbodyColor(temperatureK),
-        radius: Math.max(radius, WHITE_DWARF_RADIUS),
-        glow: 2.5,
-        surfaceLum: 1.0,
-        pulsarBeam: false,
-      };
-    }
+    case LifecycleStage.Death:
+      return deathAppearance(mass, p, supernova, composition, systemScale);
 
     case LifecycleStage.Remnant:
       return remnantAppearance(remnant);
 
     default:
-      return {
-        visible: false,
-        temperatureK: 0,
-        color: { r: 0, g: 0, b: 0 },
-        radius: 0,
-        glow: 0,
-        surfaceLum: 0,
-        pulsarBeam: false,
-      };
+      return HIDDEN_STAR;
   }
 }
+
+/**
+ * How far the supernova fireball's photosphere expands, as a multiple of the
+ * star's main-sequence radius. Several times the red giant it came from — but
+ * deliberately kept to a few AU rather than the tens of AU a real one reaches,
+ * because the fireball is an OPAQUE sphere: at true scale it swallows the camera
+ * and the explosion becomes a white screen instead of a spectacle.
+ */
+export const FIREBALL_SWELL = 70;
+
+/**
+ * How far the BLAST SHELL reaches by the end of the death stage, as a fraction
+ * of the birth cloud's radius — matched to the distance the kernel's ejecta
+ * particles actually cover in that time, so the drawn shock front and the real
+ * expanding debris move together. The shell keeps going afterwards; from the
+ * remnant stage on, the particles alone carry it.
+ */
+export const SHOCKWAVE_REACH = { supernova: 3.3, nebula: 1.3 } as const;
+
+/** Cloud radius (scene units) assumed when the caller does not supply one. */
+export const DEFAULT_SYSTEM_SCALE = 50;
+
+/** Peak effective temperature at shock breakout (K) — a UV flash. */
+export const BREAKOUT_TEMPERATURE_K = 40000;
+
+/**
+ * Appearance during the DEATH stage: the star's last few moments, drawn as the
+ * physical sequence rather than as a fade.
+ *
+ * For a CORE-COLLAPSE SUPERNOVA (`supernova`):
+ *   1. `p < shockBreakout` — the iron core implodes and the envelope falls in
+ *      behind it. The star visibly SHRINKS and dims; nothing has escaped yet.
+ *   2. at `shockBreakout` — the rebound shock reaches the surface: a blinding
+ *      ~10^5 K ultraviolet flash, and the kernel throws its ejecta shell on the
+ *      very same fraction.
+ *   3. up to `peakLuminosity` — the fireball expands and brightens to peak.
+ *   4. afterwards — it cools through white and orange, thins, and the receding
+ *      photosphere hands over to the compact remnant while the blast shell
+ *      keeps racing outward.
+ *
+ * For a QUIET death (low-mass star ⇒ planetary nebula) the envelope is puffed
+ * gently away over the first half of the stage and the second half exposes the
+ * ferociously hot stellar core — the blue-white central star of the nebula.
+ *
+ * Pure; exported for unit testing.
+ */
+export function deathAppearance(
+  mass: number,
+  progress: number,
+  supernova: boolean,
+  composition: CloudComposition | null = null,
+  systemScale = DEFAULT_SYSTEM_SCALE,
+): StarAppearance {
+  const p = clamp(progress, 0, 1);
+  const msRadius = mainSequenceRadius(mass);
+  const msTemp = mainSequenceTemperature(mass) * compositionTempFactor(composition);
+  const giantRadius = msRadius * RED_GIANT_SWELL;
+  const scale = Math.max(systemScale, 1);
+  const { shockBreakout, peakLuminosity } = DEATH_PHASES;
+
+  if (!supernova) {
+    return planetaryNebulaAppearance(msRadius, giantRadius, p, scale);
+  }
+
+  if (p < shockBreakout) {
+    // --- 1. CORE COLLAPSE ---------------------------------------------------
+    // The core implodes in about a second and the envelope follows it inward.
+    // Quadratic because the infall accelerates, and the star DIMS: this is the
+    // moment of calm that makes the flash land.
+    const k = p / shockBreakout;
+    const temperatureK = msTemp * (1 + 0.5 * k);
+    return {
+      visible: true,
+      temperatureK,
+      color: blackbodyColor(temperatureK),
+      radius: giantRadius * (1 - 0.82 * k * k),
+      glow: 1.4 - 0.9 * k,
+      surfaceLum: 0.5 - 0.22 * k,
+      pulsarBeam: false,
+      surfaceDetail: 1,
+      ...NO_BLAST,
+    };
+  }
+
+  // --- 2-4. BREAKOUT, FIREBALL, FADE ----------------------------------------
+  const q = (p - shockBreakout) / (1 - shockBreakout); // 0 at breakout, 1 at the end
+  const peakQ = (peakLuminosity - shockBreakout) / (1 - shockBreakout);
+
+  // The photosphere is blown outward almost instantly, then keeps coasting; past
+  // the peak it RECEDES back through the thinning ejecta toward the remnant, so
+  // the shrinking star never has to jump discontinuously to the compact object.
+  const expansion = 1 - Math.exp(-6 * q);
+  const receding = q <= peakQ ? 0 : Math.pow((q - peakQ) / (1 - peakQ), 1.5);
+  const fireball = msRadius * (0.18 + FIREBALL_SWELL * expansion);
+  const radius = Math.max(NEUTRON_STAR_RADIUS, fireball * (1 - 0.995 * receding));
+
+  // Cools from the breakout flash through white and into the orange of an
+  // expanding, adiabatically cooling envelope.
+  const temperatureK = clamp(
+    BREAKOUT_TEMPERATURE_K * Math.pow(1 - 0.985 * q, 1.6) + 3400,
+    3400,
+    BREAKOUT_TEMPERATURE_K,
+  );
+
+  // Light curve: an instantaneous breakout spike, a broad maximum, then decay.
+  const rise = q <= peakQ ? Math.pow(q / Math.max(peakQ, 1e-6), 0.35) : 1;
+  const decay = q <= peakQ ? 1 : Math.pow(1 - (q - peakQ) / (1 - peakQ), 1.4);
+  const spike = Math.exp(-Math.pow(q / 0.06, 2)); // the breakout flash itself
+  const luminosity = rise * decay;
+
+  const shellColorK = clamp(BREAKOUT_TEMPERATURE_K * (1 - 0.8 * q) + 5000, 5000, 40000);
+  return {
+    visible: true,
+    temperatureK,
+    color: blackbodyColor(temperatureK),
+    radius,
+    // A brief, blinding breakout spike on top of a strong (but not screen-
+    // filling) sustained maximum: a supernova's light curve is a flash followed
+    // by a long decline, not a sustained white-out.
+    glow: 1 + 4.5 * luminosity + 9 * spike,
+    surfaceLum: clamp(0.55 + 0.45 * luminosity, 0, 1) * (1 - 0.9 * receding),
+    pulsarBeam: false,
+    // The fireball is a smooth, opaque, radiation-dominated photosphere — none
+    // of the convective mottling a living star has.
+    surfaceDetail: 0.15,
+    magnetosphere: false,
+    blackHole: false,
+    // The shell keeps expanding and fading for the whole sequence, reaching zero
+    // exactly as the stage ends: from there the ejecta PARTICLES the kernel
+    // integrates are the visible remnant shell, so the handover has no seam.
+    shockwave: clamp(0.35 + 0.65 * decay, 0, 1) * (1 - Math.pow(q, 3)),
+    shockwaveRadius: msRadius + scale * SHOCKWAVE_REACH.supernova * Math.pow(q, 0.85),
+    shockwaveColor: blackbodyColor(shellColorK),
+  };
+}
+
+/**
+ * The quiet death of a low-mass star: the envelope drifts off as a planetary
+ * nebula and the exposed core — one of the hottest objects in the universe at
+ * ~100 000 K — lights it up from inside before cooling into a white dwarf.
+ */
+function planetaryNebulaAppearance(
+  msRadius: number,
+  giantRadius: number,
+  p: number,
+  scale: number,
+): StarAppearance {
+  const SHED_END = 0.55;
+  if (p < SHED_END) {
+    // Pulsating, cooling envelope slowly being pushed away by radiation pressure.
+    const k = p / SHED_END;
+    const temperatureK = 3300 - 400 * k;
+    return {
+      visible: true,
+      temperatureK,
+      color: blackbodyColor(temperatureK),
+      radius: giantRadius * (1 + 0.35 * k),
+      glow: 1.4 + 0.5 * k,
+      surfaceLum: 0.4 - 0.12 * k,
+      pulsarBeam: false,
+      surfaceDetail: 1,
+      magnetosphere: false,
+      blackHole: false,
+      // A slow, gentle shell rather than a blast wave.
+      shockwave: 0.45 * k,
+      shockwaveRadius: msRadius + scale * SHOCKWAVE_REACH.nebula * 0.45 * Math.pow(k, 0.85),
+      shockwaveColor: blackbodyColor(4200),
+    };
+  }
+  // The envelope becomes transparent and the searing core is laid bare.
+  const k = (p - SHED_END) / (1 - SHED_END);
+  const temperatureK = clamp(3000 + 37000 * Math.pow(k, 0.7), 3000, 40000);
+  return {
+    visible: true,
+    temperatureK,
+    color: blackbodyColor(temperatureK),
+    radius: Math.max(WHITE_DWARF_RADIUS, giantRadius * 1.35 * Math.pow(1 - k, 2.4)),
+    glow: 1.9 - 0.6 * k,
+    surfaceLum: 0.35 + 0.6 * k,
+    pulsarBeam: false,
+    surfaceDetail: 1 - 0.7 * k,
+    magnetosphere: false,
+    blackHole: false,
+    // Fades to nothing by the end of the stage, handing over to the ejecta cloud.
+    shockwave: 0.45 * (1 - Math.pow(k, 2)),
+    shockwaveRadius: msRadius + scale * SHOCKWAVE_REACH.nebula * (0.45 + 0.55 * Math.pow(k, 0.85)),
+    shockwaveColor: blackbodyColor(4200 + 8000 * k),
+  };
+}
+
+/**
+ * Effective surface temperature of a young neutron star, in Kelvin. Real values
+ * are ~10^6 K — far off the blackbody ramp's domain, where everything saturates
+ * to the same blue — so the ramp is fed the top of its range, which is the
+ * correct COLOUR for anything that hot.
+ */
+export const NEUTRON_STAR_TEMPERATURE_K = 40000;
 
 /** Visual appearance of the terminal compact remnant. */
 export function remnantAppearance(remnant: RemnantType | null): StarAppearance {
@@ -304,41 +593,59 @@ export function remnantAppearance(remnant: RemnantType | null): StarAppearance {
         glow: 1.2,
         surfaceLum: 0.95,
         pulsarBeam: false,
+        // A degenerate surface, but still a thin radiating atmosphere.
+        surfaceDetail: 0.25,
+        ...NO_BLAST,
       };
     }
     case RemnantType.NeutronStar: {
-      const temperatureK = 30000; // tiny, intense
       return {
         visible: true,
-        temperatureK,
-        color: blackbodyColor(temperatureK),
+        temperatureK: NEUTRON_STAR_TEMPERATURE_K,
+        color: blackbodyColor(NEUTRON_STAR_TEMPERATURE_K),
         radius: NEUTRON_STAR_RADIUS,
-        glow: 2.0,
+        glow: 2.4,
         surfaceLum: 1.0,
         pulsarBeam: false,
+        // A smooth, degenerate crust: no convection, no granulation.
+        surfaceDetail: 0,
+        ...NO_BLAST,
+        magnetosphere: true,
       };
     }
     case RemnantType.Pulsar: {
-      const temperatureK = 34000; // neutron star + sweeping beam
+      return {
+        visible: true,
+        temperatureK: NEUTRON_STAR_TEMPERATURE_K,
+        color: blackbodyColor(NEUTRON_STAR_TEMPERATURE_K),
+        radius: NEUTRON_STAR_RADIUS,
+        glow: 2.6,
+        surfaceLum: 1.0,
+        pulsarBeam: true,
+        surfaceDetail: 0,
+        ...NO_BLAST,
+        magnetosphere: true,
+      };
+    }
+    case RemnantType.BlackHole: {
+      // No photosphere at all: `color` describes the accretion disc, whose inner
+      // edge glows at ~10^7 K, and the horizon itself is drawn perfectly black.
+      const temperatureK = 22000;
       return {
         visible: true,
         temperatureK,
         color: blackbodyColor(temperatureK),
-        radius: NEUTRON_STAR_RADIUS,
-        glow: 2.2,
-        surfaceLum: 1.0,
-        pulsarBeam: true,
+        radius: BLACK_HOLE_RADIUS,
+        glow: 1.8,
+        // The horizon emits nothing; every photon comes from the disc/ring.
+        surfaceLum: 0,
+        pulsarBeam: false,
+        surfaceDetail: 0,
+        ...NO_BLAST,
+        blackHole: true,
       };
     }
     default:
-      return {
-        visible: false,
-        temperatureK: 0,
-        color: { r: 0, g: 0, b: 0 },
-        radius: 0,
-        glow: 0,
-        surfaceLum: 0,
-        pulsarBeam: false,
-      };
+      return HIDDEN_STAR;
   }
 }

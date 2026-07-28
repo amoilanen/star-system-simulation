@@ -73,6 +73,7 @@ function makeFakeModule(): { mod: WasmModule; particle: number[]; body: number[]
     stage: () => LifecycleStage.MainSequence,
     stage_progress: () => 0.5,
     elapsed_sim_seconds: () => 1.6e13,
+    star_mass_solar: () => 0.9,
     free: () => {},
   };
 

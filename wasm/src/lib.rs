@@ -25,12 +25,16 @@ use nbody::{
     accretion_efficiency, accretion_radius, body_radius_from_mass, circular_speed, integrate_orbit,
     magnitude, merge_radius, merged_velocity, orbital_step, softened_accel, Vec3,
     BODY_DAMP_FRACTION, DISK_SETTLE, GAS_DRAG, GRAVITY, INTERNAL_DT, MAX_PARTICLES, MAX_SUBSTEPS,
-    ORBITAL_MASS_SCALE, SOFTENING, VERTICAL_DAMP,
+    ORBITAL_MASS_SCALE, ORBITAL_MAX, SOFTENING, VERTICAL_DAMP,
 };
+#[cfg(test)]
+use nbody::SNOW_LINE_AU;
 use stages::{
-    bool_f64, determine_fate, stage_durations, FateOutcome, LifecycleStage, PackedEvent,
-    SimEventType,
+    bool_f64, determine_fate, remnant_mass, stage_durations, stellar_mass_from_cloud, FateOutcome,
+    LifecycleStage, PackedEvent, SimEventType,
 };
+#[cfg(test)]
+use stages::cloud_mass_for_star;
 
 /// Number of Float32 lanes per particle (mirror `PARTICLE_STRIDE`).
 const PARTICLE_STRIDE: usize = 7;
@@ -48,17 +52,21 @@ const VISITOR_SPAWN_INTERVAL: f64 = 8.0e15;
 const MAX_VISITORS: usize = 10;
 /// Fraction of the cloud mass pre-seeded into the central protostar core.
 const CORE_SEED_FRACTION: f64 = 0.04;
-/// Fraction of the cloud mass in each planetesimal seed (~3 M⊕ for 1 M☉).
-const PLANETESIMAL_MASS_FRACTION: f64 = 1e-5;
+/// Fraction of the cloud mass in each planetesimal seed (~1 M⊕ for a solar cloud).
+const PLANETESIMAL_MASS_FRACTION: f64 = 1e-6;
 
 /// Body-swallow radius as a fraction of the dust feeding radius (mirror of the
 /// TS fallback's `BODY_SWALLOW_FRACTION`). A body inside it has fallen into the
 /// star and is destroyed rather than parking on top of it.
 const BODY_SWALLOW_FRACTION: f64 = 0.6;
-/// Particles beyond this multiple of the cloud extent are considered escaped.
+/// Dust/debris beyond this multiple of the cloud extent is considered escaped.
 const ESCAPE_EXTENT_FACTOR: f64 = 2.4;
+/// Death EJECTA is followed far further out than ordinary dust: the expanding
+/// shell IS the death scene, so it must survive while it sweeps outward through
+/// the planetary system and on past it (mirror of the TS fallback).
+const EJECTA_ESCAPE_EXTENT_FACTOR: f64 = 9.0;
 /// Number of ejecta particles thrown out when the star dies (nebula/supernova).
-const EJECTA_COUNT: usize = 1200;
+const EJECTA_COUNT: usize = 2200;
 /// Debris fragments spawned when a body is tidally disrupted by the star.
 const DEBRIS_PER_BODY: usize = 140;
 /// Orbital-time lifetime of a tidal-disruption debris stream (mirror of
@@ -72,21 +80,55 @@ const DEBRIS_LIFETIME: f64 = 6.0;
 /// stream is shredded, shocked and colliding with itself, so it loses angular
 /// momentum fast and spirals into the star.
 const DEBRIS_DRAG: f64 = 0.6;
-/// Minimum death-ejecta speed as a multiple of the LOCAL ESCAPE SPEED (mirror of
-/// `EJECTA_ESCAPE_MARGIN`). Real ejecta always exceeds escape velocity — that is
-/// why the shell disperses and leaves a bare remnant instead of a ring around it.
-const EJECTA_ESCAPE_MARGIN: f64 = 1.25;
+/// How far the death shell coasts, in multiples of the cloud extent, over the
+/// span of the DEATH stage (mirror of `EJECTA_SHELL_REACH`).
+///
+/// The speed is derived ASYMPTOTICALLY and GEOMETRICALLY. Asymptotically: the
+/// fragment's total specific energy is exactly v_inf^2/2 > 0, so it is provably
+/// unbound and no part of the shell can settle into a ring around the remnant.
+/// Geometrically: the shell sweeps the same fraction of the system over the same
+/// number of frames whatever the star's mass, so the death is framed identically
+/// for a red dwarf and for a black-hole progenitor.
+const EJECTA_SHELL_REACH_SUPERNOVA: f64 = 5.5;
+const EJECTA_SHELL_REACH_NEBULA: f64 = 2.2;
+/// Radius (scene units) at which the shell is launched: outside the softened
+/// core, where the integrator resolves the motion comfortably, and about where a
+/// red supergiant's photosphere sits when the shock breaks out.
+const EJECTA_LAUNCH_RADIUS_MIN: f64 = 3.0;
+const EJECTA_LAUNCH_RADIUS_MAX: f64 = 6.0;
+
+/// Internal structure of the DEATH stage, as fractions of its duration (mirror
+/// of `DEATH_PHASES` in `src/sim/stages.ts`). A core-collapse supernova is a
+/// SEQUENCE — implosion, shock breakout, expanding fireball, fade — and the
+/// point of the death scene is that the viewer can watch it happen.
+const DEATH_SHOCK_BREAKOUT: f64 = 0.12;
+/// Smallest number of kernel steps the DEATH stage may take. The stellar clock
+/// is compressed by up to ~14 orders of magnitude, so at a fast pace ONE frame
+/// spans far more than the ~10^4 yr the death lasts and the star blinked from
+/// red giant straight to remnant. Capping how much of the stage a single step
+/// may consume makes the death always watchable.
+const DEATH_MIN_STEPS: f64 = 240.0;
 /// Red-giant photospheric reach in AU (= scene units) for a 1 M☉ star; scaled by
 /// mass^0.3. Planets inside it are engulfed when the star becomes a red giant.
 const REDGIANT_ENGULF_AU: f64 = 2.2;
 /// Cap on how much surviving orbits widen when the dying star sheds its mass.
 const REMNANT_ORBIT_EXPANSION_MAX: f64 = 2.6;
 
-/// Core mass fractions at which the FORMATION stages advance (mirror the TS
-/// fallback's `*_CORE_FRACTION`). Formation is accretion-driven, not timed.
-const PROTOSTAR_CORE_FRACTION: f64 = 0.1;
-const FUSION_CORE_FRACTION: f64 = 0.3;
-const IGNITION_CORE_FRACTION: f64 = 0.5;
+/// Core mass fractions — of the FINAL STELLAR MASS, not of the cloud — at which
+/// the FORMATION stages advance (mirror the TS fallback's `*_CORE_FRACTION`).
+/// Formation is accretion-driven, not timed. The star only ever assembles a
+/// fraction of its cloud, so a threshold against the cloud mass could never be
+/// reached.
+const PROTOSTAR_CORE_FRACTION: f64 = 0.2;
+const FUSION_CORE_FRACTION: f64 = 0.55;
+const IGNITION_CORE_FRACTION: f64 = 0.9;
+
+/// Radiation-pressure-to-gravity ratio (β) felt by leftover dust once the star
+/// has ignited (mirror of `IGNITED_RADIATION_BETA`). β > 1 means the young star
+/// pushes harder than it pulls, so the residual cloud is driven back out instead
+/// of raining onto the star — the reason its final mass is only a fraction of
+/// the cloud it formed from.
+const IGNITED_RADIATION_BETA: f64 = 1.16;
 
 /// Maximum rate at which the protostar can swallow dust, as a fraction of the
 /// cloud mass per unit orbital time (mirror of the TS `CORE_ACCRETION_RATE`).
@@ -97,7 +139,10 @@ const IGNITION_CORE_FRACTION: f64 = 0.5;
 /// rather than a free-fall time. Without the cap the core ran from its 4% seed
 /// to the 50% ignition threshold in ~1 second of playback, so the star appeared
 /// to be born immediately.
-const CORE_ACCRETION_RATE: f64 = 0.0055;
+///
+/// Expressed as a fraction of the star's FINAL mass so formation takes the same
+/// number of frames whatever the cloud mass.
+const CORE_ACCRETION_RATE: f64 = 0.008;
 
 /// Per-species dust colour tint (linear RGB) + point size, mirroring
 /// `SPECIES_COLOR` and `speciesColorSize` in the fallback.
@@ -159,7 +204,13 @@ struct Particle {
 pub struct Kernel {
     cloud_extent: f64,
     cloud_mass: f64,
+    /// Mass (M☉) the star will actually assemble — a fraction of the cloud (see
+    /// `stellar_mass_from_cloud`). Core accretion is capped here; past it the
+    /// star's own radiation blows the rest of the cloud away.
+    star_mass: f64,
     core_mass: f64,
+    /// Cloud mass blown back into interstellar space by the ignited star.
+    dispersed_mass: f64,
     /// Mass that has left the dust pool but not yet reached the star: the inner
     /// accretion disc. Dust swept by a planetesimal but not retained flows here
     /// and drains onto the core under the same `CORE_ACCRETION_RATE` limit as
@@ -209,12 +260,18 @@ impl Kernel {
     ) -> Kernel {
         let seed = seed_from_config(mass, cloud_extent, pace, h, he, metals);
         let cloud_mass = mass.max(f64::EPSILON);
+        let star_mass = stellar_mass_from_cloud(cloud_mass, metals).max(f64::EPSILON);
         let core_mass = cloud_mass * CORE_SEED_FRACTION;
-        let core_accretion_radius = (cloud_extent * 0.02).clamp(0.5, 2.0);
+        // Small capture zone (AU) so several planets can orbit INSIDE the snow
+        // line (the terrestrial zone); dust still reaches the star by spiralling
+        // in under gas drag.
+        let core_accretion_radius = (cloud_extent * 0.014).clamp(0.4, 1.2);
         let mut kernel = Kernel {
             cloud_extent,
             cloud_mass,
+            star_mass,
             core_mass,
+            dispersed_mass: 0.0,
             disc_reservoir: 0.0,
             core_accretion_radius,
             body_swallow_radius: core_accretion_radius * BODY_SWALLOW_FRACTION,
@@ -223,9 +280,11 @@ impl Kernel {
             rng: Mulberry32::new(seed),
             stage: LifecycleStage::DustCloud,
             stellar_elapsed: 0.0,
-            durations: stage_durations(mass, metals),
-            fate: determine_fate(mass, metals),
-            core_fraction: core_mass / cloud_mass,
+            // Stellar timing and the death path follow the STAR's mass, not the
+            // cloud's: a 40 M☉ cloud makes a ~10 M☉ star, which lives far longer.
+            durations: stage_durations(star_mass, metals),
+            fate: determine_fate(star_mass, metals),
+            core_fraction: core_mass / star_mass,
             particles: Vec::new(),
             bodies: Vec::new(),
             particle_buf: Vec::new(),
@@ -279,16 +338,20 @@ impl Kernel {
         }
 
         // Drive the lifecycle: FORMATION from accreted core mass, STELLAR by time.
-        self.core_fraction = self.core_mass / self.cloud_mass.max(f64::EPSILON);
+        self.core_fraction = self.core_mass / self.star_mass.max(f64::EPSILON);
         self.advance_stages(dt_sim_seconds, self.core_fraction, &mut events);
 
         // Once the star ignites, the surviving planetesimals are full planets.
         if self.stage as u32 >= LifecycleStage::FusionIgnition as u32 {
             self.promote_planets();
         }
-        // When the star dies, sweep away leftover primordial disc dust (so none
-        // lingers orbiting the remnant) and throw a shell of ejecta out.
-        if self.stage as u32 >= LifecycleStage::Death as u32 && !self.ejecta_done {
+        // The shell is thrown at SHOCK BREAKOUT, not the instant the star enters
+        // its death throes: the core spends the first moments imploding, and
+        // only when the rebound shock reaches the surface is anything actually
+        // expelled. The renderer flashes on the same fraction, so the ejecta
+        // appears exactly when the star flares. Everything still circling the
+        // star is swept away at the same moment.
+        if !self.ejecta_done && self.has_shock_broken_out() {
             self.dissipate_disc_material();
             self.spawn_ejecta();
             self.ejecta_done = true;
@@ -359,9 +422,43 @@ impl Kernel {
     pub fn elapsed_sim_seconds(&self) -> f64 {
         self.compute_elapsed_sim_seconds()
     }
+
+    /// Mass (M☉) of the central object right now: the accreted core while the
+    /// star is assembling, the finished star during its life, and only the
+    /// compact remnant's mass once it has died (mirror of `currentStarMass`).
+    #[must_use]
+    pub fn star_mass_solar(&self) -> f64 {
+        if (self.stage as u32) < LifecycleStage::MainSequence as u32 {
+            return self.core_mass.min(self.star_mass);
+        }
+        if self.stage == LifecycleStage::Remnant {
+            return remnant_mass(self.star_mass, self.fate.remnant);
+        }
+        self.star_mass
+    }
 }
 
 impl Kernel {
+    /// Whether the rebound shock has reached the surface, so the star is now
+    /// actually blowing its envelope off (mirror of `hasShockBrokenOut`).
+    fn has_shock_broken_out(&self) -> bool {
+        if self.stage as u32 > LifecycleStage::Death as u32 {
+            return true;
+        }
+        self.stage == LifecycleStage::Death && self.compute_stage_progress() >= DEATH_SHOCK_BREAKOUT
+    }
+
+    /// How much sim time one step may advance the DEATH stage: at most a
+    /// `DEATH_MIN_STEPS` fraction of it. At a slow pace `sim_dt` is far below the
+    /// cap and the death runs at its true rate.
+    fn death_step(&self, sim_dt: f64) -> f64 {
+        let dur = self.durations[LifecycleStage::Death as usize];
+        if !dur.is_finite() || dur <= 0.0 {
+            return sim_dt;
+        }
+        sim_dt.min(dur / DEATH_MIN_STEPS)
+    }
+
     /// Gravitational parameter driving the dynamics (visual-scaled). Uses the
     /// TOTAL cloud mass so collapse/orbits proceed from the start rather than
     /// stalling until the seed core has grown.
@@ -407,7 +504,14 @@ impl Kernel {
             && sim_dt.is_finite()
             && sim_dt > 0.0
         {
-            self.stellar_elapsed += sim_dt;
+            // Bound how much of the DEATH stage a single step may consume so the
+            // collapse -> flash -> expanding fireball sequence is always
+            // watchable instead of being crossed whole inside one frame.
+            self.stellar_elapsed += if self.stage == LifecycleStage::Death {
+                self.death_step(sim_dt)
+            } else {
+                sim_dt
+            };
             let mut guard = 0;
             while guard < 8 {
                 guard += 1;
@@ -425,6 +529,13 @@ impl Kernel {
                     }
                     LifecycleStage::RedGiant => {
                         self.stage = LifecycleStage::Death;
+                        // Whatever time was left over from the red giant must NOT
+                        // be carried into the death: at a fast pace it is
+                        // astronomically more than the death lasts and would fling
+                        // the star straight through to the remnant in the same
+                        // step it entered.
+                        self.stellar_elapsed =
+                            self.stellar_elapsed.min(self.death_step(f64::INFINITY));
                         let sn = bool_f64(self.fate.supernova);
                         self.emit_stage(SimEventType::DeathEvent, sn, 0.0, out);
                     }
@@ -528,7 +639,7 @@ impl Kernel {
             // plane with a modest vertical spread that dissipation collapses into
             // a disc. Concentration + sub-Keplerian spin let the cloud drain onto
             // the forming star over the formation phase.
-            let rho = extent * (0.04 + 0.56 * self.rng.next_f64());
+            let rho = extent * (0.015 + 0.585 * self.rng.next_f64());
             let phi = 2.0 * std::f64::consts::PI * self.rng.next_f64();
             let x = rho * phi.cos();
             let z = rho * phi.sin();
@@ -562,8 +673,13 @@ impl Kernel {
         let seed_mu = self.mu();
         // Geometric (Titius-Bode-like) spacing, each orbit ~30% wider than the
         // last, with small eccentricities and mutual inclinations.
-        let inner = (self.cloud_extent * 0.02).max(self.core_accretion_radius * 1.3);
-        let outer = (inner * 4.0).max(self.cloud_extent * 0.8);
+        // The innermost seed sits just outside the star's (now small) dust-capture
+        // zone, so several seeds land INSIDE the 2.7 AU snow line — the
+        // terrestrial zone. Previously the first seed was already at the snow
+        // line, so every planet was an ice/gas world and the biggest one always
+        // formed closest to the star.
+        let inner = (self.cloud_extent * 0.008).max(self.core_accretion_radius * 1.4);
+        let outer = (inner * 6.0).max(self.cloud_extent * 0.75);
         let mass = self.cloud_mass * PLANETESIMAL_MASS_FRACTION;
         let ratio = if PLANETESIMAL_COUNT > 1 {
             (outer / inner).powf(1.0 / (PLANETESIMAL_COUNT - 1) as f64)
@@ -615,9 +731,22 @@ impl Kernel {
         // Debris from a disrupted body is shocked, self-colliding material on its
         // way into the star, so it bleeds angular momentum far faster than gas.
         let debris_drag = (1.0 - DEBRIS_DRAG * h).max(0.0);
+        // Once fusion has ignited, the star's radiation pressure exceeds its pull
+        // on the leftover grains (β > 1), so the residual cloud is driven OUT
+        // instead of continuing to fall in. Only the dust feels this; ejecta and
+        // tidal debris are dense, optically thick material.
+        let dust_gravity = if forming {
+            1.0
+        } else {
+            1.0 - IGNITED_RADIATION_BETA
+        };
         for p in &mut self.particles {
-            let a = softened_accel(mu, SOFTENING, [p.x, p.y, p.z]);
             let dust = p.kind == ParticleKind::Dust;
+            let a = softened_accel(
+                if dust { mu * dust_gravity } else { mu },
+                SOFTENING,
+                [p.x, p.y, p.z],
+            );
             let drag = match p.kind {
                 ParticleKind::Dust => dust_drag,
                 ParticleKind::Debris => debris_drag,
@@ -684,11 +813,24 @@ impl Kernel {
         // can only take so much mass per unit time. Material already waiting in
         // the inner disc reaches it first; dust arriving faster than the cap
         // stays in the visible disc and is swallowed on later steps.
-        let mut core_budget = CORE_ACCRETION_RATE * cloud_mass * orbital_dt.max(0.0);
+        //
+        // How much the star can still take AT ALL is capped by `star_mass`: a
+        // star only ever assembles a fraction of its birth cloud, and past that
+        // point its own radiation drives the rest away. This is what makes a
+        // 40 M☉ cloud yield a ~10 M☉ star instead of a 40 M☉ one.
+        let capacity = (self.star_mass - self.core_mass).max(0.0);
+        let star_full = capacity <= 0.0;
+        let mut core_budget =
+            (CORE_ACCRETION_RATE * self.star_mass * orbital_dt.max(0.0)).min(capacity);
         let from_reservoir = self.disc_reservoir.min(core_budget);
         self.disc_reservoir -= from_reservoir;
         self.core_mass += from_reservoir;
         core_budget -= from_reservoir;
+        if star_full && self.disc_reservoir > 0.0 {
+            // The star can take no more: the inner disc is photo-evaporated away.
+            self.dispersed_mass += self.disc_reservoir;
+            self.disc_reservoir = 0.0;
+        }
         let body_r2: Vec<f64> = self
             .bodies
             .iter()
@@ -710,6 +852,10 @@ impl Kernel {
                 if core_budget >= p.mass {
                     core_budget -= p.mass;
                     self.core_mass += p.mass;
+                } else if star_full {
+                    // The star has all the mass it will ever have; anything
+                    // still falling in is blown back out rather than accreted.
+                    self.dispersed_mass += p.mass;
                 } else {
                     // Over the accretion rate limit: the grain waits in the
                     // inner disc (still visible, still orbiting).
@@ -787,9 +933,9 @@ impl Kernel {
         }
     }
 
-    /// Red-giant photospheric reach in scene units (∝ mass^0.3).
+    /// Red-giant photospheric reach in scene units (∝ stellar mass^0.3).
     fn red_giant_engulf_radius(&self) -> f64 {
-        REDGIANT_ENGULF_AU * self.cloud_mass.max(0.1).powf(0.3)
+        REDGIANT_ENGULF_AU * self.star_mass.max(0.1).powf(0.3)
     }
 
     /// Engulf and destroy planets orbiting inside the swollen red giant. Done
@@ -827,7 +973,11 @@ impl Kernel {
     /// Expand surviving planets' orbits when the dying star sheds its mass
     /// (mirror of `expandOrbitsAfterMassLoss`).
     fn expand_orbits_after_mass_loss(&mut self) {
-        let retained: f64 = if self.fate.supernova { 0.16 } else { 0.55 };
+        // How much of the star actually survives as the compact object — the
+        // single source of truth is the fate model, so the orbital widening
+        // matches the remnant mass reported in the UI.
+        let retained: f64 =
+            (remnant_mass(self.star_mass, self.fate.remnant) / self.star_mass).clamp(0.02, 1.0);
         let f = (1.0 / retained).clamp(1.0, REMNANT_ORBIT_EXPANSION_MAX);
         let v_scale = 1.0 / f.sqrt();
         let supernova = self.fate.supernova;
@@ -933,10 +1083,18 @@ impl Kernel {
 
     /// Remove dust that has escaped far beyond the system (keeps counts bounded).
     fn cull_particles(&mut self) {
-        let escape = self.cloud_extent * ESCAPE_EXTENT_FACTOR;
-        let escape2 = escape * escape;
-        self.particles
-            .retain(|p| p.x * p.x + p.y * p.y + p.z * p.z <= escape2);
+        let dust = self.cloud_extent * ESCAPE_EXTENT_FACTOR;
+        let dust2 = dust * dust;
+        let ejecta = self.cloud_extent * EJECTA_ESCAPE_EXTENT_FACTOR;
+        let ejecta2 = ejecta * ejecta;
+        self.particles.retain(|p| {
+            let limit2 = if p.kind == ParticleKind::Ejecta {
+                ejecta2
+            } else {
+                dust2
+            };
+            p.x * p.x + p.y * p.y + p.z * p.z <= limit2
+        });
     }
 
     /// Clear every circumstellar particle when the star dies, leaving only the
@@ -957,21 +1115,38 @@ impl Kernel {
     fn spawn_ejecta(&mut self) {
         let budget = MAX_PARTICLES.saturating_sub(self.particles.len());
         let n = EJECTA_COUNT.min(budget);
-        let violent = self.cloud_mass >= 8.0;
-        let base_speed =
-            (if violent { 26.0 } else { 12.0 }) * (self.mu() / (self.cloud_extent + 1.0)).sqrt();
+        let violent = self.fate.supernova;
+        // A supernova's envelope is accelerated by a single shock into a layered,
+        // velocity-stratified shell; a planetary nebula is puffed off gently over
+        // millennia, so it is slower and more ragged.
+        // Orbital time the death stage spans at the fastest pace: the bounded
+        // number of steps times the bounded orbital time each may advance.
+        let death_span = DEATH_MIN_STEPS * ORBITAL_MAX;
+        let reach = if violent {
+            EJECTA_SHELL_REACH_SUPERNOVA
+        } else {
+            EJECTA_SHELL_REACH_NEBULA
+        };
+        let terminal = reach * self.cloud_extent / death_span;
+        let spread = if violent { 0.5 } else { 0.28 };
+        let launch_span = EJECTA_LAUNCH_RADIUS_MAX - EJECTA_LAUNCH_RADIUS_MIN;
         for _ in 0..n {
             let cos_t = 2.0 * self.rng.next_f64() - 1.0;
             let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
             let phi = 2.0 * std::f64::consts::PI * self.rng.next_f64();
             let dir: Vec3 = [sin_t * phi.cos(), cos_t, sin_t * phi.sin()];
-            let r0 = 1.0 + self.rng.next_f64() * 2.0;
-            // Never below the local escape speed: real nebula/supernova ejecta is
-            // unbound, which is why the shell disperses and leaves a BARE remnant
-            // instead of settling into a ring of particles around it.
+            let r0 = EJECTA_LAUNCH_RADIUS_MIN + self.rng.next_f64() * launch_span;
+            // Launch fast enough that, after climbing out of the star's potential
+            // well, the fragment still coasts at `v_infinity` — i.e. unbound with
+            // a known asymptotic speed.
             let escape_speed = (2.0 * self.mu() / r0.max(f64::EPSILON)).sqrt();
-            let speed = (base_speed * (0.6 + 0.8 * self.rng.next_f64()))
-                .max(EJECTA_ESCAPE_MARGIN * escape_speed);
+            let roll = self.rng.next_f64();
+            let v_infinity = terminal * (1.0 + spread * roll);
+            let speed = (v_infinity * v_infinity + escape_speed * escape_speed).sqrt();
+            // Velocity stratification: a supernova's ejecta is layered and the
+            // fastest, outermost material is the hottest, so the shell shades from
+            // a blue-white leading edge through white to a cooler interior.
+            let heat = if violent { roll } else { roll * 0.5 };
             self.particles.push(Particle {
                 x: dir[0] * r0,
                 y: dir[1] * r0,
@@ -979,10 +1154,10 @@ impl Kernel {
                 vx: dir[0] * speed,
                 vy: dir[1] * speed,
                 vz: dir[2] * speed,
-                r: if violent { 1.0 } else { 0.9 },
-                g: if violent { 0.7 } else { 0.5 },
-                b: if violent { 0.5 } else { 0.9 },
-                size: 1.6,
+                r: if violent { 1.0 - 0.35 * heat } else { 0.95 },
+                g: if violent { 0.45 + 0.45 * heat } else { 0.55 },
+                b: if violent { 0.3 + 0.7 * heat } else { 0.85 },
+                size: if violent { 1.5 + 0.8 * heat } else { 1.6 },
                 mass: 0.0,
                 kind: ParticleKind::Ejecta,
                 ttl: f64::INFINITY,
@@ -1157,8 +1332,12 @@ mod tests {
     /// hundred bounded orbital steps.
     const LIFECYCLE_STEPS: usize = 900;
 
-    fn solar_kernel(mass: f64, particle_count: u32) -> Kernel {
-        Kernel::new(mass, 50.0, 0.5, 0.74, 0.24, 0.02, particle_count)
+    /// A kernel whose cloud assembles a star of `star_mass` M☉. Only a fraction
+    /// of a cloud ever reaches the star, so the tests state the STAR's mass and
+    /// let `cloud_mass_for_star` work out the cloud they need.
+    fn solar_kernel(star_mass: f64, particle_count: u32) -> Kernel {
+        let cloud = cloud_mass_for_star(star_mass, 0.02);
+        Kernel::new(cloud, 50.0, 0.5, 0.74, 0.24, 0.02, particle_count)
     }
 
     #[test]
@@ -1353,6 +1532,74 @@ mod tests {
     }
 
     #[test]
+    fn grows_the_biggest_planet_beyond_the_snow_line() {
+        // Reported bug 2: the most massive world used to be the INNERMOST one,
+        // because the retention curve peaked at the snow line while the dust
+        // supply falls outward. Mirror of the TS fallback's regression.
+        let mut kernel = solar_kernel(1.0, 4000);
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e9);
+            if kernel.stage() >= LifecycleStage::MainSequence as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::MainSequence as u32);
+
+        let planets: Vec<(f64, f64)> = kernel
+            .bodies
+            .iter()
+            .filter(|b| matches!(b.kind, BodyType::Planet | BodyType::Protoplanet))
+            .map(|b| (magnitude(b.pos), b.mass))
+            .collect();
+        assert!(planets.len() > 4, "too few planets formed");
+
+        let heaviest = planets
+            .iter()
+            .copied()
+            .fold((0.0f64, 0.0f64), |a, b| if b.1 > a.1 { b } else { a });
+        assert!(
+            heaviest.0 > SNOW_LINE_AU,
+            "biggest planet formed at {} AU, inside the snow line",
+            heaviest.0
+        );
+        assert!(heaviest.0 < 20.0, "biggest planet formed absurdly far out");
+
+        // Inner worlds stay small; the giants outside dwarf them.
+        let inner_max = planets
+            .iter()
+            .filter(|p| p.0 < SNOW_LINE_AU)
+            .fold(0.0f64, |a, p| a.max(p.1));
+        assert!(inner_max > 0.0, "no planet formed inside the snow line");
+        assert!(heaviest.1 > inner_max * 20.0);
+    }
+
+    #[test]
+    fn the_cloud_does_not_collapse_into_the_star_wholesale() {
+        // Reported bug 6: a 40 M☉ cloud produced a 40 M☉ star.
+        let cloud = 40.0;
+        let mut kernel = Kernel::new(cloud, 50.0, 0.5, 0.74, 0.24, 0.02, 2000);
+        let expected = stellar_mass_from_cloud(cloud, 0.02);
+        assert!(expected < cloud * 0.45);
+
+        let mut peak: f64 = 0.0;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e9);
+            peak = peak.max(kernel.star_mass_solar());
+            if kernel.stage() >= LifecycleStage::MainSequence as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::MainSequence as u32);
+        assert!((peak - expected).abs() < 1e-9, "peak {peak} vs {expected}");
+
+        // However long it runs, the star can never grow past its budget.
+        for _ in 0..60 {
+            kernel.step(1.0e9);
+            assert!(kernel.star_mass_solar() <= expected + 1e-9);
+        }
+    }
+
+    #[test]
     fn forms_the_star_gradually_not_immediately() {
         // Regression for "the star is born almost immediately": every grain that
         // crossed the capture radius used to be swallowed instantly, so the core
@@ -1462,13 +1709,14 @@ mod tests {
         }
         assert!(saw_debris, "red giant never disrupted an inner planet");
 
-        // The stream drains into the star within a few orbits.
+        // The stream drains into the star within a few orbits. Stepped on a much
+        // finer sim-dt so the star stays a red giant throughout: the debris must
+        // vanish through its OWN infall, not because the supernova blast later
+        // sweeps the system clean.
         for _ in 0..60 {
-            if kernel.stage() >= LifecycleStage::Death as u32 {
-                break;
-            }
-            kernel.step(1.0e16);
+            kernel.step(1.0e14);
         }
+        assert_eq!(kernel.stage(), LifecycleStage::RedGiant as u32);
         assert!(
             !kernel
                 .particles
@@ -1476,6 +1724,78 @@ mod tests {
                 .any(|p| p.kind == ParticleKind::Debris),
             "tidal debris is still orbiting long after the disruption"
         );
+    }
+
+    #[test]
+    fn the_death_is_a_watchable_sequence_not_a_single_step() {
+        // Reported: "the transition to the neutron star happens all of a sudden,
+        // the star just shrinks". On the compressed stellar clock one frame spans
+        // far more than the ~10^4 yr the death lasts, so the star crossed from red
+        // giant to remnant inside a single step and nothing was ever drawn.
+        let mut kernel = solar_kernel(14.0, 2000);
+        let mut death_steps = 0;
+        let mut saw_death = false;
+        for _ in 0..LIFECYCLE_STEPS {
+            // A deliberately ENORMOUS dt: the cap has to hold even here.
+            kernel.step(1.0e18);
+            if kernel.stage() == LifecycleStage::Death as u32 {
+                saw_death = true;
+                death_steps += 1;
+            }
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        assert!(saw_death, "the death stage was skipped entirely");
+        assert_eq!(kernel.stage(), LifecycleStage::Remnant as u32);
+        assert!(
+            death_steps as f64 >= DEATH_MIN_STEPS * 0.9,
+            "death crossed in {death_steps} steps; it must be watchable"
+        );
+    }
+
+    #[test]
+    fn the_shell_is_thrown_at_shock_breakout_not_before() {
+        // The core implodes first; nothing is expelled until the rebound shock
+        // reaches the surface.
+        let mut kernel = solar_kernel(14.0, 2000);
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e18);
+            if kernel.stage() == LifecycleStage::Death as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::Death as u32);
+        // Still collapsing: no ejecta yet.
+        assert!((kernel.stage_progress() as f64) < DEATH_SHOCK_BREAKOUT);
+        assert!(!kernel
+            .particles
+            .iter()
+            .any(|p| p.kind == ParticleKind::Ejecta));
+
+        // Step until the shock breaks out, then the shell must exist.
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e18);
+            if (kernel.stage_progress() as f64) >= DEATH_SHOCK_BREAKOUT
+                || kernel.stage() != LifecycleStage::Death as u32
+            {
+                break;
+            }
+        }
+        let ejecta = kernel
+            .particles
+            .iter()
+            .filter(|p| p.kind == ParticleKind::Ejecta)
+            .count();
+        assert!(ejecta > 100, "the blast threw only {ejecta} fragments");
+
+        // Every fragment is unbound: the shell disperses and leaves a bare remnant.
+        let mu = kernel.mu();
+        for p in &kernel.particles {
+            let r = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
+            let speed = (p.vx * p.vx + p.vy * p.vy + p.vz * p.vz).sqrt();
+            assert!(!is_bound(mu, r, speed), "a fragment fell back at r={r}");
+        }
     }
 
     #[test]

@@ -276,10 +276,50 @@ button:hover {
   border-color: var(--accent);
 }
 
-/* Toggled-on transport button (e.g. rewind while scrubbing). */
+/* Toggled-on transport button (e.g. pause, or rewind while scrubbing). */
 button.hud-button--active {
   background: rgba(255, 176, 90, 0.32);
   border-color: var(--accent-strong, #ffb05a);
+}
+
+/*
+ * PAUSED badge. Centred near the top of the viewport and deliberately
+ * unmissable: with the whole scene frozen there is otherwise nothing to
+ * distinguish a paused simulation from a stalled one.
+ */
+.hud-paused {
+  position: absolute;
+  /* Below the HUD panel, which owns the top of the overlay. */
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  padding: 6px 18px;
+  border: 1px solid var(--accent-strong, #ffb05a);
+  border-radius: 999px;
+  background: rgba(12, 14, 24, 0.72);
+  color: var(--accent-strong, #ffb05a);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+  animation: hud-paused-pulse 2.4s ease-in-out infinite;
+}
+
+.hud-paused[hidden] {
+  display: none;
+}
+
+@keyframes hud-paused-pulse {
+  0%,
+  100% {
+    opacity: 0.95;
+  }
+  50% {
+    opacity: 0.55;
+  }
 }
 
 select {

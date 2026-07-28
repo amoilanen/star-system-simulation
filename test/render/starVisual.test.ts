@@ -1,10 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
+import { DEATH_PHASES } from '../../src/sim/stages';
 import {
   blackbodyColor,
+  deathAppearance,
   mainSequenceRadius,
   mainSequenceTemperature,
+  remnantAppearance,
   starAppearance,
+  WHITE_DWARF_RADIUS,
+  type StarAppearance,
 } from '../../src/render/starVisual';
 
 describe('blackbodyColor ramp', () => {
@@ -147,5 +152,181 @@ describe('Solar-System scale (bug: arcade-sized star)', () => {
     const neutron = starAppearance(LifecycleStage.Remnant, 20, 1, RemnantType.NeutronStar);
     expect(dwarf.radius).toBeLessThan(mainSequenceRadius(1));
     expect(neutron.radius).toBeLessThan(dwarf.radius);
+  });
+});
+
+describe('bug 5 — the spectrum must be visibly a spectrum', () => {
+  it('renders a hot star unmistakably blue, not white', () => {
+    const hot = blackbodyColor(mainSequenceTemperature(20));
+    expect(hot.b).toBe(1);
+    // The blue must clearly dominate; a near-white (0.79, 0.86, 1.0) does not.
+    expect(hot.b - hot.r).toBeGreaterThan(0.35);
+    expect(hot.b - hot.g).toBeGreaterThan(0.2);
+  });
+
+  it('renders a cool star unmistakably orange-red', () => {
+    const cool = blackbodyColor(mainSequenceTemperature(0.35));
+    expect(cool.r).toBe(1);
+    expect(cool.r - cool.b).toBeGreaterThan(0.6);
+  });
+
+  it('keeps a sun-like star neutral in between', () => {
+    const sun = blackbodyColor(mainSequenceTemperature(1));
+    expect(Math.abs(sun.r - sun.g)).toBeLessThan(0.2);
+    expect(Math.abs(sun.g - sun.b)).toBeLessThan(0.2);
+  });
+
+  it('separates every mass step by a visible colour change', () => {
+    const masses = [0.3, 1, 3, 10, 30];
+    const blues = masses.map((m) => blackbodyColor(mainSequenceTemperature(m)).b);
+    const reds = masses.map((m) => blackbodyColor(mainSequenceTemperature(m)).r);
+    for (let i = 1; i < masses.length; i += 1) {
+      expect(blues[i]!).toBeGreaterThanOrEqual(blues[i - 1]!);
+      expect(reds[i]!).toBeLessThanOrEqual(reds[i - 1]!);
+    }
+    // The extremes are genuinely different colours, not two shades of white.
+    expect(blues.at(-1)! - blues[0]!).toBeGreaterThan(0.5);
+    expect(reds[0]! - reds.at(-1)!).toBeGreaterThan(0.5);
+  });
+
+  it('scales the mass→temperature relation steeply enough to reach O-star heat', () => {
+    expect(mainSequenceTemperature(20)).toBeGreaterThan(30000);
+    expect(mainSequenceTemperature(0.3)).toBeLessThan(3500);
+  });
+});
+
+describe('bug 4 — compact remnants get their own presentation', () => {
+  it('draws a neutron star as a smooth crust with a magnetosphere', () => {
+    const ns = remnantAppearance(RemnantType.NeutronStar);
+    expect(ns.visible).toBe(true);
+    // No convective granulation on a degenerate crust.
+    expect(ns.surfaceDetail).toBe(0);
+    expect(ns.magnetosphere).toBe(true);
+    expect(ns.blackHole).toBe(false);
+    // Searing hot ⇒ blue.
+    expect(ns.color.b).toBeGreaterThan(ns.color.r);
+  });
+
+  it('adds the sweeping beam only for a pulsar', () => {
+    expect(remnantAppearance(RemnantType.Pulsar).pulsarBeam).toBe(true);
+    expect(remnantAppearance(RemnantType.NeutronStar).pulsarBeam).toBe(false);
+    expect(remnantAppearance(RemnantType.Pulsar).magnetosphere).toBe(true);
+  });
+
+  it('draws a black hole with no emitting surface at all', () => {
+    const bh = remnantAppearance(RemnantType.BlackHole);
+    expect(bh.visible).toBe(true);
+    expect(bh.blackHole).toBe(true);
+    // The horizon radiates nothing; the disc and photon ring carry the light.
+    expect(bh.surfaceLum).toBe(0);
+    expect(bh.glow).toBeGreaterThan(1);
+    expect(bh.radius).toBeGreaterThan(0);
+  });
+
+  it('keeps convective granulation on true stars', () => {
+    expect(starAppearance(LifecycleStage.MainSequence, 1, 0.5).surfaceDetail).toBe(1);
+    expect(starAppearance(LifecycleStage.RedGiant, 1, 0.5).surfaceDetail).toBe(1);
+    expect(starAppearance(LifecycleStage.MainSequence, 1, 0.5).blackHole).toBe(false);
+  });
+});
+
+describe('the death sequence is staged, not a fade', () => {
+  const SN_MASS = 14;
+
+  /** Sample the supernova death appearance across the whole stage. */
+  function sample(mass: number, supernova: boolean, steps = 200): StarAppearance[] {
+    return Array.from({ length: steps + 1 }, (_, i) => deathAppearance(mass, i / steps, supernova));
+  }
+
+  it('implodes before it explodes: the star shrinks and dims first', () => {
+    const start = deathAppearance(SN_MASS, 0, true);
+    const justBefore = deathAppearance(SN_MASS, DEATH_PHASES.shockBreakout * 0.98, true);
+    // The core collapse pulls the photosphere inward and the star fades.
+    expect(justBefore.radius).toBeLessThan(start.radius * 0.3);
+    expect(justBefore.glow).toBeLessThan(start.glow);
+    // Nothing has been expelled yet.
+    expect(start.shockwave).toBe(0);
+    expect(justBefore.shockwave).toBe(0);
+  });
+
+  it('flashes at shock breakout — the brightest moment of the star’s life', () => {
+    const collapsing = deathAppearance(SN_MASS, DEATH_PHASES.shockBreakout * 0.98, true);
+    const breakout = deathAppearance(SN_MASS, DEATH_PHASES.shockBreakout + 0.001, true);
+    const mainSequence = starAppearance(LifecycleStage.MainSequence, SN_MASS, 0.5);
+
+    expect(breakout.glow).toBeGreaterThan(collapsing.glow * 8);
+    expect(breakout.glow).toBeGreaterThan(mainSequence.glow * 8);
+    // A ~10^5 K ultraviolet flash reads blue-white.
+    expect(breakout.temperatureK).toBeGreaterThan(30000);
+    expect(breakout.color.b).toBeGreaterThan(breakout.color.r);
+    // …and the shell is born at the same instant the kernel throws its ejecta.
+    expect(breakout.shockwave).toBeGreaterThan(0);
+  });
+
+  it('expands a fireball that then cools and recedes to the remnant', () => {
+    const samples = sample(SN_MASS, true);
+    const radii = samples.map((a) => a.radius);
+    const peakRadius = Math.max(...radii);
+    const collapsed = deathAppearance(SN_MASS, DEATH_PHASES.shockBreakout * 0.98, true).radius;
+    const redGiant = starAppearance(LifecycleStage.RedGiant, SN_MASS, 1).radius;
+
+    // The fireball dwarfs the collapsed core and outgrows the red giant it came
+    // from — but stays a few AU across, because it is an OPAQUE sphere and a
+    // literal tens-of-AU photosphere would simply swallow the camera.
+    expect(peakRadius).toBeGreaterThan(collapsed * 10);
+    expect(peakRadius).toBeGreaterThan(redGiant * 2);
+    expect(peakRadius).toBeLessThan(15);
+    // The blast SHELL, which is transparent, is the part that sweeps the system.
+    const peakShell = Math.max(...samples.map((a) => a.shockwaveRadius));
+    expect(peakShell).toBeGreaterThan(peakRadius * 8);
+    // …and the photosphere has receded again by the end, so handing over to the
+    // compact remnant is continuous rather than a jump.
+    expect(radii.at(-1)!).toBeLessThan(peakRadius * 0.02);
+
+    // Monotonic cooling after the flash.
+    const afterFlash = samples.filter((_, i) => i / 200 > DEATH_PHASES.shockBreakout);
+    for (let i = 1; i < afterFlash.length; i += 1) {
+      expect(afterFlash[i]!.temperatureK).toBeLessThanOrEqual(afterFlash[i - 1]!.temperatureK + 1);
+    }
+    expect(afterFlash.at(-1)!.temperatureK).toBeLessThan(6000);
+  });
+
+  it('expands the blast shell throughout and hands over cleanly at the end', () => {
+    const samples = sample(SN_MASS, true);
+    const shells = samples.filter((a) => a.shockwave > 0);
+    expect(shells.length).toBeGreaterThan(100);
+    for (let i = 1; i < shells.length; i += 1) {
+      expect(shells[i]!.shockwaveRadius).toBeGreaterThan(shells[i - 1]!.shockwaveRadius);
+    }
+    // Fades to nothing as the stage ends: from there the ejecta PARTICLES are the
+    // visible shell, so there is no pop when the remnant appears.
+    expect(samples.at(-1)!.shockwave).toBeCloseTo(0, 5);
+  });
+
+  it('gives a low-mass star a gentle planetary nebula instead of a blast', () => {
+    const nebula = sample(1, false);
+    const supernova = sample(SN_MASS, true);
+
+    // No violent flash: the peak glow is a fraction of a supernova's.
+    const nebulaPeak = Math.max(...nebula.map((a) => a.glow));
+    const snPeak = Math.max(...supernova.map((a) => a.glow));
+    expect(nebulaPeak).toBeLessThan(snPeak * 0.3);
+
+    // The envelope drifts off cool and red, and the EXPOSED CORE is then revealed
+    // as one of the hottest objects in the universe.
+    expect(nebula[0]!.temperatureK).toBeLessThan(4000);
+    expect(nebula[0]!.color.r).toBeGreaterThan(nebula[0]!.color.b);
+    const final = nebula.at(-1)!;
+    expect(final.temperatureK).toBeGreaterThan(30000);
+    expect(final.color.b).toBeGreaterThan(final.color.r);
+    // …and it has shrunk to exactly white-dwarf size, ready for the remnant.
+    expect(final.radius).toBeCloseTo(WHITE_DWARF_RADIUS, 6);
+  });
+
+  it('is reachable through starAppearance with the fate flag', () => {
+    const staged = starAppearance(LifecycleStage.Death, SN_MASS, 0.2, null, null, true);
+    const quiet = starAppearance(LifecycleStage.Death, SN_MASS, 0.2, null, null, false);
+    expect(staged.glow).toBeGreaterThan(quiet.glow * 3);
+    expect(staged).toEqual(deathAppearance(SN_MASS, 0.2, true));
   });
 });

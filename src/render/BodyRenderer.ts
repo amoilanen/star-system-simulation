@@ -2,9 +2,10 @@
 //
 // Reads the kernel body buffer each frame and draws bodies as instanced meshes,
 // one instanced mesh per kind. Planets spin on their axis (accumulated per body
-// id from the buffer's spin rate) while their orbital position comes from the
-// kernel. Comets additionally get an additive tail billboard oriented radially
-// away from the star (bodyMath.tailDirectionAwayFromStar).
+// id from the buffer's spin rate) around a per-world axial tilt, are tinted from
+// `planetLook` so no two look alike, and carry ring systems and moons. Comets
+// additionally get an additive tail billboard oriented radially away from the
+// star (bodyMath.tailDirectionAwayFromStar).
 
 import * as THREE from 'three';
 import { BODY_OFFSET, BODY_STRIDE, BodyType } from '../sim/PhysicsKernel';
@@ -15,14 +16,19 @@ import {
   tailDirectionAwayFromStar,
   tailLength,
 } from './bodyMath';
+import { MAX_MOONS_PER_PLANET, moonOffset, moonOrbit, planetLook } from './planetLook';
 import { apparentRadius } from './screenScale';
 import { cometTailFragmentShader, cometTailVertexShader } from './shaders/cometTail';
 
 const MAX_PLANETS = 32;
 const MAX_COMETS = 48;
 const MAX_ASTEROIDS = 48;
-/** Instanced-mesh capacity for planet moons (a few per planet). */
-const MAX_MOONS = 96;
+/** Instanced-mesh capacity for planet moons. */
+const MAX_MOONS = MAX_PLANETS * MAX_MOONS_PER_PLANET;
+/** Instanced-mesh capacity for ring systems (a minority of planets have one). */
+const MAX_RINGS = MAX_PLANETS;
+/** Sampled points per drawn moon-orbit circle. */
+const MOON_ORBIT_SEGMENTS = 64;
 /** Local +Y axis a comet tail plane is built along, rotated toward the tail. */
 const TAIL_AXIS = new THREE.Vector3(0, 1, 0);
 /**
@@ -41,20 +47,11 @@ const MAX_TAIL_LENGTH = 2.5;
 const MIN_BODY_PIXELS = 7;
 
 /** Apparent-size floor for a moon; below its planet's so the hierarchy reads. */
-const MIN_MOON_PIXELS = 4;
+const MIN_MOON_PIXELS = 3;
 
-/**
- * Deterministic moon count for a body: only true planets/protoplanets get
- * moons, 1–2 depending on the body id, so the system reads as a hierarchy of
- * orbits rather than lone planets (addresses the "planets have no moons"
- * over-simplification). Purely visual — moons are not kernel bodies.
- */
-function moonCountForBody(id: number, type: BodyType): number {
-  if (type !== BodyType.Planet && type !== BodyType.Protoplanet) {
-    return 0;
-  }
-  return 1 + (Math.abs(Math.round(id)) % 2);
-}
+/** Ring-system inner/outer radius as a multiple of the planet's drawn radius. */
+const RING_INNER = 1.5;
+const RING_OUTER = 2.5;
 
 /** Draws all orbiting/visiting bodies read from the kernel body buffer. */
 export class BodyRenderer {
@@ -64,10 +61,17 @@ export class BodyRenderer {
   private readonly comets: THREE.InstancedMesh;
   private readonly asteroids: THREE.InstancedMesh;
   private readonly moons: THREE.InstancedMesh;
+  private readonly rings: THREE.InstancedMesh;
   private readonly tails: THREE.InstancedMesh;
   private readonly tailMaterial: THREE.ShaderMaterial;
+  /** Pooled moon-orbit circles, shown with the orbit overlay. */
+  private readonly moonOrbitGroup: THREE.Group;
+  private readonly moonOrbitPool: THREE.LineLoop[] = [];
+  private readonly moonOrbitGeometry: THREE.BufferGeometry;
+  private readonly moonOrbitMaterial: THREE.LineBasicMaterial;
 
   private readonly dummy = new THREE.Object3D();
+  private readonly color = new THREE.Color();
   /** Per-body accumulated axial spin angle, keyed by body id (FR-6). */
   private readonly spinAngles = new Map<number, number>();
   private readonly starPos: Vec3 = [0, 0, 0];
@@ -87,10 +91,12 @@ export class BodyRenderer {
   constructor() {
     this.group = new THREE.Group();
 
+    // Planets: one instanced sphere, tinted PER INSTANCE from `planetLook` so a
+    // rocky world, an ice giant and a gas giant are told apart at a glance.
     const planetMat = new THREE.MeshStandardMaterial({
-      color: 0x88aaff,
-      roughness: 0.8,
-      metalness: 0.1,
+      color: 0xffffff,
+      roughness: 0.85,
+      metalness: 0.05,
     });
     this.planets = new THREE.InstancedMesh(
       new THREE.SphereGeometry(1, 24, 24),
@@ -128,6 +134,31 @@ export class BodyRenderer {
     this.moons.frustumCulled = false;
     this.group.add(this.moons);
 
+    // Ring systems: a flat annulus in the planet's equatorial plane, so it tilts
+    // with the world's axis exactly as Saturn's does.
+    const ringGeom = new THREE.RingGeometry(RING_INNER, RING_OUTER, 48, 1);
+    ringGeom.rotateX(-Math.PI / 2);
+    const ringMat = new THREE.MeshStandardMaterial({
+      color: 0xd8c9a8,
+      // Ring particles are icy and highly reflective, and a ring plane is often
+      // nearly edge-on to the star — so a purely diffuse ring renders as a dark
+      // smudge. A little self-illumination keeps it legible from any angle
+      // without making it glow.
+      emissive: 0x6a5f4a,
+      emissiveIntensity: 1,
+      roughness: 1,
+      metalness: 0,
+      transparent: true,
+      opacity: 0.5,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    this.rings = new THREE.InstancedMesh(ringGeom, ringMat, MAX_RINGS);
+    this.rings.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.rings.count = 0;
+    this.rings.frustumCulled = false;
+    this.group.add(this.rings);
+
     const asteroidMat = new THREE.MeshStandardMaterial({
       color: 0x8a7a66,
       roughness: 1,
@@ -142,6 +173,20 @@ export class BodyRenderer {
     this.asteroids.count = 0;
     this.asteroids.frustumCulled = false;
     this.group.add(this.asteroids);
+
+    // Moon-orbit rings: unit circles in the local x–z plane, transformed per
+    // moon. Hidden until the orbit overlay is switched on.
+    this.moonOrbitGroup = new THREE.Group();
+    this.moonOrbitGroup.visible = false;
+    this.group.add(this.moonOrbitGroup);
+    this.moonOrbitGeometry = createUnitCircleGeometry(MOON_ORBIT_SEGMENTS);
+    this.moonOrbitMaterial = new THREE.LineBasicMaterial({
+      color: 0x9fb4d8,
+      transparent: true,
+      // Fainter than a planetary orbit: a moon's path is a detail, not the plot.
+      opacity: 0.3,
+      depthWrite: false,
+    });
 
     // Comet tails: a plane spanning local y∈[0,1] (head at the comet, tip away).
     const tailGeom = new THREE.PlaneGeometry(1, 1);
@@ -167,9 +212,10 @@ export class BodyRenderer {
 
   /**
    * Update all instanced bodies from the interleaved kernel body buffer. `count`
-   * is the number of bodies; `dt` (real seconds) advances axial spin. The camera
-   * and viewport height are used only to keep astronomically small bodies above
-   * a minimum apparent size (see `screenScale.ts`) — positions and distances are
+   * is the number of bodies; `dt` (real seconds) advances axial spin and the
+   * moons — pass 0 to freeze them while the simulation is paused. The camera and
+   * viewport height are used only to keep astronomically small bodies above a
+   * minimum apparent size (see `screenScale.ts`) — positions and distances are
    * always the kernel's true ones.
    */
   update(
@@ -188,7 +234,9 @@ export class BodyRenderer {
     let cometIdx = 0;
     let asteroidIdx = 0;
     let moonIdx = 0;
+    let ringIdx = 0;
     let tailIdx = 0;
+    let orbitIdx = 0;
     const seen = new Set<number>();
 
     for (let i = 0; i < count; i += 1) {
@@ -196,6 +244,7 @@ export class BodyRenderer {
       const id = buffer[base + BODY_OFFSET.id] ?? 0;
       const type = Math.round(buffer[base + BODY_OFFSET.type] ?? 0) as BodyType;
       const radius = buffer[base + BODY_OFFSET.radius] ?? 0.5;
+      const mass = buffer[base + BODY_OFFSET.mass] ?? 0;
       const pos: Vec3 = [
         buffer[base + BODY_OFFSET.x] ?? 0,
         buffer[base + BODY_OFFSET.y] ?? 0,
@@ -223,10 +272,18 @@ export class BodyRenderer {
           break;
         case BodyType.Protoplanet:
         case BodyType.Planet:
-        default:
-          planetIdx = this.writeInstance(this.planets, planetIdx, pos, radius, angle, MAX_PLANETS);
-          moonIdx = this.writeMoons(moonIdx, id, type, pos, radius);
+        default: {
+          const look = planetLook(id, mass);
+          const drawn = this.drawnRadius(pos, radius, MIN_BODY_PIXELS);
+          planetIdx = this.writePlanet(planetIdx, pos, drawn, angle, look.axialTilt, look.color);
+          if (look.hasRings) {
+            ringIdx = this.writeRing(ringIdx, pos, drawn, look.axialTilt);
+          }
+          const moons = this.writeMoons(moonIdx, orbitIdx, id, look.moonCount, pos, drawn);
+          moonIdx = moons.moonIndex;
+          orbitIdx = moons.orbitIndex;
           break;
+        }
       }
     }
 
@@ -234,7 +291,15 @@ export class BodyRenderer {
     this.finalize(this.comets, cometIdx);
     this.finalize(this.asteroids, asteroidIdx);
     this.finalize(this.moons, moonIdx);
+    this.finalize(this.rings, ringIdx);
     this.finalize(this.tails, tailIdx);
+    if (this.planets.instanceColor !== null) {
+      this.planets.instanceColor.needsUpdate = true;
+    }
+    // Hide any pooled moon-orbit circles left over from a previous frame.
+    for (let i = orbitIdx; i < this.moonOrbitPool.length; i += 1) {
+      this.moonOrbitPool[i]!.visible = false;
+    }
 
     // Drop spin state for bodies that have left the system.
     for (const id of this.spinAngles.keys()) {
@@ -242,6 +307,11 @@ export class BodyRenderer {
         this.spinAngles.delete(id);
       }
     }
+  }
+
+  /** Show or hide the moon-orbit circles (follows the orbit overlay toggle). */
+  setMoonOrbitsVisible(visible: boolean): void {
+    this.moonOrbitGroup.visible = visible;
   }
 
   /**
@@ -284,45 +354,104 @@ export class BodyRenderer {
     return index + 1;
   }
 
-  /**
-   * Write the moon instances for one planet: 1–2 small bodies on inclined
-   * near-circular orbits around the planet's current position. Deterministic in
-   * the body id (stable phases/inclinations) and animated by `moonElapsed`, so
-   * moons visibly circle their planet without any kernel support.
-   */
-  private writeMoons(index: number, id: number, type: BodyType, pos: Vec3, radius: number): number {
-    const moonCount = moonCountForBody(id, type);
-    let idx = index;
-    for (let k = 0; k < moonCount && idx < MAX_MOONS; k += 1) {
-      // Stable per-moon seed → phase offset, inclination and a size jitter.
-      const seed = Math.sin((Math.abs(id) + 1) * 12.9898 + k * 78.233) * 43758.5453;
-      const phase0 = (seed - Math.floor(seed)) * Math.PI * 2;
-      const incl = 0.25 + 0.5 * ((Math.abs(id) + k) % 3) * 0.1;
-      const orbitRadius = radius * (2.3 + 1.4 * k);
-      const angularSpeed = 0.9 / (1 + k) + 0.15 * ((Math.abs(id) + k) % 2);
-      const angle = phase0 + this.moonElapsed * angularSpeed;
+  /** Write one planet instance: tilted axis, own spin phase and own colour. */
+  private writePlanet(
+    index: number,
+    pos: Vec3,
+    drawnRadius: number,
+    spinAngle: number,
+    axialTilt: number,
+    color: { r: number; g: number; b: number },
+  ): number {
+    if (index >= MAX_PLANETS) {
+      return index;
+    }
+    this.dummy.position.set(pos[0], pos[1], pos[2]);
+    // Tilt the pole, THEN spin about it — the order matters, or the world wobbles
+    // instead of rotating.
+    this.dummy.rotation.set(axialTilt, spinAngle, 0, 'ZXY');
+    this.dummy.scale.setScalar(drawnRadius);
+    this.dummy.updateMatrix();
+    this.planets.setMatrixAt(index, this.dummy.matrix);
+    this.color.setRGB(color.r, color.g, color.b);
+    this.planets.setColorAt(index, this.color);
+    return index + 1;
+  }
 
-      // Circular orbit in the planet's local x–z plane, tilted by `incl`.
-      const ox = Math.cos(angle) * orbitRadius;
-      const oz = Math.sin(angle) * orbitRadius;
-      const oy = Math.sin(angle) * orbitRadius * Math.sin(incl);
-      const moonPos: Vec3 = [pos[0] + ox, pos[1] + oy, pos[2] + oz];
-      // Skip the moon entirely once the planet is far enough away that its own
-      // apparent-size floor would swallow the moon's orbit — otherwise moons
-      // would be drawn buried inside their planet.
-      if (this.drawnRadius(pos, radius, MIN_BODY_PIXELS) > orbitRadius * 0.8) {
-        continue;
-      }
-      const moonRadius = this.drawnRadius(moonPos, radius * (0.16 + 0.05 * k), MIN_MOON_PIXELS);
+  /** Write one ring system, lying in its planet's tilted equatorial plane. */
+  private writeRing(index: number, pos: Vec3, drawnRadius: number, axialTilt: number): number {
+    if (index >= MAX_RINGS) {
+      return index;
+    }
+    this.dummy.position.set(pos[0], pos[1], pos[2]);
+    this.dummy.rotation.set(axialTilt, 0, 0, 'ZXY');
+    this.dummy.scale.setScalar(drawnRadius);
+    this.dummy.updateMatrix();
+    this.rings.setMatrixAt(index, this.dummy.matrix);
+    return index + 1;
+  }
+
+  /**
+   * Write the moons of one planet, plus their orbit circles.
+   *
+   * Everything is sized off the planet's DRAWN radius rather than its true one,
+   * which is what makes moons visible at all: bodies are floored to a minimum
+   * apparent size, so a moon placed a couple of TRUE radii out sat inside the
+   * drawn planet at every zoom level and was previously skipped entirely.
+   */
+  private writeMoons(
+    moonIndex: number,
+    orbitIndex: number,
+    id: number,
+    moonCount: number,
+    pos: Vec3,
+    drawnRadius: number,
+  ): { moonIndex: number; orbitIndex: number } {
+    let mIdx = moonIndex;
+    let oIdx = orbitIndex;
+    for (let k = 0; k < moonCount && mIdx < MAX_MOONS; k += 1) {
+      const orbit = moonOrbit(id, k);
+      const offset = moonOffset(orbit, this.moonElapsed);
+      const orbitRadius = drawnRadius * orbit.radiusFactor;
+      const moonPos: Vec3 = [
+        pos[0] + offset[0] * drawnRadius,
+        pos[1] + offset[1] * drawnRadius,
+        pos[2] + offset[2] * drawnRadius,
+      ];
+      const moonRadius = this.drawnRadius(moonPos, drawnRadius * orbit.sizeFactor, MIN_MOON_PIXELS);
 
       this.dummy.position.set(moonPos[0], moonPos[1], moonPos[2]);
-      this.dummy.rotation.set(0, angle, 0);
+      this.dummy.rotation.set(0, orbit.phase + this.moonElapsed * orbit.angularSpeed, 0);
       this.dummy.scale.setScalar(moonRadius);
       this.dummy.updateMatrix();
-      this.moons.setMatrixAt(idx, this.dummy.matrix);
-      idx += 1;
+      this.moons.setMatrixAt(mIdx, this.dummy.matrix);
+      mIdx += 1;
+
+      // The matching orbit circle: same centre, same radius, same tilt — so the
+      // moon is always drawn ON the line the overlay shows.
+      if (this.moonOrbitGroup.visible) {
+        const line = this.moonOrbitLine(oIdx);
+        line.position.set(pos[0], pos[1], pos[2]);
+        line.rotation.set(orbit.tilt, 0, 0, 'ZXY');
+        line.scale.setScalar(orbitRadius);
+        line.visible = true;
+        oIdx += 1;
+      }
     }
-    return idx;
+    return { moonIndex: mIdx, orbitIndex: oIdx };
+  }
+
+  /** Get (or lazily create) the pooled moon-orbit circle at `index`. */
+  private moonOrbitLine(index: number): THREE.LineLoop {
+    const existing = this.moonOrbitPool[index];
+    if (existing !== undefined) {
+      return existing;
+    }
+    const line = new THREE.LineLoop(this.moonOrbitGeometry, this.moonOrbitMaterial);
+    line.frustumCulled = false;
+    this.moonOrbitPool[index] = line;
+    this.moonOrbitGroup.add(line);
+    return line;
   }
 
   /**
@@ -372,7 +501,14 @@ export class BodyRenderer {
   }
 
   dispose(): void {
-    for (const mesh of [this.planets, this.comets, this.asteroids, this.moons, this.tails]) {
+    for (const mesh of [
+      this.planets,
+      this.comets,
+      this.asteroids,
+      this.moons,
+      this.rings,
+      this.tails,
+    ]) {
       mesh.geometry.dispose();
       const mat = mesh.material;
       if (Array.isArray(mat)) {
@@ -381,6 +517,26 @@ export class BodyRenderer {
         mat.dispose();
       }
     }
+    for (const line of this.moonOrbitPool) {
+      this.moonOrbitGroup.remove(line);
+    }
+    this.moonOrbitPool.length = 0;
+    this.moonOrbitGeometry.dispose();
+    this.moonOrbitMaterial.dispose();
     this.spinAngles.clear();
   }
+}
+
+/** A unit-radius circle in the local x–z plane, for the moon-orbit line loops. */
+function createUnitCircleGeometry(segments: number): THREE.BufferGeometry {
+  const positions = new Float32Array(segments * 3);
+  for (let i = 0; i < segments; i += 1) {
+    const a = (i / segments) * Math.PI * 2;
+    positions[i * 3] = Math.cos(a);
+    positions[i * 3 + 1] = 0;
+    positions[i * 3 + 2] = Math.sin(a);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  return geometry;
 }

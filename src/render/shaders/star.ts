@@ -25,6 +25,7 @@ export const starFragmentShader = /* glsl */ `
   uniform vec3 uColorCore;   // blackbody color of the surface
   uniform vec3 uColorEdge;   // slightly cooler limb color
   uniform float uGlow;       // corona intensity multiplier
+  uniform float uDetail;     // 0 = smooth degenerate crust, 1 = full granulation
 
   varying vec3 vNormalW;
   varying vec3 vViewDir;
@@ -62,20 +63,29 @@ export const starFragmentShader = /* glsl */ `
 
   void main() {
     vec3 p = normalize(vLocalPos) * 3.0 + vec3(0.0, uTime * 0.15, 0.0);
-    float granulation = fbm(p + uTime * 0.05);
+    // A convective photosphere boils; a neutron star's degenerate crust does
+    // not. uDetail blends between the two so a compact remnant renders as a
+    // smooth, searing sphere rather than a few pixels of noise.
+    float granulation = mix(0.5, fbm(p + uTime * 0.05), uDetail);
     float hotSpots = pow(granulation, 2.0);
 
     // Fresnel term brightens the limb into a corona rim.
     float fresnel = pow(1.0 - max(dot(vNormalW, vViewDir), 0.0), 2.5);
 
-    // Keep the surface close to the blackbody hue: a bounded granulation term
-    // modulates brightness without pushing every channel to 1.0, otherwise the
-    // ACES tone-map + bloom would desaturate all stages to the same white and
-    // the stage-to-stage colour change (e.g. a red giant) would be invisible.
-    vec3 surface = mix(uColorEdge, uColorCore, hotSpots) * (0.85 + 0.4 * granulation);
-    // Tinted rim glow, bounded so a hot star flares white-hot at the limb while
-    // a cool star's rim stays its own colour rather than blowing out.
-    vec3 color = surface + uColorCore * fresnel * (0.35 + 0.35 * uGlow);
+    // Granulation modulates BRIGHTNESS ONLY. Blending between two differently
+    // tinted colours (the old mix(edge, core, hotSpots)) dragged every hue
+    // toward the average and, after the ACES tone-map and bloom, left a hot
+    // O-star looking like the same pale ball as a G-star. Keeping the hue fixed
+    // and varying only the intensity is both truer and far more legible.
+    float bright = 0.72 + 0.52 * granulation + 0.18 * hotSpots;
+
+    // Limb darkening: the edge of the disc looks through more atmosphere, so it
+    // is dimmer and marginally cooler — a small shift, not a change of colour.
+    float limb = pow(1.0 - max(dot(vNormalW, vViewDir), 0.0), 1.2);
+    vec3 surface = mix(uColorCore, uColorEdge, limb * 0.65) * bright;
+
+    // Tinted rim glow, bounded so the limb flares without washing the disc out.
+    vec3 color = surface + uColorCore * fresnel * (0.25 + 0.2 * uGlow);
 
     gl_FragColor = vec4(color, 1.0);
   }

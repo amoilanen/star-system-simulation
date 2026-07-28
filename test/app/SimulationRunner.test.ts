@@ -6,13 +6,21 @@ import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
 import { SimEventType, type SimulationEvent } from '../../src/sim/events';
 import { STAGE_ORDER } from '../../src/sim/stages';
 import { PARTICLE_STRIDE } from '../../src/sim/PhysicsKernel';
+import { cloudMassForStar, stellarMassFromCloud } from '../../src/config/starFormation';
 import type { SimulationConfig } from '../../src/config/SimulationConfig';
+
+/**
+ * Cloud mass (M☉) that assembles a SOLAR-mass star. Only ~a third of a cloud
+ * reaches the star, so a run that should live (and die) like the Sun starts
+ * from a ~3 M☉ cloud.
+ */
+const SOLAR_CLOUD_MASS = cloudMassForStar(1, 0.02);
 
 function makeConfig(overrides: Partial<SimulationConfig> = {}): SimulationConfig {
   return {
     locale: 'en',
     composition: { hydrogen: 0.74, helium: 0.24, metals: 0.02 },
-    mass: 1,
+    mass: SOLAR_CLOUD_MASS,
     cloudExtent: 50,
     pace: 1,
     showEventAnnotations: true,
@@ -87,7 +95,11 @@ describe('SimulationRunner (headless orchestration)', () => {
     const runner = new SimulationRunner(makeConfig({ mass: 2 }), new TsFallbackKernel());
     const { state } = runner.tick(1);
 
-    expect(state.mass).toBe(2);
+    // `mass` is the STAR's mass, which is still assembling out of the 2 M☉ cloud
+    // — it can never exceed what the cloud will actually give it.
+    expect(state.cloudMass).toBe(2);
+    expect(state.mass).toBeGreaterThan(0);
+    expect(state.mass).toBeLessThan(stellarMassFromCloud(2, 0.02));
     expect(state.particleCount).toBe(state.particles.length / PARTICLE_STRIDE);
     expect(state.particleCount).toBeGreaterThan(0);
     expect(state.bodyCount).toBeGreaterThan(0);
@@ -98,8 +110,10 @@ describe('SimulationRunner (headless orchestration)', () => {
   });
 
   it('surfaces the selected remnant type at the terminal stage', () => {
-    // High-mass ⇒ supernova ⇒ pulsar (fateModel single source of truth).
-    const runner = new SimulationRunner(makeConfig({ mass: 20 }), new TsFallbackKernel(), {
+    // A cloud massive enough to assemble a ~14 M☉ star ⇒ supernova ⇒ pulsar
+    // (fateModel is the single source of truth).
+    const pulsarCloud = cloudMassForStar(14, 0.02);
+    const runner = new SimulationRunner(makeConfig({ mass: pulsarCloud }), new TsFallbackKernel(), {
       particleCount: WIRING_PARTICLES,
     });
     let last = runner.tick(1);

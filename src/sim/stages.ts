@@ -89,6 +89,43 @@ export const STAGE_TIMING = {
 } as const;
 
 /**
+ * Internal structure of the DEATH stage, as fractions of its duration.
+ *
+ * A core-collapse supernova is not one event but a short, violent sequence, and
+ * the whole point of the death scene is that the viewer can SEE that sequence:
+ *
+ *   1. the iron core implodes and the envelope starts to fall in behind it —
+ *      the star briefly shrinks and dims (the deceptive calm);
+ *   2. the rebound shock reaches the surface and BREAKS OUT: a blinding
+ *      ultraviolet flash;
+ *   3. the envelope is blown off at ~10^4 km/s as an expanding fireball that
+ *      brightens to peak luminosity while cooling from ~10^5 K;
+ *   4. the fireball thins and fades, leaving the compact remnant inside a
+ *      still-expanding shell.
+ *
+ * Both kernels and the renderer key off these fractions, so the ejecta shell is
+ * thrown at exactly the moment the flash is drawn. Mirror in Rust.
+ */
+export const DEATH_PHASES = {
+  /** Fraction of the stage spent collapsing before the shock breaks out. */
+  shockBreakout: 0.12,
+  /** Fraction at which the expanding fireball reaches peak luminosity. */
+  peakLuminosity: 0.34,
+  /**
+   * Smallest number of kernel steps the DEATH stage may take.
+   *
+   * The stellar clock is compressed by up to ~14 orders of magnitude, so at a
+   * fast pace ONE frame spans far more than the ~10^4 yr the death lasts, and
+   * the star blinked from red giant straight to remnant with nothing in
+   * between. Capping how much of the stage a single step may consume makes the
+   * death always watchable — the same reasoning as `orbitalStep`'s compression
+   * of the orbital dynamics, and it only engages when the pace is fast enough
+   * for the death to be sub-frame anyway.
+   */
+  minSteps: 240,
+} as const;
+
+/**
  * Illustrative duration (sim seconds) the star spends IN each stage before
  * advancing to the next, keyed on `mass` (M☉) and `composition`. The terminal
  * {@link LifecycleStage.Remnant} lasts forever (`Infinity`). Pure; exported for
