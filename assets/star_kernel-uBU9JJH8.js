@@ -106,6 +106,16 @@ export class Kernel {
         return ret;
     }
     /**
+     * Mass (M☉) of the central object right now: the accreted core while the
+     * star is assembling, the finished star during its life, and only the
+     * compact remnant's mass once it has died (mirror of `currentStarMass`).
+     * @returns {number}
+     */
+    star_mass_solar() {
+        const ret = wasm.kernel_star_mass_solar(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Advance the simulation by `dt_sim_seconds`, returning the number of events
      * emitted this step (packed into the events buffer). Mirror of
      * `TsFallbackKernel.step`.
