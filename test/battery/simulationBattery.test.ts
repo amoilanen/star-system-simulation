@@ -56,17 +56,24 @@ import {
   PARTICLE_STRIDE,
   type PhysicsKernel,
 } from '../../src/sim/PhysicsKernel';
-import {
-  TsFallbackKernel,
-  SOFTENING,
-  SNOW_LINE_AU,
-  orbitalMu,
-  mulberry32,
-  ParticleKind,
-} from '../../src/sim/TsFallbackKernel';
 import { paceToRate, DEFAULT_LIFECYCLE_SIM_SECONDS } from '../../src/sim/Clock';
 import { loadWasmModule, WasmKernel } from '../../src/sim/WasmKernel';
 import { sceneToAu, solarToEarthMasses } from '../../src/sim/astro';
+
+/**
+ * Deterministic RNG used ONLY to generate the battery's configuration list, so
+ * every run of the suite exercises the same twelve systems. This is test
+ * scaffolding, not simulation semantics — the kernel owns its own RNG.
+ */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 const RUNS = Number(process.env.BATTERY_RUNS ?? 12);
 const PARTICLES = 900;
@@ -169,18 +176,17 @@ function allFinite(buf: Float32Array): boolean {
   return true;
 }
 
-/** TS-kernel internals (deliberate white-box access for conservation checks). */
-interface TsInternals {
-  particles: { x: number; y: number; z: number; mass: number; kind: ParticleKind }[];
-  bodies: { mass: number }[];
-  coreMass: number;
-  discReservoir: number;
-  dispersedMass: number;
-  starMass: number;
-  cloudMass: number;
+/** Model constants read from the kernel itself, never re-declared here. */
+interface KernelConstants {
+  softening: number;
+  snowLineAu: number;
 }
 
-function runBattery(kernel: PhysicsKernel, config: BatteryConfig, isTs: boolean): RunReport {
+function runBattery(
+  kernel: PhysicsKernel,
+  config: BatteryConfig,
+  consts: KernelConstants,
+): RunReport {
   const report: RunReport = {
     issues: [],
     events: [],
@@ -201,14 +207,14 @@ function runBattery(kernel: PhysicsKernel, config: BatteryConfig, isTs: boolean)
   const durations = stageDurations(stellarMass, config.composition);
   const paceRate = paceToRate(config.pace, 1, DEFAULT_LIFECYCLE_SIM_SECONDS, 60);
   const baseSimDt = paceRate * FRAME_REAL_DT;
-  const mu = orbitalMu(config.mass);
+  // The kernel owns these; the harness must not keep its own copies or the
+  // energy checks below would be testing a different model than the one running.
+  const mu = kernel.orbitalMu();
+  const { softening: SOFTENING } = consts;
 
   let lastStage: LifecycleStage = LifecycleStage.DustCloud;
   let lastElapsed = -Infinity;
   let remnantTicks = 0;
-  let maxMassBudget = -Infinity;
-
-  const internals = isTs ? (kernel as unknown as TsInternals) : null;
 
   for (let tick = 0; tick < MAX_TICKS; tick += 1) {
     report.ticks = tick + 1;
@@ -339,28 +345,10 @@ function runBattery(kernel: PhysicsKernel, config: BatteryConfig, isTs: boolean)
         }
       }
 
-      // TS-kernel mass conservation bookkeeping.
-      if (internals !== null) {
-        let dust = 0;
-        for (const p of internals.particles) {
-          dust += p.mass;
-        }
-        let bodies = 0;
-        for (const b of internals.bodies) {
-          bodies += b.mass;
-        }
-        const total =
-          internals.coreMass + internals.discReservoir + internals.dispersedMass + dust + bodies;
-        if (total > config.mass * 1.005 + 1e-9) {
-          issue(`mass created: budget total ${total.toFixed(4)} > cloud ${config.mass}`);
-        }
-        if (total > maxMassBudget + config.mass * 0.002) {
-          if (maxMassBudget !== -Infinity) {
-            issue(`mass budget grew ${maxMassBudget.toFixed(4)} -> ${total.toFixed(4)}`);
-          }
-        }
-        maxMassBudget = Math.max(maxMassBudget, total);
-      }
+      // Mass-conservation book-keeping needs white-box access to the kernel's
+      // internal budget fields, which the flat output buffers do not expose. It
+      // now lives in the crate that owns that state, as the Rust unit test
+      // `the_mass_budget_is_conserved_and_never_grows`.
     }
 
     if (res.stage === LifecycleStage.Remnant) {
@@ -377,7 +365,7 @@ function runBattery(kernel: PhysicsKernel, config: BatteryConfig, isTs: boolean)
     report.finalElapsed = res.elapsedSimSeconds;
   }
 
-  finishChecks(report, config, kernel, internals, stellarMass, durations, mu, issue);
+  finishChecks(report, config, kernel, stellarMass, durations, mu, consts, issue);
   return report;
 }
 
@@ -385,12 +373,14 @@ function finishChecks(
   report: RunReport,
   config: BatteryConfig,
   kernel: PhysicsKernel,
-  internals: TsInternals | null,
   stellarMass: number,
   durations: Readonly<Record<LifecycleStage, number>>,
   mu: number,
+  consts: KernelConstants,
   issue: (msg: string) => void,
 ): void {
+  // Model constants come from the kernel, never from a copy in this harness.
+  const { softening: SOFTENING, snowLineAu: SNOW_LINE_AU } = consts;
   if (report.finalStage !== LifecycleStage.Remnant) {
     issue(
       `lifecycle did not complete: ended in ${LifecycleStage[report.finalStage]} ` +
@@ -494,23 +484,11 @@ function finishChecks(
     );
   }
 
-  // --- Post-mortem state: only unbound, receding ejecta remains. -------------
-  if (internals !== null) {
-    if (substellar) {
-      // The opposite invariant: a brown dwarf has no explosion, so it must
-      // never produce ejecta — and it keeps the disc a blast would have swept.
-      if (internals.particles.some((p) => p.kind === ParticleKind.Ejecta)) {
-        issue('a brown dwarf threw ejecta — it has no explosion to throw it');
-      }
-    } else {
-      for (const p of internals.particles) {
-        if (p.kind !== ParticleKind.Ejecta) {
-          issue('non-ejecta particles still present around the remnant');
-          break;
-        }
-      }
-    }
-  }
+  // Post-mortem particle-KIND checks (a brown dwarf throws no ejecta; a real
+  // death leaves only ejecta behind) need the kinds, which the flat particle
+  // buffer does not carry. They now live in the crate that owns that state, as
+  // the Rust unit tests `a_brown_dwarf_never_throws_ejecta_and_keeps_its_disc`
+  // and `leaves_no_primordial_dust_orbiting_the_remnant`.
   const pbuf = kernel.getParticleBuffer();
   const bbuf = kernel.getBodyBuffer();
   if (!allFinite(pbuf) || !allFinite(bbuf)) {
@@ -605,26 +583,11 @@ function finishChecks(
 
 const configs = buildConfigs(RUNS);
 
-describe(`simulation battery (${RUNS} runs) — TypeScript kernel`, () => {
-  for (const config of configs) {
-    it(
-      config.label,
-      () => {
-        const kernel = new TsFallbackKernel();
-        const report = runBattery(kernel, config, true);
-        kernel.dispose();
-        expect(report.issues, report.issues.join('\n')).toEqual([]);
-      },
-      120000,
-    );
-  }
-});
-
 const wasmBinUrl = new URL('../../wasm/pkg/star_kernel_bg.wasm', import.meta.url);
 const wasmBuilt = existsSync(fileURLToPath(wasmBinUrl));
 const describeWasm = wasmBuilt ? describe : describe.skip;
 
-describeWasm(`simulation battery (${RUNS} runs) — WASM kernel`, () => {
+describeWasm(`simulation battery (${RUNS} runs)`, () => {
   for (const config of configs) {
     it(
       config.label,
@@ -632,7 +595,11 @@ describeWasm(`simulation battery (${RUNS} runs) — WASM kernel`, () => {
         const bytes = readFileSync(fileURLToPath(wasmBinUrl));
         const mod = await loadWasmModule({ module_or_path: new Uint8Array(bytes) });
         const kernel = new WasmKernel(mod);
-        const report = runBattery(kernel, config, false);
+        // Read the model constants the checks depend on from the kernel itself.
+        const report = runBattery(kernel, config, {
+          softening: mod.softening(),
+          snowLineAu: mod.snow_line_au(),
+        });
         kernel.dispose();
         expect(report.issues, report.issues.join('\n')).toEqual([]);
       },

@@ -59,7 +59,7 @@ export interface HudOptions {
   onToggleLabels?: (enabled: boolean) => void;
   /** Toggle the orbital-path overlay; receives the NEW enabled state. */
   onToggleOrbits?: (enabled: boolean) => void;
-  /** Initial state of the labels checkbox. Default true. */
+  /** Initial state of the labels checkbox. Default false (uncluttered sky). */
   initialLabels?: boolean;
   /** Initial state of the orbits checkbox. Default false. */
   initialOrbits?: boolean;
@@ -171,10 +171,11 @@ export class Hud {
     }
 
     // Labels toggle (bodies are drawn at realistic — small — sizes, so the
-    // labels are the primary way to find and identify them).
+    // labels are the primary way to find and identify them — but they start
+    // OFF so the simulation opens on an uncluttered sky).
     const onToggleLabels = options.onToggleLabels;
     if (onToggleLabels !== undefined) {
-      this.labelsInput = this.checkbox('hud.labels', options.initialLabels ?? true, (on) =>
+      this.labelsInput = this.checkbox('hud.labels', options.initialLabels ?? false, (on) =>
         onToggleLabels(on),
       );
     }

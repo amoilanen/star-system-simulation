@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
 import { DEATH_PHASES } from '../../src/sim/stages';
+import { SOLAR_RADIUS_AU } from '../../src/sim/astro';
 import {
   blackbodyColor,
   deathAppearance,
@@ -122,36 +123,49 @@ describe('starAppearance by stage', () => {
   });
 });
 
-describe('Solar-System scale (bug: arcade-sized star)', () => {
-  it('keeps a main-sequence star far smaller than the inner planetary orbits', () => {
-    // The Sun's radius is 0.00465 AU against Mercury at 0.39 AU. The star is
-    // exaggerated ~10× for visibility, but must stay tiny next to the innermost
-    // orbit (~1 AU) — it used to be drawn at 0.5 AU, i.e. half the way there.
+describe('True-scale star radii (spec §3.1)', () => {
+  it('uses the physical solar radius for a 1 M☉ main-sequence star', () => {
+    // mainSequenceRadius now returns SOLAR_RADIUS_AU · M^0.8 (true scale).
+    // For the Sun this is ≈ 0.00465 AU — visibility is maintained by the
+    // StarRenderer pixel-floor, not by inflating the physical radius.
     const r = mainSequenceRadius(1);
-    expect(r).toBeGreaterThan(0.02);
-    expect(r).toBeLessThan(0.06);
-    // Ordered by mass, and bounded for the extremes.
+    expect(r).toBeCloseTo(SOLAR_RADIUS_AU, 4);
+    expect(r).toBeGreaterThan(0.001); // above lower clamp
+    expect(r).toBeLessThan(0.05); // below upper clamp
+    // Ordered by mass (M^0.8 monotone) and bounded at the upper clamp.
     expect(mainSequenceRadius(20)).toBeGreaterThan(mainSequenceRadius(1));
     expect(mainSequenceRadius(0.1)).toBeLessThan(mainSequenceRadius(1));
-    expect(mainSequenceRadius(1000)).toBeLessThanOrEqual(0.4);
+    expect(mainSequenceRadius(1000)).toBeLessThanOrEqual(0.05);
   });
 
   it('swells the red giant to roughly the radius at which it engulfs planets', () => {
     // The kernel destroys planets inside REDGIANT_ENGULF_AU (2.2 AU for 1 M☉),
-    // so the visible photosphere must grow to a comparable size — otherwise
-    // planets would vanish while the star still looked small.
+    // so the visible photosphere must grow to a comparable size.
+    // With RED_GIANT_SWELL = 250: 0.00465 · 250 ≈ 1.16 AU < 2.2 AU ✓.
     const late = starAppearance(LifecycleStage.RedGiant, 1, 1);
     expect(late.radius).toBeGreaterThan(0.8);
     expect(late.radius).toBeLessThan(2.2);
-    // …and it is a huge multiple of the main-sequence size, as in reality.
-    expect(late.radius).toBeGreaterThan(mainSequenceRadius(1) * 20);
+    // …and it is a huge multiple of the true-scale main-sequence radius.
+    expect(late.radius).toBeGreaterThan(mainSequenceRadius(1) * 100);
   });
 
-  it('draws the compact remnant far smaller than the star it came from', () => {
+  it('draws compact remnants at true physical scale, smaller than the star', () => {
+    // White dwarf ≈ Earth-radius = 4.3e-5 AU; neutron star is smaller still.
     const dwarf = starAppearance(LifecycleStage.Remnant, 1, 1, RemnantType.WhiteDwarf);
     const neutron = starAppearance(LifecycleStage.Remnant, 20, 1, RemnantType.NeutronStar);
+    // Both smaller than the main-sequence star they came from.
     expect(dwarf.radius).toBeLessThan(mainSequenceRadius(1));
+    // NS kept at illustrative pixel-floor level, but still physically smaller
+    // than a white dwarf (real ratio: ~10 km vs ~6 400 km).
     expect(neutron.radius).toBeLessThan(dwarf.radius);
+  });
+
+  it('places the brown dwarf at roughly one Jupiter radius (5e-4 AU)', () => {
+    const bd = starAppearance(LifecycleStage.Remnant, 0.05, 1, RemnantType.BrownDwarf);
+    expect(bd.radius).toBeCloseTo(5e-4, 6);
+    // Larger than a white dwarf but smaller than a true star.
+    expect(bd.radius).toBeGreaterThan(WHITE_DWARF_RADIUS);
+    expect(bd.radius).toBeLessThan(mainSequenceRadius(0.1));
   });
 });
 
@@ -268,19 +282,24 @@ describe('the death sequence is staged, not a fade', () => {
     const radii = samples.map((a) => a.radius);
     const peakRadius = Math.max(...radii);
     const collapsed = deathAppearance(SN_MASS, DEATH_PHASES.shockBreakout * 0.98, true).radius;
-    const redGiant = starAppearance(LifecycleStage.RedGiant, SN_MASS, 1).radius;
 
-    // The fireball dwarfs the collapsed core and outgrows the red giant it came
-    // from — but stays a few AU across, because it is an OPAQUE sphere and a
-    // literal tens-of-AU photosphere would simply swallow the camera.
-    expect(peakRadius).toBeGreaterThan(collapsed * 10);
-    expect(peakRadius).toBeGreaterThan(redGiant * 2);
-    expect(peakRadius).toBeLessThan(15);
-    // The blast SHELL, which is transparent, is the part that sweeps the system.
+    // With true-scale msRadius the fireball (FIREBALL_SWELL × msRadius) is a
+    // few AU for a massive progenitor — it significantly exceeds the collapsed
+    // core and is bounded so it does not swallow the camera (opaque sphere).
+    expect(peakRadius).toBeGreaterThan(collapsed * 4);
+    expect(peakRadius).toBeLessThan(20);
+    // It must also outgrow the RED GIANT it came from, or the explosion would
+    // read as smaller than the star that produced it. With true scale the
+    // margin is thinner than before (FIREBALL_SWELL 350 vs RED_GIANT_SWELL 250
+    // ⇒ ≈1.4×), so this bound is what stops the fireball regressing below the
+    // progenitor — the visible sweep is carried by the blast shell below.
+    const redGiant = starAppearance(LifecycleStage.RedGiant, SN_MASS, 1).radius;
+    expect(peakRadius).toBeGreaterThan(redGiant);
+    // The blast SHELL, which is transparent, sweeps far beyond the fireball.
     const peakShell = Math.max(...samples.map((a) => a.shockwaveRadius));
     expect(peakShell).toBeGreaterThan(peakRadius * 8);
-    // …and the photosphere has receded again by the end, so handing over to the
-    // compact remnant is continuous rather than a jump.
+    // …and the photosphere has receded again by the end, handing over to the
+    // compact remnant without a discontinuous jump.
     expect(radii.at(-1)!).toBeLessThan(peakRadius * 0.02);
 
     // Monotonic cooling after the flash.

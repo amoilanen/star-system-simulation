@@ -1,8 +1,8 @@
 //! Softened Newtonian gravity primitives (spec §4.4, plan "nbody.rs").
 //!
-//! This module is the numeric core shared by the WASM kernel. It mirrors the
-//! pure-TypeScript fallback (`src/sim/TsFallbackKernel.ts`) so the two kernels
-//! are interchangeable behind the `PhysicsKernel` contract:
+//! This module is the numeric core of the WASM kernel, and the single source of
+//! truth for the model's constants and formulae — nothing outside this crate
+//! reimplements them:
 //!
 //!   * the illustrative production model is a **central-force** softened collapse
 //!     toward the forming core at the origin (`softened_accel`, `integrate_orbit`),
@@ -181,29 +181,57 @@ pub fn accretion_radius(body_mass: f64, cloud_mass: f64) -> f64 {
     0.4 + 1.2 * (body_mass.max(0.0) / reference).cbrt()
 }
 
+/// Earth masses per solar mass. Mirrors `EARTH_MASSES_PER_SOLAR` in the TS
+/// fallback and in `lib.rs`.
+const EARTH_MASSES_PER_SOLAR: f64 = 332_946.0;
+
+/// Earth radius in AU — rocky-planet normalisation point (spec §3.2).
+const R_EARTH_AU: f64 = 4.26e-5;
+
+/// Jupiter radius in AU — near-constant giant-regime limit (spec §3.2).
+const R_JUPITER_AU: f64 = 4.78e-4;
+
+/// ln(2 M⊕) — lower bound of the rocky-to-giant log-space transition.
+const LOG_ROCKY_THRESH: f64 = std::f64::consts::LN_2;
+
+/// ln(100 M⊕) — upper bound of the rocky-to-giant log-space transition.
+const LOG_GIANT_THRESH: f64 = 4.605_170_185_988_092_f64; // ln(100)
+
 /// Visual radius bounds for celestial bodies, in scene units (= AU). Mirrors
 /// the TS fallback's `MIN_BODY_RADIUS` / `MAX_BODY_RADIUS`.
 ///
-/// Solar-System proportions, not arcade ones: Jupiter's true radius is 0.00048
-/// AU against a 5.2 AU orbit, so a literal drawing would be sub-pixel. Bodies
-/// are exaggerated ~30×, but no further — the largest gas giant is still ~1/3 of
-/// the star's radius and ~1/300 of its orbit. Visibility when zoomed out is a
-/// RENDERER concern (a minimum apparent size), not a physical one.
-pub const MIN_BODY_RADIUS: f64 = 0.004;
-pub const MAX_BODY_RADIUS: f64 = 0.016;
+/// Bodies are drawn at TRUE physical scale (spec §3.2). Visibility when zoomed
+/// out is a RENDERER concern (a minimum apparent size in `screenScale.ts`),
+/// not a physical one.
+pub const MIN_BODY_RADIUS: f64 = 1e-5;
+pub const MAX_BODY_RADIUS: f64 = 8e-4;
 
 /// Visual radii of visiting comets/asteroids, in scene units (= AU).
-pub const COMET_RADIUS: f64 = 0.008;
-pub const ASTEROID_RADIUS: f64 = 0.006;
+pub const COMET_RADIUS: f64 = 1e-5;
+pub const ASTEROID_RADIUS: f64 = 8e-6;
 
-/// Visual radius (scene units) of a body from its accreted mass. Mirrors
-/// `bodyRadiusFromMass`.
+/// Visual radius (scene units) of a body from its accreted mass using a
+/// physical mass–radius relation (spec §3.2). Mirrors `bodyRadiusFromMass`.
+///
+/// - Rocky (< ~2 M⊕):  `4.26e-5 · (M/M⊕)^0.27`  (Earth = 4.26e-5 AU)
+/// - Giant (> ~100 M⊕): ≈ 4.78e-4 AU  (1 R♃, degenerate EOS)
+/// - Transition:         log-space blend between the two regimes.
+///
+/// `_cloud_mass` is retained for API compatibility but is NOT used; the
+/// relation is absolute (depends only on the body's own mass).
 #[must_use]
-pub fn body_radius_from_mass(body_mass: f64, cloud_mass: f64) -> f64 {
-    // Reference ≈ one Jupiter mass so Jupiter-class planets read as gas giants.
-    let reference = (cloud_mass * 1e-3).max(f64::EPSILON);
-    let r = 0.0035 + 0.011 * (body_mass.max(0.0) / reference).cbrt();
-    r.clamp(MIN_BODY_RADIUS, MAX_BODY_RADIUS)
+pub fn body_radius_from_mass(body_mass: f64, _cloud_mass: f64) -> f64 {
+    let m_e = body_mass.max(0.0) * EARTH_MASSES_PER_SOLAR;
+    let m_e_safe = m_e.max(1e-10);
+    // Rocky end: constant-density power law anchored to Earth.
+    let r_rocky = R_EARTH_AU * m_e_safe.powf(0.27);
+    // Log-space blend from rocky (2 M⊕) to giant (100 M⊕) regime.
+    let log_me = m_e_safe.ln();
+    let t = ((log_me - LOG_ROCKY_THRESH) / (LOG_GIANT_THRESH - LOG_ROCKY_THRESH))
+        .clamp(0.0, 1.0);
+    // Blend in log(R) space to avoid kinks at the transition boundaries.
+    let log_r = (1.0 - t) * r_rocky.ln() + t * R_JUPITER_AU.ln();
+    log_r.exp().clamp(MIN_BODY_RADIUS, MAX_BODY_RADIUS)
 }
 
 /// Radius at which two growing oligarchs COLLIDE and merge. Mirrors `mergeRadius`.
@@ -521,6 +549,261 @@ mod tests {
         assert!(near.contains(&0));
         assert!(near.contains(&1));
         assert!(!near.contains(&2), "far point must not be a neighbour");
+    }
+
+    // ---- accretion_efficiency (snow line) -----------------------------------
+
+    #[test]
+    fn accretion_efficiency_is_low_and_flat_inside_snow_line() {
+        // Rocky zone: same constant retention for any distance below the snow
+        // line; positive but tiny — planets in that zone grow slowly.
+        let a = accretion_efficiency(0.7);
+        let b = accretion_efficiency(2.0);
+        assert_eq!(
+            a, b,
+            "efficiency should be the same flat value anywhere inside the snow line"
+        );
+        assert!(a > 0.0, "rocky efficiency should be non-zero");
+        assert!(a < 0.001, "rocky efficiency should be tiny, got {a}");
+    }
+
+    #[test]
+    fn accretion_efficiency_jumps_sharply_beyond_snow_line() {
+        // The ice + gas-capture transition is the dominant feature of the disc
+        // model: immediately past the snow line, retention is >50× higher than
+        // in the rocky zone, seeding the giant-forming region.
+        let inside = accretion_efficiency(SNOW_LINE_AU - 0.1);
+        let outside = accretion_efficiency(SNOW_LINE_AU + 0.1);
+        assert!(
+            outside > inside * 50.0,
+            "giant-zone efficiency ({outside}) should be >50× rocky ({inside})"
+        );
+    }
+
+    #[test]
+    fn accretion_efficiency_rises_then_thins_beyond_snow_line() {
+        // Bug-guard: the curve must RISE past the snow line before falling off.
+        // A monotone-decreasing curve after the snow line would hand the biggest
+        // planet to the innermost seed — the very bug this exponent fixes.
+        assert!(
+            accretion_efficiency(10.0) > accretion_efficiency(3.0),
+            "efficiency should still be rising at 10 AU vs 3 AU"
+        );
+        assert!(
+            accretion_efficiency(30.0) < accretion_efficiency(10.0),
+            "efficiency should be falling at 30 AU vs 10 AU"
+        );
+    }
+
+    #[test]
+    fn accretion_efficiency_peaks_well_beyond_snow_line() {
+        // The giant-forming supply peak must lie well outside the snow line so
+        // that the biggest planets form in the outer disc (≈ Jupiter/Saturn).
+        let mut best = 0.0f64;
+        let mut best_au = 0.0f64;
+        let mut au = 0.5f64;
+        while au <= 60.0 {
+            let e = accretion_efficiency(au);
+            if e > best {
+                best = e;
+                best_au = au;
+            }
+            au += 0.1;
+        }
+        assert!(
+            best_au > SNOW_LINE_AU * 2.0,
+            "peak at {best_au} AU should be well outside 2× snow line ({:.1} AU)",
+            SNOW_LINE_AU * 2.0
+        );
+        assert!(best_au < 20.0, "peak at {best_au} AU should be < 20 AU");
+    }
+
+    #[test]
+    fn accretion_efficiency_never_exceeds_one() {
+        // Physical invariant: a planetesimal can retain at most 100 % of the
+        // swept mass — more would violate mass conservation.
+        let mut au = 0.1f64;
+        while au <= 200.0 {
+            let e = accretion_efficiency(au);
+            assert!(e <= 1.0, "efficiency {e} > 1.0 at {au} AU");
+            au += 0.5;
+        }
+    }
+
+    #[test]
+    fn accretion_efficiency_returns_zero_for_degenerate_distances() {
+        // Zero and negative distances are non-physical; returning 0 prevents
+        // them from polluting the accretion calculus with NaN or a rocky value.
+        assert_eq!(accretion_efficiency(0.0), 0.0);
+        assert_eq!(accretion_efficiency(-1.0), 0.0);
+    }
+
+    // ---- body_radius_from_mass ----------------------------------------------
+
+    #[test]
+    fn body_radius_grows_with_mass_and_stays_in_sane_range() {
+        // Masses spanning rocky → transition → giant zones (in solar masses).
+        // The radius must grow monotonically and remain within the clamped range.
+        let small = body_radius_from_mass(1e-4, 1.0); // ~33 M⊕ — transition zone
+        let big = body_radius_from_mass(8e-4, 1.0); // ~266 M⊕ — giant zone
+        assert!(big > small, "radius should grow with mass");
+        assert!(
+            small >= MIN_BODY_RADIUS,
+            "radius {small} should be >= MIN_BODY_RADIUS {MIN_BODY_RADIUS}"
+        );
+        assert!(
+            big <= MAX_BODY_RADIUS,
+            "radius {big} should be <= MAX_BODY_RADIUS {MAX_BODY_RADIUS}"
+        );
+    }
+
+    #[test]
+    fn body_radius_anchors_earth_and_jupiter() {
+        // Physical mass–radius anchors (spec §3.2). Earth within 20 %, Jupiter
+        // within 5 %, so the radii read as plausible at true scale.
+        let earth_mass_solar = 1.0_f64 / 332_946.0;
+        let jupiter_mass_solar = 317.8_f64 / 332_946.0;
+        let r_earth_au = 4.26e-5_f64;
+        let r_jupiter_au = 4.78e-4_f64;
+
+        let earth_r = body_radius_from_mass(earth_mass_solar, 1.0);
+        assert!(
+            earth_r > r_earth_au * 0.8,
+            "Earth radius {earth_r} too small (expected > {:.2e})",
+            r_earth_au * 0.8
+        );
+        assert!(
+            earth_r < r_earth_au * 1.2,
+            "Earth radius {earth_r} too large (expected < {:.2e})",
+            r_earth_au * 1.2
+        );
+
+        let jup_r = body_radius_from_mass(jupiter_mass_solar, 1.0);
+        assert!(
+            jup_r > r_jupiter_au * 0.95,
+            "Jupiter radius {jup_r} too small (expected > {:.2e})",
+            r_jupiter_au * 0.95
+        );
+        assert!(
+            jup_r < r_jupiter_au * 1.05,
+            "Jupiter radius {jup_r} too large (expected < {:.2e})",
+            r_jupiter_au * 1.05
+        );
+    }
+
+    #[test]
+    fn heaviest_body_clamps_to_max_body_radius_and_stays_below_sun() {
+        // The very heaviest synthetic body is clamped to MAX_BODY_RADIUS, and
+        // that cap must sit well below the solar radius (spec §3.2: bodies are
+        // visually tiny compared to the star).
+        let heaviest = body_radius_from_mass(1e6, 1.0);
+        assert!(
+            heaviest <= MAX_BODY_RADIUS,
+            "heaviest body radius {heaviest} must be <= MAX_BODY_RADIUS {MAX_BODY_RADIUS}"
+        );
+        // Solar radius at 1 M☉ ≈ 4.65e-3 AU (spec §3.2 anchor).
+        let solar_radius_au = 4.65e-3_f64;
+        assert!(
+            MAX_BODY_RADIUS < solar_radius_au,
+            "MAX_BODY_RADIUS {MAX_BODY_RADIUS} must be < solar radius {solar_radius_au}"
+        );
+        // Tighter sanity-bound: planet radius cap below 1e-3 AU (compile-time).
+        const { assert!(MAX_BODY_RADIUS < 1e-3) };
+    }
+
+    // ---- accretion_radius ---------------------------------------------------
+
+    #[test]
+    fn accretion_radius_grows_with_body_mass() {
+        // Oligarchic growth: a larger body commands a wider feeding zone, so
+        // accretion_radius must be strictly monotonic in body mass.
+        let small = accretion_radius(0.001, 1.0);
+        let big = accretion_radius(0.05, 1.0);
+        assert!(
+            big > small,
+            "feeding-zone radius should grow with body mass: small={small}, big={big}"
+        );
+    }
+
+    // ---- merge_radius -------------------------------------------------------
+
+    #[test]
+    fn merge_radius_exceeds_visual_radius_and_is_monotonic() {
+        // The dynamical (merging) radius is intentionally decoupled from the
+        // drawn (visual) radius: merging on the visual radius would make the
+        // emergent planet count depend on a cosmetic choice. Must be > 3× the
+        // visual radius so it represents a real dynamical feeding zone.
+        assert!(
+            merge_radius(1e-5, 1.0) > body_radius_from_mass(1e-5, 1.0) * 3.0,
+            "merge_radius should be > 3× body_radius for small mass"
+        );
+        assert!(
+            merge_radius(1e-3, 1.0) > body_radius_from_mass(1e-3, 1.0) * 3.0,
+            "merge_radius should be > 3× body_radius for large mass"
+        );
+        // Still monotonic: a heavier oligarch has a larger merge radius.
+        assert!(
+            merge_radius(1e-3, 1.0) > merge_radius(1e-6, 1.0),
+            "merge_radius should be monotonic in body mass"
+        );
+        // Compile-time: the visual radius bounds must be consistently ordered.
+        const { assert!(MIN_BODY_RADIUS < MAX_BODY_RADIUS) };
+    }
+
+    // ---- orbital_step -------------------------------------------------------
+
+    #[test]
+    fn orbital_step_is_zero_when_paused_or_invalid() {
+        // An integrator called with dt ≤ 0 or non-finite must not advance the
+        // orbital phase — the simulation is paused or given junk input.
+        assert_eq!(orbital_step(0.0), 0.0);
+        assert_eq!(orbital_step(-5.0), 0.0);
+        assert_eq!(orbital_step(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn orbital_step_increases_with_sim_time_and_saturates_at_cap() {
+        // A small sim-dt advances less phase than a large one, and extremely
+        // large values are clamped to ORBITAL_MAX to keep the integrator stable
+        // — an unbounded phase advance would skip over entire orbits.
+        let small = orbital_step(1.0e4);
+        let large = orbital_step(1.0e7);
+        assert!(large > small, "orbital step should increase with sim time");
+        assert!(large <= ORBITAL_MAX, "orbital step must not exceed ORBITAL_MAX");
+        assert!(
+            orbital_step(1.0e30) <= ORBITAL_MAX,
+            "astronomically large dt must be clamped to ORBITAL_MAX"
+        );
+        assert!(
+            (orbital_step(1.0e30) - ORBITAL_MAX).abs() < 1e-12,
+            "orbital step for huge dt should be exactly ORBITAL_MAX"
+        );
+    }
+
+    // ---- merged_velocity ----------------------------------------------------
+
+    #[test]
+    fn merged_velocity_conserves_momentum() {
+        // Perfectly inelastic collision: v_merged = (m1·v1 + m2·v2) / (m1+m2).
+        // p = 2·(+1) + 1·(−1) = 1; total mass = 3 → v = 1/3.
+        let v = merged_velocity(2.0, [1.0, 0.0, 0.0], 1.0, [-1.0, 0.0, 0.0]);
+        assert!(
+            (v[0] - 1.0 / 3.0).abs() < 1e-12,
+            "x component: expected 1/3, got {}",
+            v[0]
+        );
+        assert!(v[1].abs() < 1e-12, "y component: expected 0, got {}", v[1]);
+    }
+
+    #[test]
+    fn merged_velocity_equals_shared_velocity_when_both_move_alike() {
+        // When both bodies have the same velocity, the merged velocity must
+        // reproduce it exactly regardless of the mass ratio.
+        let shared = [0.5_f64, -0.2, 0.1];
+        let v = merged_velocity(3.0, shared, 5.0, shared);
+        assert!((v[0] - 0.5).abs() < 1e-12, "x: got {}", v[0]);
+        assert!((v[1] - (-0.2)).abs() < 1e-12, "y: got {}", v[1]);
+        assert!((v[2] - 0.1).abs() < 1e-12, "z: got {}", v[2]);
     }
 }
 

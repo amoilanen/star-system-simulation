@@ -1,16 +1,18 @@
 // Physics kernel boundary (spec §4.4, §4.5, Decisions D1/D2).
 //
-// This module defines the CONTRACT that both physics implementations satisfy:
-//   - `WasmKernel`      — the Rust→WASM numeric hot loop (added in a later step).
-//   - `TsFallbackKernel`— the pure-TypeScript fallback used when WASM is
-//                         unavailable (this step; see `./TsFallbackKernel.ts`).
+// This module defines the CONTRACT the physics implementation satisfies:
+//   - `WasmKernel` — the Rust→WASM numeric hot loop, the ONLY kernel. The
+//     simulation model lives entirely in `wasm/src/`; nothing on this side
+//     duplicates it. (A mirrored pure-TypeScript fallback used to exist for
+//     environments without WebAssembly; it was removed once WASM became
+//     universally available, because keeping the two hand-mirrored was a
+//     standing source of drift.)
 //
-// Per Decision D1 the two sides communicate over FLAT typed-array buffers so the
-// renderer can read simulation state each frame with no per-particle JS↔WASM
-// boundary calls. The interleaved layouts below are the single source of truth
-// for that memory format; the WASM kernel's linear-memory views must match these
-// strides and offsets exactly so the two kernels are interchangeable behind the
-// {@link PhysicsKernel} interface.
+// Per Decision D1 the kernel and the renderer communicate over FLAT typed-array
+// buffers so the renderer can read simulation state each frame with no
+// per-particle JS↔WASM boundary calls. The interleaved layouts below are the
+// single source of truth for that memory format; the WASM kernel's
+// linear-memory views must match these strides and offsets exactly.
 
 import type { SimulationConfig } from '../config/SimulationConfig';
 import type { LifecycleStage } from '../config/fateModel';
@@ -159,6 +161,13 @@ export interface PhysicsKernel {
   getParticleBuffer(): Float32Array;
   /** Flat interleaved body state; see {@link BODY_OFFSET}. */
   getBodyBuffer(): Float32Array;
+  /**
+   * The central gravitational parameter the kernel is integrating against, so
+   * the renderer can reconstruct exactly the Kepler conics the bodies are
+   * following (the orbit-path overlay). The kernel owns this value — the host
+   * must not recompute it from its own copy of the simulation constants.
+   */
+  orbitalMu(): number;
   /** Release resources / listeners. The kernel is unusable afterwards. */
   dispose(): void;
 }

@@ -86,6 +86,12 @@ export interface PlanetLook {
   axialTilt: number;
   /** Whether this world carries a ring system. */
   hasRings: boolean;
+  /**
+   * Ring visual prominence in [0, 1]. 1 = full-opacity Saturn-like ring; values
+   * < 1 yield a dimmer, translucent ring (ice-giant style). 0 means no ring
+   * (hasRings is always false when this is 0).
+   */
+  ringProminence: number;
   /** Number of drawn moons. */
   moonCount: number;
 }
@@ -106,6 +112,24 @@ export function planetLook(id: number, massSolar: number): PlanetLook {
   // entry are not pixel-identical.
   const shade = 0.85 + 0.3 * bodyHash(id, 2);
 
+  // Ring presence and visual prominence, by class (spec §3.3):
+  //   - Gas giant:  prominent rings on ~30 % of worlds (Saturn-like is the exception)
+  //   - Ice giant:  faint rings on ~25 % of worlds (Uranus/Neptune-style, low opacity)
+  //   - Rocky:      never — rocky worlds lack the mass / Roche radius to sustain rings
+  const ringRoll = bodyHash(id, 5);
+  let hasRings: boolean;
+  let ringProminence: number;
+  if (cls === PlanetClass.GasGiant) {
+    hasRings = ringRoll < 0.3;
+    ringProminence = hasRings ? 1.0 : 0;
+  } else if (cls === PlanetClass.IceGiant) {
+    hasRings = ringRoll < 0.25;
+    ringProminence = hasRings ? 0.3 : 0;
+  } else {
+    hasRings = false;
+    ringProminence = 0;
+  }
+
   return {
     planetClass: cls,
     color: {
@@ -115,8 +139,8 @@ export function planetLook(id: number, massSolar: number): PlanetLook {
     },
     // Most worlds are modestly tilted; a minority are dramatically so.
     axialTilt: (bodyHash(id, 3) < 0.8 ? 0.6 : 1.9) * (bodyHash(id, 4) - 0.5) * 2,
-    // Rings need a massive world to hold them and are commonest on gas giants.
-    hasRings: cls === PlanetClass.GasGiant ? bodyHash(id, 5) < 0.55 : bodyHash(id, 5) < 0.12,
+    hasRings,
+    ringProminence,
     moonCount: moonCountFor(cls, id),
   };
 }
@@ -134,7 +158,8 @@ function moonCountFor(cls: PlanetClass, id: number): number {
     case PlanetClass.IceGiant:
       return 2 + (roll < 0.6 ? 0 : 1);
     default:
-      return roll < 0.45 ? 0 : 1;
+      // Rocky worlds rarely host moons — ~30 % chance of one (spec §3.3).
+      return roll < 0.3 ? 1 : 0;
   }
 }
 
@@ -146,7 +171,12 @@ export interface MoonOrbit {
   tilt: number;
   /** Phase at t = 0, in radians. */
   phase: number;
-  /** Angular speed in radians per second of real time. */
+  /**
+   * Angular speed in radians per sim-second (spec §3.4). The body renderer
+   * advances moon positions by `angularSpeed × effectiveDt` where `effectiveDt`
+   * is the sim dt for this frame, clamped to a legibility range so moons freeze
+   * when paused and remain visible at all non-paused paces.
+   */
   angularSpeed: number;
   /** Moon radius, as a MULTIPLE of the planet's drawn radius. */
   sizeFactor: number;
@@ -165,9 +195,17 @@ export interface MoonOrbit {
  */
 export function moonOrbit(id: number, index: number): MoonOrbit {
   const jitter = bodyHash(id, 20 + index);
+  // Geometric orbit-radius family (spec §3.3):
+  //   r_k = 6 · 1.8^k · (0.9 + 0.2·jitter)
+  // This mirrors the Galilean spread (Io≈6 R♃ … Callisto≈26 R♃) and keeps every
+  // moon's orbit ring clearly outside the one below it.
+  //   k=0: ~6   drawn radii  (Io-like)
+  //   k=1: ~10.8 drawn radii  (Europa-like)
+  //   k=2: ~19.4 drawn radii  (Ganymede-like)
+  //   k=3: ~35   drawn radii  (Callisto-like)
+  const radiusFactor = 6 * Math.pow(1.8, index) * (0.9 + 0.2 * jitter);
   return {
-    // Well clear of the planet's disc, and spaced so the orbits never overlap.
-    radiusFactor: 3.4 + 2.1 * index + 0.6 * jitter,
+    radiusFactor,
     // A few degrees of inclination each, with the odd steeply-tilted capture.
     tilt: (bodyHash(id, 40 + index) - 0.5) * 0.9,
     phase: jitter * Math.PI * 2,
@@ -179,7 +217,7 @@ export function moonOrbit(id: number, index: number): MoonOrbit {
 
 /**
  * Position of a moon relative to its planet's centre, in DRAWN-radius units, at
- * the given elapsed time.
+ * the given accumulated sim-time elapsed (spec §3.4).
  *
  * The orbit is a unit circle in the x–z plane rotated about the local x-axis by
  * {@link MoonOrbit.tilt} — matching exactly what a Three.js `rotation.x = tilt`

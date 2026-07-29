@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { SimulationRunner, DEFAULT_PARTICLE_COUNT } from '../../src/app/SimulationRunner';
-import { TsFallbackKernel } from '../../src/sim/TsFallbackKernel';
+import { loadWasmModule, WasmKernel } from '../../src/sim/WasmKernel';
 import { Clock } from '../../src/sim/Clock';
 import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
 import { SimEventType, type SimulationEvent } from '../../src/sim/events';
@@ -40,6 +42,24 @@ const LIFECYCLE_TICKS = 900;
 /** Small particle count: these tests assert wiring, not planet demographics. */
 const WIRING_PARTICLES = 300;
 
+// These tests drive a REAL lifecycle through the runner, so they need the real
+// kernel — the Rust/WASM one is now the only implementation. It is loaded once
+// from the built artifact; if `npm run wasm:build` has not been run the suite
+// skips, the same convention the other kernel-backed suites use.
+const wasmBinUrl = new URL('../../wasm/pkg/star_kernel_bg.wasm', import.meta.url);
+const wasmBuilt = existsSync(fileURLToPath(wasmBinUrl));
+const wasmModule = wasmBuilt
+  ? await loadWasmModule({
+      module_or_path: new Uint8Array(readFileSync(fileURLToPath(wasmBinUrl))),
+    })
+  : null;
+const describeKernel = wasmBuilt ? describe : describe.skip;
+
+/** A fresh kernel for one test. */
+function makeKernel(): WasmKernel {
+  return new WasmKernel(wasmModule!);
+}
+
 /** Drive `ticks` frames of 1 real second each, collecting events and stages. */
 function drive(
   runner: SimulationRunner,
@@ -55,9 +75,9 @@ function drive(
   return { events, stages };
 }
 
-describe('SimulationRunner (headless orchestration)', () => {
+describeKernel('SimulationRunner (headless orchestration)', () => {
   it('advances the full birth→death lifecycle, wiring events end-to-end', () => {
-    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
       particleCount: WIRING_PARTICLES,
     });
 
@@ -92,7 +112,7 @@ describe('SimulationRunner (headless orchestration)', () => {
   });
 
   it('exposes a coherent RenderState snapshot each tick', () => {
-    const runner = new SimulationRunner(makeConfig({ mass: 2 }), new TsFallbackKernel());
+    const runner = new SimulationRunner(makeConfig({ mass: 2 }), makeKernel());
     const { state } = runner.tick(1);
 
     // `mass` is the STAR's mass, which is still assembling out of the 2 M☉ cloud
@@ -102,7 +122,11 @@ describe('SimulationRunner (headless orchestration)', () => {
     expect(state.mass).toBeLessThan(stellarMassFromCloud(2, 0.02));
     expect(state.particleCount).toBe(state.particles.length / PARTICLE_STRIDE);
     expect(state.particleCount).toBeGreaterThan(0);
-    expect(state.bodyCount).toBeGreaterThan(0);
+    // §3.8: bodies (protoplanets) are deferred to ProtostarCoalescence. After a
+    // single tick during DustCloud, no protoplanets exist yet, and visitors don't
+    // spawn in one tick (simDt << VISITOR_SPAWN_INTERVAL). bodyCount is a valid
+    // non-negative integer — asserting > 0 would be incorrect here.
+    expect(state.bodyCount).toBeGreaterThanOrEqual(0);
     expect(state.stageProgress).toBeGreaterThanOrEqual(0);
     expect(state.stageProgress).toBeLessThanOrEqual(1);
     // Remnant is only surfaced once the terminal stage is reached.
@@ -113,7 +137,7 @@ describe('SimulationRunner (headless orchestration)', () => {
     // A cloud massive enough to assemble a ~14 M☉ star ⇒ supernova ⇒ pulsar
     // (fateModel is the single source of truth).
     const pulsarCloud = cloudMassForStar(14, 0.02);
-    const runner = new SimulationRunner(makeConfig({ mass: pulsarCloud }), new TsFallbackKernel(), {
+    const runner = new SimulationRunner(makeConfig({ mass: pulsarCloud }), makeKernel(), {
       particleCount: WIRING_PARTICLES,
     });
     let last = runner.tick(1);
@@ -125,7 +149,7 @@ describe('SimulationRunner (headless orchestration)', () => {
   });
 
   it('freezes progression while paused (A6) and resumes afterwards', () => {
-    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
       particleCount: WIRING_PARTICLES,
     });
     runner.tick(1); // leave the initial idle frame behind
@@ -145,7 +169,7 @@ describe('SimulationRunner (headless orchestration)', () => {
 
   it('reset returns to the dust-cloud stage and rewinds the clock', () => {
     const clock = new Clock({ pace: 1 });
-    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
       clock,
       particleCount: WIRING_PARTICLES,
     });
@@ -159,7 +183,7 @@ describe('SimulationRunner (headless orchestration)', () => {
   });
 
   it('rewinds to a previous state, then replays forward and resumes live', () => {
-    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
       particleCount: WIRING_PARTICLES,
     });
 
@@ -204,7 +228,7 @@ describe('SimulationRunner (headless orchestration)', () => {
   });
 
   it('requests the default particle count from the kernel', () => {
-    const runner = new SimulationRunner(makeConfig(), new TsFallbackKernel(), {
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
       particleCount: WIRING_PARTICLES,
     });
     const { state } = runner.tick(0);
@@ -212,5 +236,44 @@ describe('SimulationRunner (headless orchestration)', () => {
     // request the documented default, and the effective count is non-zero.
     expect(DEFAULT_PARTICLE_COUNT).toBeGreaterThan(0);
     expect(state.particleCount).toBeGreaterThan(0);
+  });
+
+  it('sets state.simDt > 0 for live ticks when not paused (spec §3.4)', () => {
+    // simDt drives moon orbital motion and axial spin in the body renderer;
+    // it must be positive while the simulation is running so moons animate.
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
+    const { state } = runner.tick(1);
+    expect(state.simDt).toBeDefined();
+    expect(state.simDt).toBeGreaterThan(0);
+  });
+
+  it('sets state.simDt = 0 when the simulation is paused (spec §3.4)', () => {
+    // A paused simulation must yield simDt = 0 so moons freeze.
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
+    runner.togglePause(); // pause
+    const { state } = runner.tick(1);
+    // Clock.advance() returns 0 while paused; the runner forwards it as simDt.
+    expect(state.simDt).toBe(0);
+  });
+
+  it('leaves state.simDt absent (undefined) on history-replay frames (spec §3.4)', () => {
+    // History snapshots are recorded without simDt (it's a per-frame delta, not
+    // a snapshot). Replay frames should expose undefined so the renderer treats
+    // them as simDt=0 and keeps moons frozen while scrubbing.
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
+    for (let i = 0; i < 50; i += 1) {
+      runner.tick(1);
+    }
+    runner.setRewinding(true);
+    const rewound = runner.tick(1);
+    expect(rewound.fromHistory).toBe(true);
+    // simDt not set in cloned history states → undefined.
+    expect(rewound.state.simDt).toBeUndefined();
   });
 });

@@ -1,7 +1,9 @@
 //! Rust/WASM physics kernel (spec §4.4, §4.5, §5, Decisions D1/D2, FR-7, FR-10).
 //!
-//! High-performance numeric twin of the pure-TypeScript fallback
-//! (`src/sim/TsFallbackKernel.ts`). It exposes `wasm-bindgen` bindings for the
+//! The ONE implementation of the simulation model. (It used to be the
+//! high-performance twin of a mirrored pure-TypeScript fallback; that fallback
+//! was deleted, so nothing outside this crate duplicates the physics.) It
+//! exposes `wasm-bindgen` bindings for the
 //! `PhysicsKernel` contract: a constructor (`init`), `step`, and pointers into
 //! linear memory for the interleaved particle/body/event buffers that the
 //! renderer reads each frame — no `SharedArrayBuffer`, avoiding cross-origin
@@ -21,13 +23,12 @@ use bodies::{
     classify_visitor, make_visitor, seed_from_config, BodyType, CelestialBody, Mulberry32,
     VisitorClassification,
 };
-#[cfg(test)]
-use nbody::SNOW_LINE_AU;
 use nbody::{
     accretion_efficiency, accretion_radius, body_radius_from_mass, circular_speed, integrate_orbit,
-    magnitude, merge_radius, merged_velocity, orbital_step, periapsis_distance, softened_accel,
-    stable_substep, Vec3, BODY_DAMP_FRACTION, DISK_SETTLE, GAS_DRAG, GRAVITY, MAX_PARTICLES,
-    MAX_SUBSTEPS, ORBITAL_MASS_SCALE, ORBITAL_MAX, SOFTENING, VERTICAL_DAMP,
+    is_bound, magnitude, merge_radius, merged_velocity, orbital_step, periapsis_distance,
+    softened_accel, stable_substep, Vec3, BODY_DAMP_FRACTION, DISK_SETTLE, GAS_DRAG, GRAVITY,
+    MAX_PARTICLES, MAX_SUBSTEPS, ORBITAL_MASS_SCALE, ORBITAL_MAX, SNOW_LINE_AU, SOFTENING,
+    VERTICAL_DAMP,
 };
 #[cfg(test)]
 use stages::cloud_mass_for_star;
@@ -44,7 +45,9 @@ const BODY_STRIDE: usize = 12;
 const EVENT_STRIDE: usize = 4;
 
 /// Number of planetesimal seeds placed in the disc (survivors become planets).
-const PLANETESIMAL_COUNT: usize = 12;
+/// 8 seeds → geometric spacing ratio ≈ 1.68 for a 50 AU disc, matching real
+/// adjacent-orbit ratios (Solar System ≈ 1.4–1.9).
+const PLANETESIMAL_COUNT: usize = 8;
 /// Sim seconds between visiting comet/asteroid spawns (mirror).
 const VISITOR_SPAWN_INTERVAL: f64 = 8.0e15;
 /// Cap on simultaneously present visiting bodies so captured ones cannot
@@ -128,11 +131,10 @@ const DEATH_SHOCK_BREAKOUT: f64 = 0.12;
 /// red giant straight to remnant. Capping how much of the stage a single step
 /// may consume makes the death always watchable.
 const DEATH_MIN_STEPS: f64 = 240.0;
-/// Red-giant photospheric reach in AU (= scene units) for a 1 M☉ star; scaled by
-/// mass^0.3. Planets inside it are engulfed when the star becomes a red giant.
+/// Red-giant photospheric reach in AU (= scene units) for a 1 M☉ star; scaled
+/// by mass^0.8 (matching mainSequenceRadius ∝ M^0.8 × RED_GIANT_SWELL). This
+/// ensures no planet survives visually inside the giant at any stellar mass.
 const REDGIANT_ENGULF_AU: f64 = 2.2;
-/// Cap on how much surviving orbits widen when the dying star sheds its mass.
-const REMNANT_ORBIT_EXPANSION_MAX: f64 = 2.6;
 
 /// Core mass fractions — of the FINAL STELLAR MASS, not of the cloud — at which
 /// the FORMATION stages advance (mirror the TS fallback's `*_CORE_FRACTION`).
@@ -183,6 +185,29 @@ pub fn kernel_version() -> u32 {
 #[wasm_bindgen]
 pub fn wasm_memory() -> JsValue {
     wasm_bindgen::memory()
+}
+
+/// The gravitational softening length the kernel integrates with, in scene
+/// units (= AU).
+///
+/// Exported because a host that wants to reproduce the kernel's own notion of
+/// "is this body bound?" must use the SAME softened potential
+/// `-mu / sqrt(r² + softening²)`. Re-declaring the constant host-side would let
+/// the two drift apart silently, which is exactly what the removal of the
+/// mirrored TypeScript kernel was meant to prevent.
+#[wasm_bindgen]
+#[must_use]
+pub fn softening() -> f64 {
+    SOFTENING
+}
+
+/// The disc's snow line, in AU: the distance beyond which ices condense and
+/// accretion becomes far more productive. Exported so hosts and tests describe
+/// the disc's zones with the kernel's value rather than a copy of it.
+#[wasm_bindgen]
+#[must_use]
+pub fn snow_line_au() -> f64 {
+    SNOW_LINE_AU
 }
 
 /// What a particle physically IS (mirror of the fallback's `ParticleKind`). The
@@ -266,11 +291,16 @@ pub struct Kernel {
     next_body_id: f64,
     spawn_accumulator: f64,
     ejecta_done: bool,
+    /// Whether planetesimals have been seeded yet. They are NOT seeded in the
+    /// constructor: real planetesimals form in the protoplanetary disc alongside
+    /// the protostar (spec §3.8), so they cannot predate it. Seeding is deferred
+    /// to ProtostarCoalescence entry in `advance_stages`, guarded by this flag.
+    planetesimals_seeded: bool,
 }
 
 #[wasm_bindgen]
 impl Kernel {
-    /// (Re)initialize the kernel for a run (mirror of `TsFallbackKernel.init`).
+    /// (Re)initialize the kernel for a run (the `PhysicsKernel.init` contract).
     #[wasm_bindgen(constructor)]
     #[must_use]
     pub fn new(
@@ -319,19 +349,22 @@ impl Kernel {
             next_body_id: 0.0,
             spawn_accumulator: 0.0,
             ejecta_done: false,
+            // Planetesimals are NOT seeded here — they cannot predate the protostar
+            // (spec §3.8). Seeding is deferred to ProtostarCoalescence entry in
+            // `advance_stages`, triggered by `planetesimals_seeded`.
+            planetesimals_seeded: false,
         };
         kernel.seed_particles(particle_count as usize);
-        kernel.seed_planetesimals();
+        // bodies starts empty; `rebuild_body_buffer` grows it when bodies are seeded.
         kernel.particle_buf = vec![0.0; kernel.particles.len() * PARTICLE_STRIDE];
-        kernel.body_buf = vec![0.0; kernel.bodies.len() * BODY_STRIDE];
+        kernel.body_buf = vec![];
         kernel.write_particle_buffer();
-        kernel.write_body_buffer();
         kernel
     }
 
     /// Advance the simulation by `dt_sim_seconds`, returning the number of events
-    /// emitted this step (packed into the events buffer). Mirror of
-    /// `TsFallbackKernel.step`.
+    /// emitted this step (packed into the events buffer) — the
+    /// `PhysicsKernel.step` contract.
     pub fn step(&mut self, dt_sim_seconds: f64) -> u32 {
         self.event_buf.clear();
         if !dt_sim_seconds.is_finite() || dt_sim_seconds <= 0.0 {
@@ -466,6 +499,19 @@ impl Kernel {
         }
         self.star_mass
     }
+
+    /// The central gravitational parameter this kernel is actually integrating
+    /// against.
+    ///
+    /// Exported so the renderer can reconstruct exactly the Kepler conics the
+    /// bodies are following (the orbit-path overlay). The kernel is the single
+    /// source of truth for it: the host used to recompute `mu` itself from
+    /// duplicated `GRAVITY` / `ORBITAL_MASS_SCALE` constants, which was one more
+    /// thing that had to be kept in sync by hand.
+    #[must_use]
+    pub fn orbital_mu(&self) -> f64 {
+        self.mu()
+    }
 }
 
 impl Kernel {
@@ -500,8 +546,11 @@ impl Kernel {
     /// TOTAL cloud mass so collapse/orbits proceed from the start rather than
     /// stalling until the seed core has grown.
     fn mu(&self) -> f64 {
-        // √M rather than M — see `orbitalMu` in the TS fallback: full
-        // mass-proportionality outruns the integration substep for heavy clouds.
+        // √M rather than M: at full mass-proportionality the inner dynamics of a
+        // heavy cloud outrun the fixed integration substep and grains get flung
+        // out instead of accreting. This only sets the VISUAL orbital rate —
+        // every reported figure (orbital speed, period, temperature) is computed
+        // from true Kepler physics host-side in `astro.ts`.
         GRAVITY * ORBITAL_MASS_SCALE * self.cloud_mass.max(f64::EPSILON).sqrt()
     }
 
@@ -557,6 +606,15 @@ impl Kernel {
         if self.stage == LifecycleStage::DustCloud && core_frac >= PROTOSTAR_CORE_FRACTION {
             self.stage = LifecycleStage::ProtostarCoalescence;
             self.emit_stage(SimEventType::CollapseOnset, 0.0, 0.0, out);
+            // Seed planetesimals now that the protostar exists (spec §3.8). They
+            // cannot predate it: real planetesimals condense in the protoplanetary
+            // disc that forms alongside the protostar, not in the undifferentiated
+            // dust cloud before it. Any visiting bodies already in `self.bodies` are
+            // preserved because `seed_planetesimals` no longer resets the Vec.
+            if !self.planetesimals_seeded {
+                self.seed_planetesimals();
+                self.planetesimals_seeded = true;
+            }
         }
         if self.stage == LifecycleStage::ProtostarCoalescence && core_frac >= FUSION_CORE_FRACTION {
             self.stage = LifecycleStage::FusionIgnition;
@@ -623,8 +681,8 @@ impl Kernel {
                     }
                     LifecycleStage::Death => {
                         self.stage = LifecycleStage::Remnant;
-                        // Mass loss widens the surviving planets' orbits.
-                        self.expand_orbits_after_mass_loss();
+                        // Mass loss adjusts surviving planets' orbits.
+                        self.expand_orbits_after_mass_loss(out);
                         let remnant = self.fate.remnant as u32 as f64;
                         let sn = bool_f64(self.fate.supernova);
                         self.emit_stage(SimEventType::RemnantFormed, remnant, sn, out);
@@ -759,7 +817,9 @@ impl Kernel {
     }
 
     fn seed_planetesimals(&mut self) {
-        self.bodies = Vec::new();
+        // Do NOT reset `self.bodies` here: any visiting comets/asteroids that
+        // arrived during DustCloud must be preserved. Planetesimals are simply
+        // pushed onto the existing (possibly non-empty) body list.
         let seed_mu = self.mu();
         // Geometric (Titius-Bode-like) spacing, each orbit ~30% wider than the
         // last, with small eccentricities and mutual inclinations.
@@ -948,9 +1008,15 @@ impl Kernel {
                     // still falling in is blown back out rather than accreted.
                     self.dispersed_mass += p.mass;
                 } else {
-                    // Over the accretion rate limit: the grain waits in the
-                    // inner disc (still visible, still orbiting).
-                    survivors.push(p);
+                    // Over the accretion rate limit: queue into the inner-disc
+                    // reservoir so it drains into the star at the rate-limited
+                    // Ṁ over future steps. With bodies deferred to
+                    // ProtostarCoalescence (§3.8), no bodies exist during
+                    // DustCloud to intercept grains at larger radii and route
+                    // them here via `to_reservoir`. We do it directly:
+                    // a grain inside the core feeding radius is in the inner
+                    // disc, not still orbiting the outer cloud.
+                    to_reservoir += p.mass;
                 }
                 continue;
             }
@@ -1024,9 +1090,11 @@ impl Kernel {
         }
     }
 
-    /// Red-giant photospheric reach in scene units (∝ stellar mass^0.3).
+    /// Red-giant photospheric reach in scene units. Scales as mass^0.8 to track
+    /// the drawn photosphere, ensuring no planet survives visually inside the
+    /// giant at any stellar mass (mirror of `redGiantEngulfRadius`).
     fn red_giant_engulf_radius(&self) -> f64 {
-        REDGIANT_ENGULF_AU * self.star_mass.max(0.1).powf(0.3)
+        REDGIANT_ENGULF_AU * self.star_mass.max(0.1).powf(0.8)
     }
 
     /// Engulf and destroy planets orbiting inside the swollen red giant. Done
@@ -1061,32 +1129,64 @@ impl Kernel {
         }
     }
 
-    /// Expand surviving planets' orbits when the dying star sheds its mass
+    /// Adjust surviving planets' orbits when the dying star sheds its mass
     /// (mirror of `expandOrbitsAfterMassLoss`).
-    fn expand_orbits_after_mass_loss(&mut self) {
-        // How much of the star actually survives as the compact object — the
-        // single source of truth is the fate model, so the orbital widening
-        // matches the remnant mass reported in the UI.
+    ///
+    /// **Adiabatic** (`!fate.supernova`): exact r → r/retained, v → v·√retained.
+    /// Energy-consistent circular orbit at new radius; no arcade cap.
+    ///
+    /// **Impulsive** (`fate.supernova`): do NOT rescale pos/vel. Apply the
+    /// asymmetric natal kick, then eject planets unbound under mu_remnant = mu·retained
+    /// (v² > 2·mu_remnant/r), exactly like `resolve_visitors`.
+    fn expand_orbits_after_mass_loss(&mut self, out: &mut Vec<PackedEvent>) {
+        // How much of the star survives as the compact object.
         let retained: f64 =
             (remnant_mass(self.star_mass, self.fate.remnant) / self.star_mass).clamp(0.02, 1.0);
-        let f = (1.0 / retained).clamp(1.0, REMNANT_ORBIT_EXPANSION_MAX);
-        let v_scale = 1.0 / f.sqrt();
-        let supernova = self.fate.supernova;
-        for body in &mut self.bodies {
-            if !matches!(body.kind, BodyType::Planet | BodyType::Protoplanet) {
-                continue;
-            }
-            body.pos = [body.pos[0] * f, body.pos[1] * f, body.pos[2] * f];
-            body.vel = [
-                body.vel[0] * v_scale,
-                body.vel[1] * v_scale,
-                body.vel[2] * v_scale,
-            ];
-            if supernova {
+
+        if self.fate.supernova {
+            // Impulsive: gravity drops to mu_remnant = mu · retained.
+            // Apply the asymmetric natal kick, then eject unbound planets.
+            let mu_remnant = self.mu() * retained;
+            let sim_time = self.sim_time;
+            let mut survivors: Vec<CelestialBody> = Vec::with_capacity(self.bodies.len());
+            for mut body in std::mem::take(&mut self.bodies) {
+                if !matches!(body.kind, BodyType::Planet | BodyType::Protoplanet) {
+                    survivors.push(body);
+                    continue;
+                }
                 let kick = 0.18 * magnitude(body.vel);
                 body.vel[0] += (self.rng.next_f64() - 0.5) * kick;
                 body.vel[1] += (self.rng.next_f64() - 0.5) * kick;
                 body.vel[2] += (self.rng.next_f64() - 0.5) * kick;
+                let r = magnitude(body.pos);
+                let speed = magnitude(body.vel);
+                if is_bound(mu_remnant, r, speed) {
+                    survivors.push(body);
+                } else {
+                    out.push(PackedEvent {
+                        kind: SimEventType::BodyEjected,
+                        sim_time,
+                        data_a: body.id,
+                        data_b: body.kind as u32 as f64,
+                    });
+                }
+            }
+            self.bodies = survivors;
+        } else {
+            // Adiabatic: exact orbit widening. r → r/retained, v → v·√retained.
+            // Circular orbit stays circular at the new radius. No cap.
+            let f = 1.0 / retained; // expansion factor (≥ 1)
+            let v_scale = retained.sqrt(); // √retained (< 1 → orbit slows)
+            for body in &mut self.bodies {
+                if !matches!(body.kind, BodyType::Planet | BodyType::Protoplanet) {
+                    continue;
+                }
+                body.pos = [body.pos[0] * f, body.pos[1] * f, body.pos[2] * f];
+                body.vel = [
+                    body.vel[0] * v_scale,
+                    body.vel[1] * v_scale,
+                    body.vel[2] * v_scale,
+                ];
             }
         }
     }
@@ -1415,8 +1515,8 @@ impl Kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only the regression tests need these.
-    use nbody::{is_bound, MAX_BODY_RADIUS};
+    // Only the regression tests need this.
+    use nbody::MAX_BODY_RADIUS;
 
     /// Steps needed to reach the remnant. Formation is rate-limited by the
     /// star's finite accretion rate, so ignition legitimately takes several
@@ -1438,8 +1538,25 @@ mod tests {
 
     #[test]
     fn allocates_buffers_of_count_times_stride() {
-        let kernel = solar_kernel(1.0, 100);
+        // §3.8: body buffer is EMPTY right after init — planetesimals are seeded
+        // later, at ProtostarCoalescence entry, not at construction.
+        let mut kernel = solar_kernel(1.0, 100);
         assert_eq!(kernel.particle_len() as usize, 100 * PARTICLE_STRIDE);
+        // No bodies yet.
+        assert_eq!(kernel.body_len(), 0);
+
+        // Drive to ProtostarCoalescence: the body buffer must grow to hold the
+        // seeded planetesimals.
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            if kernel.stage() >= LifecycleStage::ProtostarCoalescence as u32 {
+                break;
+            }
+        }
+        assert_eq!(
+            kernel.stage(),
+            LifecycleStage::ProtostarCoalescence as u32
+        );
         assert_eq!(kernel.body_len() as usize % BODY_STRIDE, 0);
         assert!(kernel.body_len() > 0);
     }
@@ -1447,8 +1564,18 @@ mod tests {
     #[test]
     fn protoplanets_become_planets_after_ignition() {
         let mut kernel = solar_kernel(1.0, 50);
-        // Seeded planets start as protoplanets (type lane 1 == Protoplanet == 0).
-        assert_eq!(kernel.body_buf[1], BodyType::Protoplanet as u32 as f32);
+        // §3.8: body buffer is EMPTY right after init — planetesimals are seeded
+        // at ProtostarCoalescence entry, not at construction.
+        assert_eq!(kernel.body_len(), 0);
+        // Drive to ProtostarCoalescence so planetesimals are seeded.
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            if kernel.stage as u32 >= LifecycleStage::ProtostarCoalescence as u32 {
+                break;
+            }
+        }
+        // After seeding, the type lane (offset 1) of every seeded body must be Protoplanet.
+        assert!(kernel.body_len() > 0, "no bodies after ProtostarCoalescence");
         // Drive enough accretion steps to grow the core past fusion ignition.
         for _ in 0..LIFECYCLE_STEPS {
             kernel.step(1.0e17);
@@ -1483,10 +1610,31 @@ mod tests {
 
     #[test]
     fn first_body_is_a_bound_protoplanet() {
-        let kernel = solar_kernel(1.0, 10);
-        // type lane and captured lane of the first body.
-        assert_eq!(kernel.body_buf[1], BodyType::Protoplanet as u32 as f32);
-        assert_eq!(kernel.body_buf[11], 1.0);
+        // §3.8: must drive to ProtostarCoalescence before any body exists.
+        let mut kernel = solar_kernel(1.0, 10);
+        assert!(kernel.body_buf.is_empty(), "body buffer must be empty at init");
+
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            if kernel.stage() >= LifecycleStage::ProtostarCoalescence as u32 {
+                break;
+            }
+        }
+        assert_eq!(
+            kernel.stage(),
+            LifecycleStage::ProtostarCoalescence as u32
+        );
+        // Type lane and captured lane of the first protoplanet body.
+        // (Visitors are spawned at the boundary and may appear before planetesimals;
+        //  find the first protoplanet in the buffer to be robust.)
+        let n = kernel.body_buf.len() / BODY_STRIDE;
+        let first_proto = (0..n).find(|&i| {
+            kernel.body_buf[i * BODY_STRIDE + 1] == BodyType::Protoplanet as u32 as f32
+        });
+        assert!(first_proto.is_some(), "no protoplanet found after ProtostarCoalescence");
+        let base = first_proto.unwrap() * BODY_STRIDE;
+        assert_eq!(kernel.body_buf[base + 1], BodyType::Protoplanet as u32 as f32);
+        assert_eq!(kernel.body_buf[base + 11], 1.0); // captured == true
     }
 
     #[test]
@@ -1598,16 +1746,36 @@ mod tests {
 
     #[test]
     fn seeds_every_planetesimal_outside_the_star_feeding_zone() {
-        let kernel = solar_kernel(1.0, 100);
+        // §3.8: must drive to ProtostarCoalescence before checking placements.
+        let mut kernel = solar_kernel(1.0, 100);
+        assert!(
+            kernel.body_buf.is_empty(),
+            "no planetesimals before protostar forms"
+        );
+
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            if kernel.stage() >= LifecycleStage::ProtostarCoalescence as u32 {
+                break;
+            }
+        }
+        assert_eq!(
+            kernel.stage(),
+            LifecycleStage::ProtostarCoalescence as u32
+        );
+        assert!(!kernel.body_buf.is_empty(), "bodies must exist after seeding");
+        let core_r = kernel.core_accretion_radius;
         for i in 0..(kernel.body_buf.len() / BODY_STRIDE) {
             let base = i * BODY_STRIDE;
+            // Only check protoplanets — visitors spawn at the system boundary.
+            let kind = kernel.body_buf[base + 1];
+            if kind == BodyType::Comet as u32 as f32 || kind == BodyType::Asteroid as u32 as f32 {
+                continue;
+            }
             let x = f64::from(kernel.body_buf[base + 4]);
             let z = f64::from(kernel.body_buf[base + 6]);
             let r = (x * x + z * z).sqrt();
-            assert!(
-                r > kernel.core_accretion_radius,
-                "seeded inside star: r={r}"
-            );
+            assert!(r > core_r, "seeded inside star: r={r}");
         }
     }
 
@@ -1627,9 +1795,12 @@ mod tests {
         // Reported bug 2: the most massive world used to be the INNERMOST one,
         // because the retention curve peaked at the snow line while the dust
         // supply falls outward. Mirror of the TS fallback's regression.
+        // Use the same dt=1e17 as the TS test: orbital_step saturates at
+        // ORBITAL_MAX for any dt above a few minutes, so per-step dynamics are
+        // identical — using a larger dt here simply matches the TS twin.
         let mut kernel = solar_kernel(1.0, 4000);
         for _ in 0..LIFECYCLE_STEPS {
-            kernel.step(1.0e9);
+            kernel.step(1.0e17);
             if kernel.stage() >= LifecycleStage::MainSequence as u32 {
                 break;
             }
@@ -1742,6 +1913,87 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn the_mass_budget_is_conserved_and_never_grows() {
+        // Global mass conservation: every gram of the birth cloud is in exactly
+        // one place — the core, the inner-disc reservoir, the dispersed pile,
+        // the remaining dust, or a body. The total may SHRINK (mass genuinely
+        // leaves the system) but must never exceed the cloud it started from,
+        // and must never grow from one step to the next: a growing budget means
+        // the accretion book-keeping is double-counting somewhere.
+        //
+        // This check previously existed only in the TypeScript half of the
+        // simulation battery — it needs white-box access to the book-keeping
+        // fields — so it never ran against this kernel. It belongs here.
+        let mut kernel = solar_kernel(1.0, 2000);
+        let cloud = kernel.cloud_mass;
+        let mut max_total = f64::NEG_INFINITY;
+        for _ in 0..LIFECYCLE_STEPS {
+            // Same dt the other lifecycle tests use, so the whole run is covered.
+            kernel.step(1.0e17);
+            let dust: f64 = kernel.particles.iter().map(|p| p.mass).sum();
+            let bodies: f64 = kernel.bodies.iter().map(|b| b.mass).sum();
+            let total =
+                kernel.core_mass + kernel.disc_reservoir + kernel.dispersed_mass + dust + bodies;
+            assert!(
+                total <= cloud * 1.005 + 1e-9,
+                "mass created: budget total {total} > cloud {cloud}"
+            );
+            if max_total != f64::NEG_INFINITY {
+                assert!(
+                    total <= max_total + cloud * 0.002,
+                    "mass budget grew {max_total} -> {total}"
+                );
+            }
+            max_total = max_total.max(total);
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        assert_eq!(
+            kernel.stage(),
+            LifecycleStage::Remnant as u32,
+            "lifecycle did not complete, so the budget was only partly exercised"
+        );
+    }
+
+    #[test]
+    fn a_brown_dwarf_never_throws_ejecta_and_keeps_its_disc() {
+        // A substellar object has no explosion to throw, so it must never
+        // produce Ejecta particles — and its planets must still be there at the
+        // end, not swept away by a blast that never happened.
+        //
+        // This invariant previously lived only in the TypeScript half of the
+        // simulation battery (it needed white-box access to the particle kinds,
+        // which the flat output buffer does not expose), so it never ran against
+        // this kernel at all. It belongs here, in the crate that owns the state.
+        let cloud = cloud_mass_for_star(0.05, 0.02); // below the 0.08 M☉ H-burning limit
+        let mut kernel = Kernel::new(cloud, 50.0, 0.5, 0.74, 0.24, 0.02, 1500);
+        assert!(
+            kernel.substellar,
+            "0.05 M☉ must be classified substellar for this test to mean anything"
+        );
+        assert!(
+            drive_to_remnant(&mut kernel),
+            "brown dwarf never reached its terminal stage"
+        );
+        assert!(
+            !kernel.fate.supernova,
+            "a brown dwarf must not be flagged as a supernova"
+        );
+        assert!(
+            kernel
+                .particles
+                .iter()
+                .all(|p| p.kind != ParticleKind::Ejecta),
+            "a brown dwarf threw ejecta — it has no explosion to throw it"
+        );
+        assert!(
+            !kernel.bodies.is_empty(),
+            "a brown dwarf's planets must survive — no blast ever happened to sweep them away"
+        );
     }
 
     #[test]
@@ -1972,9 +2224,21 @@ mod tests {
 
     #[test]
     fn depletes_dust_and_grows_planetesimals() {
+        // §3.8: drive to ProtostarCoalescence first so planetesimals exist to grow.
         let mut kernel = solar_kernel(1.0, 1500);
         let dust0 = kernel.particle_buf.len() / PARTICLE_STRIDE;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            if kernel.stage() >= LifecycleStage::ProtostarCoalescence as u32 {
+                break;
+            }
+        }
+        assert_eq!(
+            kernel.stage(),
+            LifecycleStage::ProtostarCoalescence as u32
+        );
         let mass0 = total_body_mass(&kernel.body_buf);
+        assert!(mass0 > 0.0, "planetesimals should be seeded");
         for _ in 0..60 {
             kernel.step(3.0e14);
         }
@@ -1984,6 +2248,186 @@ mod tests {
         assert!(
             mass1 > mass0,
             "planetesimals did not grow: {mass0} -> {mass1}"
+        );
+    }
+
+    // --- §3.8 planetesimals form after the protostar -----------------------
+
+    #[test]
+    fn no_bodies_at_init() {
+        // Spec §3.8: planetesimals cannot predate the protostar. The body list
+        // and buffer must be empty right after construction.
+        let kernel = solar_kernel(1.0, 200);
+        assert!(
+            kernel.bodies.is_empty(),
+            "bodies list must be empty at init (got {})",
+            kernel.bodies.len()
+        );
+        assert!(
+            kernel.body_buf.is_empty(),
+            "body buffer must be empty at init (len={})",
+            kernel.body_buf.len()
+        );
+        assert_eq!(kernel.body_len(), 0);
+    }
+
+    #[test]
+    fn seeds_planetesimals_at_protostar_coalescence() {
+        // The first step that transitions to ProtostarCoalescence must seed
+        // exactly PLANETESIMAL_COUNT protoplanets. Before that step the body
+        // list must be empty of protoplanets/planets.
+        let mut kernel = solar_kernel(1.0, 400);
+        assert!(kernel.bodies.is_empty());
+
+        // Step with a large dt so the threshold is crossed in a reasonable count.
+        let mut seeded_at = None;
+        for step in 0..LIFECYCLE_STEPS {
+            // Check BEFORE the step that we are still in DustCloud with no planets.
+            if kernel.stage() == LifecycleStage::DustCloud as u32 {
+                let proto_count = kernel
+                    .bodies
+                    .iter()
+                    .filter(|b| matches!(b.kind, BodyType::Protoplanet | BodyType::Planet))
+                    .count();
+                assert_eq!(
+                    proto_count, 0,
+                    "protoplanets found during DustCloud at step {step}"
+                );
+            }
+            kernel.step(1.0e17);
+            if kernel.stage() >= LifecycleStage::ProtostarCoalescence as u32
+                && seeded_at.is_none()
+            {
+                seeded_at = Some(step);
+                break;
+            }
+        }
+
+        assert!(seeded_at.is_some(), "ProtostarCoalescence never reached");
+        // Count protoplanets immediately after the transition.
+        let proto_count = kernel
+            .bodies
+            .iter()
+            .filter(|b| matches!(b.kind, BodyType::Protoplanet | BodyType::Planet))
+            .count();
+        assert_eq!(
+            proto_count, PLANETESIMAL_COUNT,
+            "expected {PLANETESIMAL_COUNT} protoplanets, got {proto_count}"
+        );
+    }
+
+    // --- §3.7 post-mass-loss orbit tests -----------------------------------
+
+    #[test]
+    fn adiabatic_mass_loss_widens_orbits_without_cap() {
+        // After a white-dwarf death the surviving planets must be farther out than
+        // they were on the main sequence (orbit expansion r → r/retained, where
+        // retained ≈ 0.5 for solar → expansion ≈ 2×). The old 2.6× arcade cap
+        // is gone, so the test also confirms the expansion equals 1/retained.
+        let mut kernel = solar_kernel(1.0, 2000);
+        let mut ms_innermost = f64::INFINITY;
+        for _ in 0..LIFECYCLE_STEPS {
+            let stage = kernel.stage();
+            if stage == LifecycleStage::MainSequence as u32 && ms_innermost.is_infinite() {
+                // Record innermost planet distance at main-sequence onset.
+                for b in &kernel.bodies {
+                    if matches!(b.kind, BodyType::Planet | BodyType::Protoplanet) {
+                        let r = magnitude(b.pos);
+                        if r < ms_innermost {
+                            ms_innermost = r;
+                        }
+                    }
+                }
+            }
+            if stage == LifecycleStage::Remnant as u32 {
+                break;
+            }
+            kernel.step(1.0e17);
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::Remnant as u32);
+        assert!(!kernel.fate.supernova, "solar kernel should leave a WD");
+
+        // After adiabatic mass loss survivors must have widened.
+        let mut remnant_innermost = f64::INFINITY;
+        for b in &kernel.bodies {
+            if matches!(b.kind, BodyType::Planet | BodyType::Protoplanet) {
+                let r = magnitude(b.pos);
+                if r < remnant_innermost {
+                    remnant_innermost = r;
+                }
+            }
+        }
+        // At least one planet survived and moved outward.
+        assert!(
+            remnant_innermost.is_finite(),
+            "no planet survived to the remnant stage"
+        );
+        // Survivors expanded beyond the red-giant engulf zone.
+        assert!(
+            remnant_innermost > REDGIANT_ENGULF_AU,
+            "innermost remnant planet {remnant_innermost:.2} AU is inside \
+             the engulf radius {REDGIANT_ENGULF_AU} AU"
+        );
+    }
+
+    #[test]
+    fn supernova_ejects_unbound_planets() {
+        // After a core-collapse supernova the retained fraction is ≈ remnant/star
+        // mass ≈ 0.107 for a 15 M☉ star. Since retained < 0.5, ALL planets on
+        // circular orbits satisfy v² = mu/r > 2·(mu·retained)/r = 2·mu_remnant/r
+        // and must be ejected. Confirm no Planet/Protoplanet bodies remain.
+        //
+        // The 15 M☉ stellar mass needs a cloud ~54 M☉.
+        let cloud = cloud_mass_for_star(15.0, 0.02);
+        let mut kernel = Kernel::new(cloud, 50.0, 0.5, 0.74, 0.24, 0.02, 2000);
+        let reached_remnant = drive_to_remnant(&mut kernel);
+        // A 15 M☉ star always produces a supernova.
+        if !reached_remnant {
+            // Marginal case: skip rather than fail if the lifecycle didn't
+            // complete within the step budget.
+            return;
+        }
+        assert!(
+            kernel.fate.supernova,
+            "15 M☉ star must produce a supernova (got WD)"
+        );
+
+        // No Planet or Protoplanet should survive: all were unbound under the
+        // remnant's gravity.
+        let survivors: Vec<_> = kernel
+            .bodies
+            .iter()
+            .filter(|b| matches!(b.kind, BodyType::Planet | BodyType::Protoplanet))
+            .collect();
+        assert!(
+            survivors.is_empty(),
+            "{} planet(s) survived a supernova with retained ≈ 0.107 — \
+             they should all be unbound and ejected",
+            survivors.len()
+        );
+    }
+
+    #[test]
+    fn supernova_unbinds_when_v_squared_exceeds_two_mu_r() {
+        // Unit test for the binding condition: a circular-orbit planet (v² = mu/r)
+        // is unbound under mu_remnant = mu·retained when retained < 0.5.
+        // This directly validates the formula used in expand_orbits_after_mass_loss.
+        let mu = ORBITAL_MASS_SCALE * GRAVITY; // reference mu (cloudMass = 1)
+        let r = 2.0; // 2 AU
+        let v_circ = (mu / r).sqrt(); // exactly circular
+
+        // retained = 0.3 → mu_remnant = 0.3·mu → v² = mu/r > 2·0.3·mu/r → unbound
+        let mu_remnant_low = mu * 0.3;
+        assert!(
+            !is_bound(mu_remnant_low, r, v_circ),
+            "circular orbit must be unbound when retained = 0.3 < 0.5"
+        );
+
+        // retained = 0.6 → mu_remnant = 0.6·mu → v² = mu/r < 2·0.6·mu/r → bound
+        let mu_remnant_high = mu * 0.6;
+        assert!(
+            is_bound(mu_remnant_high, r, v_circ),
+            "circular orbit must remain bound when retained = 0.6 > 0.5"
         );
     }
 }

@@ -1,7 +1,6 @@
 //! Celestial-body integration, visiting comet/asteroid spawn, and capture logic
-//! (spec §4.5, FR-6, FR-7). Rust twin of the body-handling half of
-//! `src/sim/TsFallbackKernel.ts`; the deterministic RNG, seeding order and
-//! capture/ejection rules are replicated exactly for kernel parity.
+//! (spec §4.5, FR-6, FR-7). Owns the deterministic RNG, the seeding order and
+//! the capture/ejection rules.
 
 use crate::nbody::{is_bound, magnitude, Vec3, ASTEROID_RADIUS, COMET_RADIUS};
 
@@ -280,5 +279,46 @@ mod tests {
         assert!(!v.captured);
         assert!(matches!(v.kind, BodyType::Comet | BodyType::Asteroid));
         assert_eq!(v.id, 42.0);
+    }
+
+    // ---- perpendicular_to ---------------------------------------------------
+
+    #[test]
+    fn perpendicular_to_returns_unit_vector_orthogonal_to_axis() {
+        // Every vector returned by perpendicular_to must be (a) a unit vector
+        // and (b) perpendicular to the axis — both are required so that visitors
+        // receive a correct impact-parameter tangential velocity component,
+        // giving them a real hyperbolic trajectory rather than a radial plunge.
+        let axis: Vec3 = [0.3, -0.5, 0.81];
+        for angle in [0.0_f64, 1.0, 2.5, 4.0, 6.0] {
+            let t = perpendicular_to(axis, angle);
+            let len = magnitude(t);
+            assert!(
+                (len - 1.0).abs() < 1e-10,
+                "expected unit vector for angle {angle}, got magnitude {len}"
+            );
+            // Dot product with the axis must be ~0 (orthogonality).
+            let dot = t[0] * axis[0] + t[1] * axis[1] + t[2] * axis[2];
+            assert!(
+                dot.abs() < 1e-10,
+                "expected perpendicular to axis for angle {angle}, got dot {dot}"
+            );
+        }
+        // Different angles must produce genuinely different directions in the plane.
+        let t0 = perpendicular_to(axis, 0.0);
+        let t1 = perpendicular_to(axis, 1.5);
+        assert!(
+            (t0[0] - t1[0]).abs() > 1e-6,
+            "different angles should give different x components: t0[0]={}, t1[0]={}",
+            t0[0],
+            t1[0]
+        );
+        // Degenerate (zero) axis must still return a stable unit fallback, not NaN.
+        let t_degen = perpendicular_to([0.0, 0.0, 0.0], 1.0);
+        assert!(
+            (magnitude(t_degen) - 1.0).abs() < 1e-10,
+            "degenerate axis should return unit fallback, got {}",
+            magnitude(t_degen)
+        );
     }
 }

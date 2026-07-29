@@ -9,6 +9,7 @@
 import { LifecycleStage, RemnantType } from '../config/fateModel';
 import { DEATH_PHASES } from '../sim/stages';
 import type { CloudComposition } from '../config/SimulationConfig';
+import { SOLAR_RADIUS_AU, stellarRadiusSolar } from '../sim/astro';
 
 /** Linear RGB triple in [0, 1]. */
 export interface Rgb {
@@ -191,54 +192,69 @@ export function mainSequenceTemperature(mass: number): number {
 }
 
 /**
- * Base scene radius (scene units = AU) of a main-sequence star from its mass.
+ * Base scene radius (scene units = AU) of a main-sequence star from its mass,
+ * at TRUE physical scale: `SOLAR_RADIUS_AU · M^0.8` (reusing
+ * `stellarRadiusSolar` from astro.ts).
  *
- * The Sun's true radius is 0.00465 AU against an innermost planet at ~1 AU — a
- * ratio of over 200:1. Drawing that literally would make the star a single
- * pixel, so it is exaggerated ~10× to 0.047 AU, but no further: at that size the
- * star is still ~1/20 of the innermost orbit and the system finally reads at
- * Solar-System scale, instead of the previous 0.5 AU "arcade" ball that spanned
- * a sizeable fraction of the inner system. Visibility when zoomed out is handled
- * by a minimum APPARENT size in the renderer (see `screenScale.ts`), not by
- * inflating the physical radius.
+ * The Sun's radius is 0.00465 AU — a ratio of ~215:1 against a 1 AU orbit.
+ * At system-framing distances the star is sub-pixel, which is why
+ * `StarRenderer` floors its drawn size to a minimum number of pixels (the same
+ * trick Celestia / NASA's Eyes use). That floor keeps it readable WITHOUT
+ * inflating the physical radius, so zoomed-in proportions are correct.
+ *
+ * Clamped 0.001–0.05 AU: below the lower end the float math loses precision;
+ * above the upper end the star fills the inner system regardless of the pixel
+ * floor (an extreme-mass "star" would exceed the clamp anyway).
  */
 export function mainSequenceRadius(mass: number): number {
   const m = Math.max(mass, 1e-3);
-  return clamp(0.047 * Math.pow(m, 0.4), 0.02, 0.4);
+  return clamp(SOLAR_RADIUS_AU * stellarRadiusSolar(m), 0.001, 0.05);
 }
 
 /**
- * How many times its main-sequence radius the star swells as a red giant. The
- * Sun will reach ~250 R☉ ≈ 1.2 AU and engulf its inner planets — a factor of
- * ~250. Compressed here to a still-spectacular 26× (≈1.2 AU for a solar star),
- * which keeps the visible photosphere consistent with `REDGIANT_ENGULF_AU`, the
- * radius inside which the kernel actually destroys planets.
+ * How many times its main-sequence radius the star swells as a red giant.
+ * The Sun expands to ~250 R☉ ≈ 1.16 AU at its tip-of-the-red-giant-branch peak
+ * — a true factor of ~250. At 1 M☉: `0.00465 · 250 ≈ 1.16 AU`, well inside
+ * `REDGIANT_ENGULF_AU = 2.2 AU` (the kernel's destruction radius), so no
+ * planet can survive inside the photosphere that the kernel has not already
+ * consumed. More massive giants swell proportionally larger.
  */
-export const RED_GIANT_SWELL = 26;
+export const RED_GIANT_SWELL = 250;
 
 /**
- * Radius of a compact remnant, in scene units. A white dwarf is Earth-sized
- * (4e-5 AU) and a neutron star is a city — both utterly invisible at true scale,
- * so they are drawn at the smallest size that still reads as a point of light.
+ * True physical radius of a white dwarf, in scene units (AU). White dwarfs are
+ * Earth-sized: R_WD ≈ 6 400 km ≈ 4.3e-5 AU. At system scale this is
+ * sub-pixel, so `StarRenderer` applies its pixel-floor; zoomed in the white
+ * dwarf reads as a small, bright point rather than a ball — correct.
  */
-export const WHITE_DWARF_RADIUS = 0.018;
-export const NEUTRON_STAR_RADIUS = 0.012;
+export const WHITE_DWARF_RADIUS = 4.3e-5;
 
 /**
- * Drawn radius of a black hole's EVENT HORIZON, in scene units. A 10 M☉ hole is
- * 30 km across (2e-7 AU) — utterly invisible at true scale — so it is drawn at
- * the smallest size whose photon ring and accretion disc still read.
+ * Illustrative floor radius used for neutron stars and pulsars, in scene
+ * units. True scale is ~10 km ≈ 7e-8 AU — physically invisible; even the
+ * pixel floor would render an unresolvable speck. This value sits at the
+ * pixel-floor threshold so the magnetosphere ring and pulsar beams remain
+ * legible without inflating the "surface". Documented exception.
  */
-export const BLACK_HOLE_RADIUS = 0.03;
+export const NEUTRON_STAR_RADIUS = 1e-5;
 
 /**
- * Drawn radius of a brown dwarf, in scene units. Degeneracy makes every brown
- * dwarf about one JUPITER radius (~5e-4 AU) whatever its mass — so it is far
- * bigger than a white dwarf yet still far smaller than any true star, and it is
- * drawn that way: noticeably larger than a compact remnant, clearly smaller
- * than the main-sequence star it failed to become.
+ * Illustrative floor radius for a black hole's EVENT HORIZON, in scene units.
+ * A stellar-mass hole is 30–60 km (2–4e-7 AU) — also physically invisible.
+ * Kept at the same pixel-floor level as `NEUTRON_STAR_RADIUS` so the photon
+ * ring and accretion disc geometry scales correctly from it. Documented
+ * exception.
  */
-export const BROWN_DWARF_RADIUS = 0.03;
+export const BLACK_HOLE_RADIUS = 1e-5;
+
+/**
+ * True physical radius of a brown dwarf, in scene units (AU). Electron
+ * degeneracy keeps every brown dwarf at roughly one Jupiter radius regardless
+ * of mass: R_BD ≈ 70 000 km ≈ 5e-4 AU. Drawn at true scale: noticeably
+ * larger than a white dwarf (4.3e-5 AU), yet clearly smaller than even the
+ * faintest true star (≥ 0.001 AU after clamping).
+ */
+export const BROWN_DWARF_RADIUS = 5e-4;
 
 /**
  * Effective temperature of a brown dwarf, in Kelvin. L/T dwarfs sit at roughly
@@ -305,10 +321,15 @@ export function starAppearance(
 
     case LifecycleStage.ProtostarCoalescence: {
       // A cool, dim, contracting protostar warming from ~1200 K toward ~2800 K.
-      // Protostars are genuinely several times their eventual main-sequence size
-      // and shrink as they contract onto it.
+      // Protostars are genuinely ~AU scale in reality before they settle onto
+      // the main sequence.  With true-scale msRadius (~0.00465 AU for 1 M☉)
+      // the old ×6 factor gave only 0.03 AU — a pixel.  We now use ×215 at
+      // the start (~1 AU for a solar star) shrinking to ×108 at the end
+      // (~0.5 AU), which hands off seamlessly to FusionIgnition's own contraction
+      // (see below).  Both factors scale the true-scale radius, so massive
+      // protostars (msRadius ≈ 0.038 AU at 14 M☉) are correctly larger (~8 AU).
       const temperatureK = 1200 + 1600 * p;
-      const radius = msRadius * (6 - 3 * p);
+      const radius = msRadius * (215 - 107 * p);
       return {
         visible: true,
         temperatureK,
@@ -325,13 +346,18 @@ export function starAppearance(
     }
 
     case LifecycleStage.FusionIgnition: {
-      // Ignition flash: temperature ramps sharply to the main-sequence value.
+      // Ignition flash: temperature ramps sharply to the main-sequence value
+      // while the star contracts.  Radius starts at the ProtostarCoalescence
+      // end value (×108 msRadius ≈ 0.5 AU for 1 M☉) and contracts to true
+      // main-sequence radius by p=1 — a seamless continuation of the
+      // Kelvin-Helmholtz shrinkage that ends with hydrogen ignition.
       const temperatureK = 2800 + (msTemp - 2800) * p;
+      const radius = msRadius * (108 - 107 * p);
       return {
         visible: true,
         temperatureK,
         color: blackbodyColor(temperatureK),
-        radius: msRadius,
+        radius,
         glow: 0.8 + 0.6 * p,
         surfaceLum: 0.55 + 0.35 * p,
         pulsarBeam: false,
@@ -398,12 +424,13 @@ export function starAppearance(
 
 /**
  * How far the supernova fireball's photosphere expands, as a multiple of the
- * star's main-sequence radius. Several times the red giant it came from — but
- * deliberately kept to a few AU rather than the tens of AU a real one reaches,
- * because the fireball is an OPAQUE sphere: at true scale it swallows the camera
- * and the explosion becomes a white screen instead of a spectacle.
+ * star's (true-scale) main-sequence radius. With `mainSequenceRadius` now at
+ * physical scale (~0.037 AU for a 14 M☉ progenitor), this factor is set so
+ * the fireball peaks at ~10 AU — visibly dwarfing the system's inner planets
+ * while remaining a bounded sphere that does not swamp the camera. The
+ * transparent BLAST SHELL driven by `SHOCKWAVE_REACH` sweeps far beyond it.
  */
-export const FIREBALL_SWELL = 70;
+export const FIREBALL_SWELL = 350;
 
 /**
  * How far the BLAST SHELL reaches by the end of the death stage, as a fraction

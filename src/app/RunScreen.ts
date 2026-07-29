@@ -148,9 +148,15 @@ export class RunScreen {
       onFocusChange: (value) => this.handleFocusChange(value),
       onToggleLabels: (enabled) => this.scene?.setLabelsEnabled(enabled),
       onToggleOrbits: (enabled) => this.scene?.setOrbitsEnabled(enabled),
-      initialLabels: true,
+      // Labels start OFF so the system reads as an uncluttered sky on entry;
+      // the user turns them on from the HUD when they want to identify bodies.
+      initialLabels: false,
       initialOrbits: false,
     });
+    // The scene's overlays default to "on"; sync them to the HUD's initial
+    // checkbox state so the two never disagree on the first frame.
+    this.scene.setLabelsEnabled(this.hud.labelsChecked);
+    this.scene.setOrbitsEnabled(this.hud.orbitsChecked);
     // The HUD is interactive; re-enable pointer events for its controls.
     this.hud.element.style.pointerEvents = 'auto';
 

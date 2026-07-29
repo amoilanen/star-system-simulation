@@ -6,6 +6,7 @@ import {
   moonOrbit,
   planetClass,
   planetLook,
+  bodyHash,
 } from '../../src/render/planetLook';
 import { GAS_GIANT_MIN_EARTH_MASSES, ICE_GIANT_MIN_EARTH_MASSES } from '../../src/ui/bodyInfo';
 import { EARTH_MASSES_PER_SOLAR } from '../../src/sim/astro';
@@ -72,6 +73,54 @@ describe('bug 8 — planets must not all look alike', () => {
     }
   });
 
+  it('rocky worlds never have rings (spec §3.3)', () => {
+    for (let id = 0; id < 100; id += 1) {
+      const look = planetLook(id, solar(1));
+      expect(look.hasRings).toBe(false);
+      expect(look.ringProminence).toBe(0);
+    }
+  });
+
+  it('gas giants have prominent rings on ~30 % of worlds (spec §3.3)', () => {
+    // Verify that the threshold is bodyHash < 0.3 by checking directly.
+    let ringed = 0;
+    const SAMPLE = 200;
+    for (let id = 0; id < SAMPLE; id += 1) {
+      const look = planetLook(id, solar(200)); // gas giant mass
+      if (look.hasRings) {
+        ringed += 1;
+        // Prominent rings have ringProminence = 1.
+        expect(look.ringProminence).toBe(1.0);
+        // Confirm the underlying hash drove the decision correctly.
+        expect(bodyHash(id, 5)).toBeLessThan(0.3);
+      } else {
+        expect(look.ringProminence).toBe(0);
+      }
+    }
+    // With bodyHash < 0.3, ~30 % should be ringed; allow ±15 % for hash distribution.
+    expect(ringed / SAMPLE).toBeGreaterThan(0.15);
+    expect(ringed / SAMPLE).toBeLessThan(0.45);
+  });
+
+  it('ice giants can have faint rings (ringProminence < 1) but never prominent ones (spec §3.3)', () => {
+    let ringed = 0;
+    const SAMPLE = 200;
+    for (let id = 0; id < SAMPLE; id += 1) {
+      const look = planetLook(id, solar(20)); // ice giant mass
+      if (look.hasRings) {
+        ringed += 1;
+        // Ice-giant rings are faint: prominence must be well below 1.
+        expect(look.ringProminence).toBeLessThan(1.0);
+        expect(look.ringProminence).toBeGreaterThan(0);
+      } else {
+        expect(look.ringProminence).toBe(0);
+      }
+    }
+    // With bodyHash < 0.25, ~25 % should be ringed; allow ±15 %.
+    expect(ringed / SAMPLE).toBeGreaterThan(0.1);
+    expect(ringed / SAMPLE).toBeLessThan(0.4);
+  });
+
   it('gives giants more moons than rocky worlds', () => {
     const total = (massSolar: number): number =>
       Array.from({ length: 20 }, (_, id) => planetLook(id, massSolar).moonCount).reduce(
@@ -83,14 +132,38 @@ describe('bug 8 — planets must not all look alike', () => {
 });
 
 describe('bug 3 — moons need room and a visible orbit', () => {
-  it('places every moon well outside its planet’s drawn disc', () => {
+  it('places every moon well outside its planet’s drawn disc (spec §3.3 geometric family)', () => {
     for (let id = 0; id < 20; id += 1) {
       for (let k = 0; k < MAX_MOONS_PER_PLANET; k += 1) {
-        // Radii are multiples of the planet's DRAWN radius, so >1 means the moon
-        // is outside the sphere at every zoom level — the reported bug was moons
-        // sitting inside (or on) their planet.
-        expect(moonOrbit(id, k).radiusFactor).toBeGreaterThan(3);
+        // Radii are multiples of the planet’s DRAWN radius. The new geometric
+        // family starts at 6·(0.9+0.2·jitter) ≥ 5.4 drawn radii for the
+        // innermost moon (k=0) — well outside the planet’s disc.
+        expect(moonOrbit(id, k).radiusFactor).toBeGreaterThan(5);
         expect(moonOrbit(id, k).sizeFactor).toBeLessThan(0.35);
+      }
+    }
+  });
+
+  it('first moon (k=0) is at least 5 drawn radii from the planet centre (spec §3.3)', () => {
+    // 6 · 1.8^0 · (0.9 + 0.2·jitter) — minimum is 6·0.9 = 5.4 drawn radii.
+    for (let id = 0; id < 50; id += 1) {
+      expect(moonOrbit(id, 0).radiusFactor).toBeGreaterThanOrEqual(5.4);
+    }
+  });
+
+  it('moon orbits follow a geometric progression (×~1.8 per step, spec §3.3)', () => {
+    // For every planet and every adjacent moon pair, the ratio r_{k+1}/r_k must
+    // be close to 1.8.  With jitter in [0.9, 1.1] on each radius the exact ratio
+    // varies, but it should always sit between 1.3 and 2.4.
+    for (let id = 0; id < 20; id += 1) {
+      const radii = Array.from(
+        { length: MAX_MOONS_PER_PLANET },
+        (_, k) => moonOrbit(id, k).radiusFactor,
+      );
+      for (let k = 1; k < radii.length; k += 1) {
+        const ratio = radii[k]! / radii[k - 1]!;
+        expect(ratio).toBeGreaterThan(1.3);
+        expect(ratio).toBeLessThan(2.4);
       }
     }
   });
@@ -130,5 +203,33 @@ describe('bug 3 — moons need room and a visible orbit', () => {
 
   it('runs inner moons faster than outer ones (Kepler)', () => {
     expect(moonOrbit(4, 0).angularSpeed).toBeGreaterThan(moonOrbit(4, 2).angularSpeed);
+  });
+
+  it('moonOffset returns the same position for elapsed = 0 (freeze when paused)', () => {
+    // When simDt = 0 (paused), moonElapsed does not advance. Calling moonOffset
+    // at the same elapsed time twice must return identical positions — the moon
+    // is truly frozen, not merely slow (spec §3.4).
+    const orbit = moonOrbit(3, 1);
+    const pos0 = moonOffset(orbit, 0);
+    const pos1 = moonOffset(orbit, 0);
+    expect(pos0).toEqual(pos1);
+  });
+
+  it('angularSpeed values are in rad/sim-second with Kepler ordering (spec §3.4)', () => {
+    // All angular speeds must be positive (moons always orbit in one direction)
+    // and inner moons (lower index) must orbit faster than outer ones.
+    for (let id = 0; id < 10; id += 1) {
+      for (let k = 0; k < MAX_MOONS_PER_PLANET; k += 1) {
+        expect(moonOrbit(id, k).angularSpeed).toBeGreaterThan(0);
+      }
+      // Kepler: ω ∝ a^{-3/2} → inner faster.
+      const speeds = Array.from(
+        { length: MAX_MOONS_PER_PLANET },
+        (_, k) => moonOrbit(id, k).angularSpeed,
+      );
+      for (let k = 1; k < speeds.length; k += 1) {
+        expect(speeds[k - 1]!).toBeGreaterThan(speeds[k]!);
+      }
+    }
   });
 });

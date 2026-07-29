@@ -65,6 +65,13 @@ export interface RenderState {
    * scaled to the system it is tearing through rather than to the star.
    */
   cloudExtent?: number;
+  /**
+   * Simulation time elapsed this frame, in sim seconds. 0 when paused or when
+   * the frame came from history replay. Consumed by the body renderer to drive
+   * moon orbital motion and axial spin from sim time (spec §3.4): moons freeze
+   * when the sim is paused and animate at pace-consistent speed otherwise.
+   */
+  simDt?: number;
 }
 
 /** Options for {@link SceneManager}. */
@@ -179,8 +186,11 @@ export class SceneManager {
     this.scene.background = new THREE.Color(0x01010a);
     this.scene.add(this.createStarfield());
 
-    // A near plane far closer than the old 0.1 so the camera can actually get
-    // up to a realistically-sized planet (radius ~0.016 AU) without clipping it.
+    // 0.02 AU is only the STARTING near plane, used while the camera frames the
+    // whole system. Bodies are drawn at true scale (a rocky world is 4e-5 AU
+    // across), so flying up to one puts the camera far inside a fixed near
+    // plane; `CameraController` therefore re-derives the near plane from the
+    // viewing distance every frame (see `nearPlaneFor`).
     this.camera = new THREE.PerspectiveCamera(55, width / height, 0.02, 20000);
     this.camera.position.set(0, 20, 60);
 
@@ -247,8 +257,32 @@ export class SceneManager {
     this.dustBrightness += (targetDust - this.dustBrightness) * ease;
     this.particleField.setBrightness(this.dustBrightness);
 
+    // Cache body state so focus/follow can locate bodies by id between frames.
+    // Done BEFORE the camera update so the follow provider reads THIS frame's
+    // positions.
+    this.lastBodies = state.bodies;
+    this.lastBodyCount = state.bodyCount;
+
+    // Settle the camera FIRST. The renderers below floor every body to a minimum
+    // apparent size, which is a function of its distance to the camera — so they
+    // must see the camera where it ends up this frame, not where it was last
+    // frame. When following a fast-moving body the two are a whole frame of
+    // orbital motion apart, and using the stale position inflated the followed
+    // body's floored radius until the camera ended up INSIDE it (black screen).
+    this.cameraController.update(dt);
+
+    // Moon orbital motion and axial spin are driven from SIM time so they freeze
+    // when paused and scale with the simulation pace. `state.simDt` is already 0
+    // when paused (the kernel clock returns 0) and absent on history-replay frames.
+    const bodySimDt = Number.isFinite(state.simDt) && (state.simDt ?? 0) > 0 ? state.simDt! : 0;
     const viewportHeightPx = this.renderer.domElement.clientHeight || this.container.clientHeight;
-    this.bodyRenderer.update(state.bodies, state.bodyCount, animDt, this.camera, viewportHeightPx);
+    this.bodyRenderer.update(
+      state.bodies,
+      state.bodyCount,
+      bodySimDt,
+      this.camera,
+      viewportHeightPx,
+    );
     this.orbits.update(state.bodies, state.bodyCount, state.mu);
 
     const appearance = starAppearance(
@@ -268,11 +302,6 @@ export class SceneManager {
     this.starLight.intensity = appearance.visible ? 0.95 + appearance.glow * 0.35 : 0;
     this.lastStarRadius = appearance.radius || 1;
 
-    // Cache body state so focus/follow can locate bodies by id between frames.
-    this.lastBodies = state.bodies;
-    this.lastBodyCount = state.bodyCount;
-
-    this.cameraController.update(dt);
     this.post.render(dt);
 
     // Labels project through the camera, so update them AFTER the controller has

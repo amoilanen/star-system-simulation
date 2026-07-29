@@ -38,6 +38,18 @@ const MAX_LABELS = 48;
 /** Beyond this normalized depth a label is hidden (behind camera / far away). */
 const MAX_LABEL_DISTANCE = 900;
 
+/**
+ * How far a label is lifted above the object it names, as a fraction of the
+ * object's distance to the camera.
+ *
+ * It has to be an ANGULAR offset, not a fixed number of AU: bodies are drawn at
+ * true scale, so a fixed lift big enough to clear a red giant (≈1 AU) throws the
+ * label kilometres off-screen the moment you fly up to a 4e-5 AU rocky world.
+ * A fraction of the viewing distance reads as the same handful of pixels at
+ * every zoom level.
+ */
+const LABEL_LIFT_FRACTION = 0.035;
+
 /** One pooled label element with its sub-nodes. */
 interface LabelNode {
   root: HTMLDivElement;
@@ -57,7 +69,12 @@ export class BodyLabels {
   private locale: Locale;
   private readonly pool: LabelNode[] = [];
   private readonly projected = new THREE.Vector3();
-  private enabled = true;
+  /**
+   * Labels start hidden so the simulation opens on an uncluttered sky; the HUD
+   * checkbox (also unchecked by default) turns them on. Both defaults must
+   * agree, and `RunScreen` syncs them explicitly on start-up.
+   */
+  private enabled = false;
 
   constructor(options: BodyLabelsOptions) {
     this.container = options.container;
@@ -116,9 +133,11 @@ export class BodyLabels {
 
     let index = 0;
     // --- The star itself, at the scene origin -------------------------------
+    // The label's lift is applied in `place` as a fraction of the viewing
+    // distance, so only the object's own extent is added here.
     index = this.place(
       index,
-      [0, Math.max(starRadius, 0.4), 0],
+      [0, starRadius, 0],
       starLabelContent(stage, starMass, remnant),
       camera,
       width,
@@ -147,7 +166,7 @@ export class BodyLabels {
         stage,
         remnant,
       );
-      index = this.place(index, [x, y + radius + 0.25, z], content, camera, width, height, false);
+      index = this.place(index, [x, y + radius, z], content, camera, width, height, false);
     }
 
     // Hide any unused pooled nodes.
@@ -171,6 +190,9 @@ export class BodyLabels {
     }
     this.projected.set(world[0], world[1], world[2]);
     const distance = this.projected.distanceTo(camera.position);
+    // Lift the label clear of the object by a constant ANGULAR amount (see
+    // LABEL_LIFT_FRACTION) so it tracks its body at every zoom level.
+    this.projected.setY(world[1] + LABEL_LIFT_FRACTION * distance);
     this.projected.project(camera);
 
     const node = this.node(index);

@@ -174,9 +174,18 @@ describe('Hud visibility toggles', () => {
     expect(container.textContent).toContain(i18n.translate('en', 'hud.labels'));
   });
 
-  it('defaults to orbits off and labels on', () => {
+  it('defaults to orbits off and labels off', () => {
     const { hud } = makeHud(container, { onToggleOrbits: vi.fn(), onToggleLabels: vi.fn() });
     expect(hud.orbitsChecked).toBe(false);
+    expect(hud.labelsChecked).toBe(false);
+  });
+
+  it('honours an explicit initialLabels override', () => {
+    const { hud } = makeHud(container, {
+      onToggleOrbits: vi.fn(),
+      onToggleLabels: vi.fn(),
+      initialLabels: true,
+    });
     expect(hud.labelsChecked).toBe(true);
   });
 

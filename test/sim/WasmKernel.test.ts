@@ -10,7 +10,7 @@ import {
   type WasmKernelHandle,
   type WasmModule,
 } from '../../src/sim/WasmKernel';
-import { BodyType, BODY_OFFSET, PARTICLE_STRIDE, BODY_STRIDE } from '../../src/sim/PhysicsKernel';
+import { BodyType, PARTICLE_STRIDE } from '../../src/sim/PhysicsKernel';
 import { SimEventType } from '../../src/sim/events';
 import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
 import type { CloudComposition, SimulationConfig } from '../../src/config/SimulationConfig';
@@ -74,6 +74,7 @@ function makeFakeModule(): { mod: WasmModule; particle: number[]; body: number[]
     stage_progress: () => 0.5,
     elapsed_sim_seconds: () => 1.6e13,
     star_mass_solar: () => 0.9,
+    orbital_mu: () => 42,
     free: () => {},
   };
 
@@ -84,6 +85,8 @@ function makeFakeModule(): { mod: WasmModule; particle: number[]; body: number[]
   const mod: WasmModule = {
     Kernel: KernelCtor,
     wasm_memory: () => memory,
+    softening: () => 0.35,
+    snow_line_au: () => 2.7,
     default: async () => undefined,
   };
   return { mod, particle, body };
@@ -134,18 +137,13 @@ describe('createKernel / feature detection', () => {
     expect(isWasmSupported()).toBe(true);
   });
 
-  it('always returns a usable kernel (falls back when WASM cannot load)', async () => {
-    // In Node the browser-style module init cannot fetch its sibling .wasm, so
-    // createKernel transparently falls back to the TS kernel (Decision D2).
-    const kernel = await createKernel();
-    kernel.init({ config: makeConfig(), particleCount: 10 });
-    const result = kernel.step(1e14);
-    expect(typeof result.stage).toBe('number');
-    expect(typeof result.stageProgress).toBe('number');
-    // Dust may already be accreting, so the count is bounded by the seed count.
-    expect(kernel.getParticleBuffer().length).toBeLessThanOrEqual(10 * PARTICLE_STRIDE);
-    expect(kernel.getParticleBuffer().length).toBeGreaterThan(0);
-    kernel.dispose();
+  it('rejects — rather than silently substituting another kernel — when the module cannot load', async () => {
+    // There is exactly ONE physics implementation now; the mirrored TypeScript
+    // fallback was deleted. So a module that fails to load must SURFACE as an
+    // error instead of quietly changing which physics the user is watching.
+    // (In Node the browser-style init cannot fetch its sibling .wasm, which is
+    // a convenient stand-in for that deployment fault.)
+    await expect(createKernel()).rejects.toThrow();
   });
 });
 
@@ -198,11 +196,9 @@ describeWasm('WASM kernel behavioural invariants', () => {
 
     // Post-init: correct interleaved buffer layout.
     expect(wasm.getParticleBuffer().length).toBe(particleCount * PARTICLE_STRIDE);
-    expect(wasm.getBodyBuffer().length % BODY_STRIDE).toBe(0);
-    expect(wasm.getBodyBuffer().length).toBeGreaterThan(0);
-    // First seeded body is a bound protoplanet.
-    expect(wasm.getBodyBuffer()[BODY_OFFSET.type]).toBe(BodyType.Protoplanet);
-    expect(wasm.getBodyBuffer()[BODY_OFFSET.captured]).toBe(1);
+    // §3.8: body buffer is EMPTY immediately after init — planetesimals are
+    // deferred to ProtostarCoalescence so they cannot predate the protostar.
+    expect(wasm.getBodyBuffer().length).toBe(0);
 
     // Formation is accretion-driven AND rate-limited by the star's finite
     // accretion rate (CORE_ACCRETION_RATE), so reaching ignition legitimately

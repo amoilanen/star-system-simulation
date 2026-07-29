@@ -10,7 +10,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { Vec3 } from '../sim/PhysicsKernel';
-import { dampVec3, frameDistance } from './cameraMath';
+import { followStep, frameDistance, nearPlaneFor } from './cameraMath';
 
 /** Supplies the live world position of a followed body, or null to stop. */
 export type FollowProvider = () => Vec3 | null;
@@ -24,6 +24,15 @@ export class CameraController {
   private readonly controls: OrbitControls;
 
   private followProvider: FollowProvider | null = null;
+  /**
+   * Body world-position recorded at the end of the last `update` call.
+   * Used as `prevBodyPos` for the feed-forward follow step (spec §3.6).
+   * `null` means "not yet initialised for this follow session" — on the
+   * first update after a reset the body delta is treated as zero and only
+   * residual damping applies (converges from the current camera position
+   * to the body's initial location).
+   */
+  private lastFollowPos: Vec3 | null = null;
   /** The smoothed look-at target the camera orbits around. */
   private readonly smoothedTarget: Vec3 = [0, 0, 0];
 
@@ -32,9 +41,9 @@ export class CameraController {
     this.controls = new OrbitControls(camera, domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
-    // Small enough to fly right up to a realistically-sized planet; bodies are
-    // only ~0.005–0.02 AU across (see `bodyRadiusFromMass`).
-    this.controls.minDistance = 0.06;
+    // Small enough to fly right up to a true-scale Earth-sized planet
+    // (~4.26e-5 AU radius — see `bodyRadiusFromMass`).
+    this.controls.minDistance = 5e-4;
     this.controls.maxDistance = 5000;
   }
 
@@ -44,6 +53,11 @@ export class CameraController {
    */
   focusOn(position: Vec3, radius: number, follow: FollowProvider | null = null): void {
     this.followProvider = follow;
+    // Seed lastFollowPos so the first update frame carries zero delta (the
+    // camera target is already placed at `position` just below, so the
+    // feed-forward term is (position − position) = 0 and only residual
+    // damping acts on any subsequent initial-transition offset).
+    this.lastFollowPos = [position[0], position[1], position[2]];
     const dist = frameDistance(radius, this.camera.fov, 2.2);
     // Preserve the current viewing direction; just re-place along it.
     const dir = new THREE.Vector3()
@@ -62,11 +76,15 @@ export class CameraController {
   /** Follow a moving body, keeping the current orbit offset (FR-8). */
   setFollow(follow: FollowProvider | null): void {
     this.followProvider = follow;
+    // Reset so the first update after a new follow provider initialises
+    // lastFollowPos from the body's current position (delta = 0 on frame 1).
+    this.lastFollowPos = null;
   }
 
   /** Stop following; the camera stays where it is and keeps free orbit. */
   clearFollow(): void {
     this.followProvider = null;
+    this.lastFollowPos = null;
   }
 
   /** Programmatic zoom in by a step (HUD control). */
@@ -92,26 +110,60 @@ export class CameraController {
   }
 
   /**
-   * Advance the controller by real `dt`. When following, smoothly moves the
-   * orbit target toward the body's live position and carries the camera by the
-   * same delta so the user's orbit offset is preserved.
+   * Advance the controller by real `dt`. When following, uses a feed-forward
+   * step (spec §3.6) to translate both the orbit target and the camera position
+   * by the body's full per-frame delta, then damps any remaining residual
+   * offset.  This keeps the body in frame at any simulation speed while
+   * preserving the user's current zoom and viewing angle.
    */
   update(dt: number): void {
     const provider = this.followProvider;
     if (provider !== null) {
-      const target = provider();
-      if (target !== null) {
-        const prev: Vec3 = [this.controls.target.x, this.controls.target.y, this.controls.target.z];
-        const next = dampVec3(prev, target, FOCUS_LAMBDA, dt);
-        const delta = new THREE.Vector3(next[0] - prev[0], next[1] - prev[1], next[2] - prev[2]);
+      const bodyPos = provider();
+      if (bodyPos !== null) {
+        // On the first frame after a follow reset, treat prevBodyPos as the
+        // current body position so the feed-forward delta is zero and only
+        // the residual damping (initial-offset convergence) acts.
+        const prevBodyPos: Vec3 = this.lastFollowPos ?? [bodyPos[0], bodyPos[1], bodyPos[2]];
+        const prevTarget: Vec3 = [
+          this.controls.target.x,
+          this.controls.target.y,
+          this.controls.target.z,
+        ];
+        const next = followStep(prevTarget, bodyPos, prevBodyPos, FOCUS_LAMBDA, dt);
+        const delta = new THREE.Vector3(
+          next[0] - prevTarget[0],
+          next[1] - prevTarget[1],
+          next[2] - prevTarget[2],
+        );
+        // Translate both target and camera by the same delta to preserve the
+        // user's orbit offset (zoom level and viewing angle are unchanged).
         this.controls.target.set(next[0], next[1], next[2]);
         this.camera.position.add(delta);
         this.smoothedTarget[0] = next[0];
         this.smoothedTarget[1] = next[1];
         this.smoothedTarget[2] = next[2];
+        // Record the body's current position for the next frame's feed-forward.
+        this.lastFollowPos = [bodyPos[0], bodyPos[1], bodyPos[2]];
       }
     }
     this.controls.update();
+    this.syncNearPlane();
+  }
+
+  /**
+   * Keep the near-clip plane below the current viewing distance so a true-scale
+   * body the camera has flown up to is never clipped away (see
+   * {@link nearPlaneFor}). Runs after `controls.update()` so it sees the
+   * distance OrbitControls actually settled on.
+   */
+  private syncNearPlane(): void {
+    const distance = this.camera.position.distanceTo(this.controls.target);
+    const near = nearPlaneFor(distance);
+    if (this.camera.near !== near) {
+      this.camera.near = near;
+      this.camera.updateProjectionMatrix();
+    }
   }
 
   dispose(): void {

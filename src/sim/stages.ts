@@ -9,7 +9,7 @@
 // structure of the death, and the illustrative stage durations. It deliberately
 // owns no state machine: both kernels drive the progression themselves, because
 // only they know the accreted core mass that makes FORMATION physics-driven
-// rather than timed (see `TsFallbackKernel.advanceStages` and its Rust twin).
+// rather than timed (see `advance_stages` in `wasm/src/lib.rs`).
 // A sub-stellar object short-circuits this order entirely — a brown dwarf never
 // ignites, so it goes straight from FusionIgnition to Remnant.
 //

@@ -53,6 +53,25 @@ const MIN_MOON_PIXELS = 3;
 const RING_INNER = 1.5;
 const RING_OUTER = 2.5;
 
+/**
+ * Legibility cap for moon orbital motion driven from sim time (spec §3.4).
+ *
+ * Moon `angularSpeed` values are in rad per sim-second. Because the sim-time
+ * rate spans ~14 orders of magnitude (near-real → whole lifecycle per minute),
+ * raw sim dt would either make moons strobe at high pace or freeze at low pace.
+ * We clamp the sim dt used for moon animation to [MIN, MAX] sim-seconds/frame:
+ *
+ *   - MAX_MOON_SIM_DT: prevents strobing — caps the fastest moon (k=0,
+ *     angularSpeed ≈ 0.85) to ≤ ~0.021 rad/frame ≈ 300-frame orbit ≈ 5s at 60fps.
+ *   - MIN_MOON_SIM_DT: prevents apparent freezing at very slow pace — ensures
+ *     the fastest moon moves ≥ ~0.003 rad/frame even near real-time pace.
+ *   - 0 is preserved: when the sim is paused simDt = 0 → moons genuinely freeze.
+ *
+ * Same clamp applied to axial spin so behaviour is consistent.
+ */
+const MAX_MOON_SIM_DT = 0.025; // sim-seconds; gives ~5 s orbit for inner moon at 60fps
+const MIN_MOON_SIM_DT = 0.003; // sim-seconds; floor so moons aren't invisible at slow pace
+
 /** Draws all orbiting/visiting bodies read from the kernel body buffer. */
 export class BodyRenderer {
   readonly group: THREE.Group;
@@ -75,7 +94,11 @@ export class BodyRenderer {
   /** Per-body accumulated axial spin angle, keyed by body id (FR-6). */
   private readonly spinAngles = new Map<number, number>();
   private readonly starPos: Vec3 = [0, 0, 0];
-  /** Real-time accumulator driving moon orbital motion. */
+  /**
+   * Accumulated sim-time (seconds) driving moon orbital motion. Advances only
+   * when simDt > 0 (i.e. when the simulation is running), so moons freeze when
+   * the simulation is paused (spec §3.4).
+   */
   private moonElapsed = 0;
   /**
    * Distance from the star within which comets develop a tail (solar heating
@@ -139,7 +162,10 @@ export class BodyRenderer {
     const ringGeom = new THREE.RingGeometry(RING_INNER, RING_OUTER, 48, 1);
     ringGeom.rotateX(-Math.PI / 2);
     const ringMat = new THREE.MeshStandardMaterial({
-      color: 0xd8c9a8,
+      // White base so per-instance colour (set in writeRing) controls brightness
+      // fully — prominent gas-giant rings get the warm sandy beige, while faint
+      // ice-giant rings are driven to near-zero diffuse and look translucent.
+      color: 0xffffff,
       // Ring particles are icy and highly reflective, and a ring plane is often
       // nearly edge-on to the star — so a purely diffuse ring renders as a dark
       // smudge. A little self-illumination keeps it legible from any angle
@@ -212,23 +238,32 @@ export class BodyRenderer {
 
   /**
    * Update all instanced bodies from the interleaved kernel body buffer. `count`
-   * is the number of bodies; `dt` (real seconds) advances axial spin and the
-   * moons — pass 0 to freeze them while the simulation is paused. The camera and
-   * viewport height are used only to keep astronomically small bodies above a
-   * minimum apparent size (see `screenScale.ts`) — positions and distances are
-   * always the kernel's true ones.
+   * is the number of bodies; `simDt` (sim seconds this frame) drives axial spin
+   * and moon orbital motion — pass 0 to freeze them while the simulation is
+   * paused (spec §3.4: moons freeze when paused). The camera and viewport height
+   * are used only to keep astronomically small bodies above a minimum apparent
+   * size (see `screenScale.ts`) — positions and distances are always the kernel's
+   * true ones.
    */
   update(
     buffer: Float32Array,
     count: number,
-    dt: number,
+    simDt: number,
     camera?: THREE.PerspectiveCamera,
     viewportHeightPx?: number,
   ): void {
     this.camera = camera ?? null;
     this.viewportHeightPx = viewportHeightPx ?? 0;
-    if (Number.isFinite(dt) && dt > 0) {
-      this.moonElapsed += dt;
+    // Apply legibility clamp to sim dt (spec §3.4): moons freeze when paused
+    // (simDt=0 → effectiveDt=0) and stay visible at all non-paused paces:
+    //   • MAX_MOON_SIM_DT cap: prevents strobing at high sim pace
+    //   • MIN_MOON_SIM_DT floor: prevents apparent freeze at very slow sim pace
+    const effectiveDt =
+      Number.isFinite(simDt) && simDt > 0
+        ? Math.max(MIN_MOON_SIM_DT, Math.min(simDt, MAX_MOON_SIM_DT))
+        : 0;
+    if (effectiveDt > 0) {
+      this.moonElapsed += effectiveDt;
     }
     let planetIdx = 0;
     let cometIdx = 0;
@@ -252,7 +287,7 @@ export class BodyRenderer {
       ];
       const spinRate = buffer[base + BODY_OFFSET.spin] ?? 0;
       seen.add(id);
-      const angle = advanceSpin(this.spinAngles.get(id) ?? 0, spinRate, dt);
+      const angle = advanceSpin(this.spinAngles.get(id) ?? 0, spinRate, effectiveDt);
       this.spinAngles.set(id, angle);
 
       switch (type) {
@@ -277,7 +312,7 @@ export class BodyRenderer {
           const drawn = this.drawnRadius(pos, radius, MIN_BODY_PIXELS);
           planetIdx = this.writePlanet(planetIdx, pos, drawn, angle, look.axialTilt, look.color);
           if (look.hasRings) {
-            ringIdx = this.writeRing(ringIdx, pos, drawn, look.axialTilt);
+            ringIdx = this.writeRing(ringIdx, pos, drawn, look.axialTilt, look.ringProminence);
           }
           const moons = this.writeMoons(moonIdx, orbitIdx, id, look.moonCount, pos, drawn);
           moonIdx = moons.moonIndex;
@@ -295,6 +330,9 @@ export class BodyRenderer {
     this.finalize(this.tails, tailIdx);
     if (this.planets.instanceColor !== null) {
       this.planets.instanceColor.needsUpdate = true;
+    }
+    if (this.rings.instanceColor !== null) {
+      this.rings.instanceColor.needsUpdate = true;
     }
     // Hide any pooled moon-orbit circles left over from a previous frame.
     for (let i = orbitIdx; i < this.moonOrbitPool.length; i += 1) {
@@ -378,8 +416,23 @@ export class BodyRenderer {
     return index + 1;
   }
 
-  /** Write one ring system, lying in its planet's tilted equatorial plane. */
-  private writeRing(index: number, pos: Vec3, drawnRadius: number, axialTilt: number): number {
+  /**
+   * Write one ring system, lying in its planet's tilted equatorial plane.
+   *
+   * `prominence` (0–1) controls the ring's visual weight via per-instance colour:
+   * - 1.0 → full sandy-beige diffuse (gas-giant, Saturn-like)
+   * - 0.3 → heavily dimmed diffuse (ice-giant, Uranus/Neptune-style faint ring)
+   *
+   * The material's emissive component is constant and keeps rings legible at any
+   * angle regardless of prominence, so even faint rings remain visible.
+   */
+  private writeRing(
+    index: number,
+    pos: Vec3,
+    drawnRadius: number,
+    axialTilt: number,
+    prominence: number,
+  ): number {
     if (index >= MAX_RINGS) {
       return index;
     }
@@ -388,6 +441,11 @@ export class BodyRenderer {
     this.dummy.scale.setScalar(drawnRadius);
     this.dummy.updateMatrix();
     this.rings.setMatrixAt(index, this.dummy.matrix);
+    // Scale the warm sandy-beige ring colour by prominence so ice-giant rings read
+    // as faint traces (0x6a5f4a emissive still provides baseline visibility).
+    const p = Math.max(0, Math.min(1, prominence));
+    this.color.setRGB(0.847 * p, 0.788 * p, 0.659 * p);
+    this.rings.setColorAt(index, this.color);
     return index + 1;
   }
 

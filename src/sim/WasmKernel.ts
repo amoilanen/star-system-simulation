@@ -6,17 +6,19 @@
 // zero-copy `Float32Array` views and reconstructs the per-step
 // {@link SimulationEvent}s from the packed `Float64Array` events buffer.
 //
-// Per Decision D2, {@link createKernel} feature-detects WebAssembly and loads
-// the compiled module lazily; if the environment lacks WASM or the module fails
-// to load, it transparently falls back to the pure-TypeScript
-// {@link TsFallbackKernel}. The module import is intentionally dynamic (computed
-// specifier) so the TypeScript build and the test runner never hard-depend on
-// the generated `wasm/pkg/` artifact, which is produced by `npm run wasm:build`.
+// {@link createKernel} loads the compiled module lazily. There is no longer a
+// TypeScript fallback: WebAssembly has been baseline in every target browser
+// since 2017, and the mirrored TS kernel that used to cover its absence cost
+// more (two implementations of every constant and formula, kept in sync by
+// hand) than the vanishing case it insured against. A failure to load now
+// surfaces as an error instead of silently degrading to a second physics model.
+// The module import is intentionally dynamic (computed specifier) so the
+// TypeScript build and the test runner never hard-depend on the generated
+// `wasm/pkg/` artifact, which is produced by `npm run wasm:build`.
 
 import { LifecycleStage, RemnantType } from '../config/fateModel';
 import { createEvent, SimEventType, type SimulationEvent } from './events';
 import { BodyType, type KernelInit, type PhysicsKernel, type StepResult } from './PhysicsKernel';
-import { TsFallbackKernel } from './TsFallbackKernel';
 
 /** The subset of the generated `Kernel` class this wrapper drives. */
 export interface WasmKernelHandle {
@@ -31,6 +33,7 @@ export interface WasmKernelHandle {
   stage_progress(): number;
   elapsed_sim_seconds(): number;
   star_mass_solar(): number;
+  orbital_mu(): number;
   free(): void;
 }
 
@@ -46,13 +49,16 @@ export interface WasmModule {
     particleCount: number,
   ) => WasmKernelHandle;
   wasm_memory(): WebAssembly.Memory;
+  /** Gravitational softening length the kernel integrates with (scene units). */
+  softening(): number;
+  /** The disc's snow line in AU, as the kernel defines it. */
+  snow_line_au(): number;
   default: (initInput?: unknown) => Promise<unknown>;
 }
 
 /**
  * {@link PhysicsKernel} backed by the Rust/WASM module. Construct with an
- * already-initialized {@link WasmModule} (see {@link loadWasmModule}), then use
- * exactly like the fallback kernel.
+ * already-initialized {@link WasmModule} (see {@link loadWasmModule}).
  */
 export class WasmKernel implements PhysicsKernel {
   private handle: WasmKernelHandle | null = null;
@@ -94,6 +100,10 @@ export class WasmKernel implements PhysicsKernel {
   getBodyBuffer(): Float32Array {
     const handle = this.requireHandle();
     return new Float32Array(this.buffer(), handle.body_ptr(), handle.body_len());
+  }
+
+  orbitalMu(): number {
+    return this.requireHandle().orbital_mu();
   }
 
   dispose(): void {
@@ -198,20 +208,24 @@ export async function loadWasmModule(initInput?: unknown): Promise<WasmModule> {
 }
 
 /**
- * Create the best available {@link PhysicsKernel} (Decision D2): the Rust/WASM
- * kernel when WebAssembly is present and the module loads, otherwise the
- * pure-TypeScript {@link TsFallbackKernel}. Never throws.
+ * Create the {@link PhysicsKernel} — the Rust/WASM module, which is the only
+ * physics implementation.
+ *
+ * Unlike the previous version this THROWS rather than silently substituting a
+ * second implementation. Both failure modes it can hit are deployment faults,
+ * not user environments: a runtime without WebAssembly (none of the supported
+ * browsers since 2017) or a `wasm/pkg` artifact that failed to load (in which
+ * case the JS bundle referencing it is broken too). Failing loudly makes those
+ * faults visible instead of quietly changing which physics the user is watching.
  */
 export async function createKernel(): Promise<PhysicsKernel> {
   if (!isWasmSupported()) {
-    return new TsFallbackKernel();
+    throw new Error(
+      'WebAssembly is not available in this runtime; the simulation kernel cannot start.',
+    );
   }
-  try {
-    const mod = await loadWasmModule();
-    return new WasmKernel(mod);
-  } catch {
-    return new TsFallbackKernel();
-  }
+  const mod = await loadWasmModule();
+  return new WasmKernel(mod);
 }
 
 /** Feature-detect a usable WebAssembly runtime. */

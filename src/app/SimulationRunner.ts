@@ -24,7 +24,6 @@ import type { SimulationEvent } from '../sim/events';
 import { BODY_STRIDE, PARTICLE_STRIDE, type PhysicsKernel } from '../sim/PhysicsKernel';
 import { StateHistory } from '../sim/StateHistory';
 import { stellarMassFromCloud } from '../config/starFormation';
-import { orbitalMu } from '../sim/TsFallbackKernel';
 import type { RenderState } from '../render/SceneManager';
 
 /** Default dust-particle count requested from the kernel (kernel may cap it). */
@@ -180,6 +179,10 @@ export class SimulationRunner {
     this.elapsed = elapsedSimSeconds;
     this.starMass = Number.isFinite(starMassSolar) ? starMassSolar : this.stellarMass;
     const state = this.buildState(stage);
+    // Attach the sim-time delta to the render state so the body renderer can
+    // drive moon orbital motion and axial spin from sim time (spec §3.4).
+    // 0 when paused (clock.advance returns 0); absent on history-replay frames.
+    state.simDt = simDt;
     this.maybeRecord(dt, state);
     return { state, events, elapsed: this.elapsed, fromHistory: false };
   }
@@ -277,7 +280,9 @@ export class SimulationRunner {
       // Let the renderer freeze its time-driven effects in step with the sim.
       paused: this.clock.paused,
       composition: this.config.composition,
-      mu: orbitalMu(this.config.mass),
+      // Read from the kernel, which owns the constant — the host deliberately
+      // keeps no copy of the simulation's gravitational parameter.
+      mu: this.kernel.orbitalMu(),
       remnant: stage === LifecycleStage.Remnant ? this.remnantType : null,
       supernova: this.supernova,
     };
@@ -288,12 +293,23 @@ export class SimulationRunner {
  * Deep-copy a {@link RenderState} for history recording. The particle/body
  * buffers are (for the WASM kernel) live views into linear memory that mutate
  * every step, so they MUST be copied out; the scalar fields are copied by value.
+ *
+ * `simDt` is a per-frame delta (not a state snapshot) and must NOT be copied
+ * into history so that replay frames always expose `simDt` as *absent* (not
+ * even `undefined`), which the renderer treats as 0 — moons and spin stay
+ * frozen while scrubbing (§3.4).
+ *
+ * Under `exactOptionalPropertyTypes` the only way to guarantee absence is to
+ * destructure `simDt` out before spreading the rest.
  */
 function cloneRenderState(state: RenderState): RenderState {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { simDt: _simDt, ...rest } = state;
   return {
-    ...state,
+    ...rest,
     particles: state.particles.slice(0, state.particleCount * PARTICLE_STRIDE),
     bodies: state.bodies.slice(0, state.bodyCount * BODY_STRIDE),
     composition: { ...state.composition },
+    // simDt intentionally absent — never persisted in history snapshots
   };
 }
