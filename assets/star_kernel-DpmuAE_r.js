@@ -57,7 +57,7 @@ export class Kernel {
         return ret >>> 0;
     }
     /**
-     * (Re)initialize the kernel for a run (mirror of `TsFallbackKernel.init`).
+     * (Re)initialize the kernel for a run (the `PhysicsKernel.init` contract).
      * @param {number} mass
      * @param {number} cloud_extent
      * @param {number} pace
@@ -71,6 +71,21 @@ export class Kernel {
         this.__wbg_ptr = ret;
         KernelFinalization.register(this, this.__wbg_ptr, this);
         return this;
+    }
+    /**
+     * The central gravitational parameter this kernel is actually integrating
+     * against.
+     *
+     * Exported so the renderer can reconstruct exactly the Kepler conics the
+     * bodies are following (the orbit-path overlay). The kernel is the single
+     * source of truth for it: the host used to recompute `mu` itself from
+     * duplicated `GRAVITY` / `ORBITAL_MASS_SCALE` constants, which was one more
+     * thing that had to be kept in sync by hand.
+     * @returns {number}
+     */
+    orbital_mu() {
+        const ret = wasm.kernel_orbital_mu(this.__wbg_ptr);
+        return ret;
     }
     /**
      * Length (in f32 lanes) of the particle buffer.
@@ -117,8 +132,8 @@ export class Kernel {
     }
     /**
      * Advance the simulation by `dt_sim_seconds`, returning the number of events
-     * emitted this step (packed into the events buffer). Mirror of
-     * `TsFallbackKernel.step`.
+     * emitted this step (packed into the events buffer) — the
+     * `PhysicsKernel.step` contract.
      * @param {number} dt_sim_seconds
      * @returns {number}
      */
@@ -137,6 +152,33 @@ if (Symbol.dispose) Kernel.prototype[Symbol.dispose] = Kernel.prototype.free;
 export function kernel_version() {
     const ret = wasm.kernel_version();
     return ret >>> 0;
+}
+
+/**
+ * The disc's snow line, in AU: the distance beyond which ices condense and
+ * accretion becomes far more productive. Exported so hosts and tests describe
+ * the disc's zones with the kernel's value rather than a copy of it.
+ * @returns {number}
+ */
+export function snow_line_au() {
+    const ret = wasm.snow_line_au();
+    return ret;
+}
+
+/**
+ * The gravitational softening length the kernel integrates with, in scene
+ * units (= AU).
+ *
+ * Exported because a host that wants to reproduce the kernel's own notion of
+ * "is this body bound?" must use the SAME softened potential
+ * `-mu / sqrt(r² + softening²)`. Re-declaring the constant host-side would let
+ * the two drift apart silently, which is exactly what the removal of the
+ * mirrored TypeScript kernel was meant to prevent.
+ * @returns {number}
+ */
+export function softening() {
+    const ret = wasm.softening();
+    return ret;
 }
 
 /**
