@@ -6,8 +6,8 @@
 // intensity) are derived here from the lifecycle stage, cloud mass and the
 // selected remnant. StarRenderer feeds these into its GLSL uniforms.
 
-import { LifecycleStage, RemnantType } from '../config/fateModel';
-import { DEATH_PHASES } from '../sim/stages';
+import { FATE_THRESHOLDS, LifecycleStage, RemnantType } from '../config/fateModel';
+import { DEATH_PHASES, NEBULA_PHASES } from '../sim/stages';
 import type { CloudComposition } from '../config/SimulationConfig';
 import { SOLAR_RADIUS_AU, stellarRadiusSolar } from '../sim/astro';
 
@@ -192,9 +192,40 @@ export function mainSequenceTemperature(mass: number): number {
 }
 
 /**
+ * Zero-age main-sequence radius in scene units (AU) at TRUE physical scale and
+ * with NO clamp: `SOLAR_RADIUS_AU · M^0.8` (reusing `stellarRadiusSolar` from
+ * astro.ts). 0.00465 AU for the Sun.
+ *
+ * This — not the clamped {@link mainSequenceRadius} — is the base every SWOLLEN
+ * stage (protostar, red giant, fireball, planetary nebula) is derived from.
+ * Multiplying the *clamped* radius by the swell factors is what drew a 20 M☉
+ * protostar 10.75 AU across (0.05 × 215) and put every planet the kernel had
+ * just seeded at 1–7 AU inside the star (reported bugs 3 and 6): the clamp
+ * raises a massive star's base radius by up to 20× relative to its true value,
+ * and the swell factor then multiplies that error.
+ */
+export function trueStellarRadius(mass: number): number {
+  return SOLAR_RADIUS_AU * stellarRadiusSolar(Math.max(mass, 1e-3));
+}
+
+/**
+ * Lower floor on every DRAWN stellar radius, in scene units (AU): one Jupiter
+ * radius, ≈ 70 000 km ≈ 5e-4 AU.
+ *
+ * Deliberately EQUAL to {@link BROWN_DWARF_RADIUS}. Electron degeneracy holds
+ * every object between a few Jupiter masses and the hydrogen-burning limit at
+ * roughly one Jupiter radius, so a 0.079 M☉ brown dwarf and a 0.081 M☉ red dwarf
+ * are very nearly the same size in reality. When this floor sat ABOVE the
+ * brown-dwarf radius, {@link companionAppearance} made a companion DOUBLE in
+ * drawn size in the single frame it crossed the burning limit in; with the two
+ * equal, the handover is the ~20 % step the physics actually has.
+ */
+export const MIN_DRAWN_STELLAR_RADIUS = 5e-4;
+
+/**
  * Base scene radius (scene units = AU) of a main-sequence star from its mass,
- * at TRUE physical scale: `SOLAR_RADIUS_AU · M^0.8` (reusing
- * `stellarRadiusSolar` from astro.ts).
+ * as DRAWN: {@link trueStellarRadius} clamped to
+ * {@link MIN_DRAWN_STELLAR_RADIUS}–0.05 AU.
  *
  * The Sun's radius is 0.00465 AU — a ratio of ~215:1 against a 1 AU orbit.
  * At system-framing distances the star is sub-pixel, which is why
@@ -202,24 +233,145 @@ export function mainSequenceTemperature(mass: number): number {
  * trick Celestia / NASA's Eyes use). That floor keeps it readable WITHOUT
  * inflating the physical radius, so zoomed-in proportions are correct.
  *
- * Clamped 0.001–0.05 AU: below the lower end the float math loses precision;
- * above the upper end the star fills the inner system regardless of the pixel
- * floor (an extreme-mass "star" would exceed the clamp anyway).
+ * Clamped: below the lower end the float math loses precision; above the upper
+ * end the star fills the inner system regardless of the pixel floor (an
+ * extreme-mass "star" would exceed the clamp anyway). Its influence is now
+ * confined to the COMPACT stages: nothing multiplies it by more than the
+ * ×1.5 of {@link ignitionRadius}, so the clamp can no longer be amplified into
+ * an AU-scale error the way the ×215/×250/×350 swells amplified it.
  */
 export function mainSequenceRadius(mass: number): number {
-  const m = Math.max(mass, 1e-3);
-  return clamp(SOLAR_RADIUS_AU * stellarRadiusSolar(m), 0.001, 0.05);
+  return clamp(trueStellarRadius(mass), MIN_DRAWN_STELLAR_RADIUS, 0.05);
 }
 
 /**
- * How many times its main-sequence radius the star swells as a red giant.
+ * Red-giant photospheric reach in scene units (AU) for a 1 M☉ star — mirror of
+ * `REDGIANT_ENGULF_AU` in `wasm/src/lib.rs`. Inside this radius the KERNEL
+ * destroys worlds, so it is the one radius the drawn star is allowed to reach:
+ * anything larger would swallow a planet the physics has kept alive.
+ */
+export const REDGIANT_ENGULF_AU = 2.2;
+
+/**
+ * The kernel's engulf radius for a star of `mass` (scene units) — mirror of
+ * `Kernel::photosphere_radius`'s red-giant value, `REDGIANT_ENGULF_AU · M^0.8`
+ * with the same `max(M, 0.1)` floor.
+ *
+ * Hard invariant, asserted in `test/render/starVisual.test.ts`: for EVERY stage
+ * and EVERY mass, `starAppearance(...).radius <= engulfRadius(mass)`. The drawn
+ * photosphere may never enclose an orbit the kernel has not already cleared.
+ */
+export function engulfRadius(mass: number): number {
+  return REDGIANT_ENGULF_AU * Math.pow(Math.max(mass, 0.1), 0.8);
+}
+
+/**
+ * How many times its TRUE main-sequence radius the star swells as a red giant.
  * The Sun expands to ~250 R☉ ≈ 1.16 AU at its tip-of-the-red-giant-branch peak
- * — a true factor of ~250. At 1 M☉: `0.00465 · 250 ≈ 1.16 AU`, well inside
- * `REDGIANT_ENGULF_AU = 2.2 AU` (the kernel's destruction radius), so no
- * planet can survive inside the photosphere that the kernel has not already
- * consumed. More massive giants swell proportionally larger.
+ * — a true factor of ~250. At 1 M☉: `0.00465 · 250 ≈ 1.16 AU`, i.e. 53 % of
+ * `REDGIANT_ENGULF_AU = 2.2 AU` (the kernel's destruction radius) — and because
+ * both scale as `M^0.8` that 53 % holds at EVERY mass, so no planet can survive
+ * inside the drawn photosphere that the kernel has not already consumed.
  */
 export const RED_GIANT_SWELL = 250;
+
+/**
+ * Radius (scene units) of the fully swollen red-giant photosphere: the shared
+ * base of the red giant, the imploding core, the supernova fireball and the
+ * planetary-nebula envelope, so all four are on one continuous scale.
+ */
+export function giantPhotosphereRadius(mass: number): number {
+  return trueStellarRadius(mass) * RED_GIANT_SWELL;
+}
+
+/**
+ * Radius the star has contracted to when hydrogen ignites, as a multiple of the
+ * radius it settles at: still ~1.5× oversized, matching
+ * `stellarRadiusForStageSolar`'s `FusionIgnition` value in `./src/sim/astro.ts`.
+ */
+export const IGNITION_SWELL = 1.5;
+
+/**
+ * Radius (scene units) at hydrogen ignition — where the protostar hands over to
+ * `FusionIgnition`, which then contracts to the main sequence.
+ *
+ * Taken from the DRAWN {@link mainSequenceRadius} rather than the true one so the
+ * contraction always ends exactly on the radius the main sequence is drawn at,
+ * even for the very low masses the drawn radius floors at 0.001 AU. The ×1.5 is
+ * far too small for the clamp to distort anything — it is the ×250/×350 swells
+ * that had to be moved off the clamped radius.
+ */
+export function ignitionRadius(mass: number): number {
+  return mainSequenceRadius(mass) * IGNITION_SWELL;
+}
+
+/**
+ * Protostellar radius in SOLAR radii at the birthline, `4 · M^0.5` — the
+ * Hayashi-track radius `stellarRadiusForStageSolar` already uses for the
+ * protostar stage. A 1 M☉ protostar is ~4 R☉ ≈ 0.019 AU: four times the Sun,
+ * NOT the ~1 AU the old flat ×215 on a clamped radius produced.
+ */
+export const PROTOSTAR_HAYASHI_SOLAR_RADII = 4;
+
+/**
+ * Radius (scene units) of a contracting protostar at the START of
+ * `ProtostarCoalescence`, from the physical Hayashi-track radius
+ * (`4 R☉ · M^0.5`) rather than a flat multiple of the clamped main-sequence
+ * radius.
+ *
+ * Floored just above {@link ignitionRadius} so the star always CONTRACTS
+ * through the stage: the Hayashi radius grows only as `M^0.5` while the ignition
+ * radius grows as `M^0.8`, so at the top of the mass range a raw Hayashi radius
+ * would make the protostar SMALLER than the star it becomes.
+ */
+export function protostarRadius(mass: number): number {
+  const m = Math.max(mass, 1e-3);
+  const hayashi = SOLAR_RADIUS_AU * PROTOSTAR_HAYASHI_SOLAR_RADII * Math.sqrt(m);
+  return Math.max(hayashi, ignitionRadius(m) * 1.15);
+}
+
+/**
+ * Size of the glow halo as a multiple of the drawn star radius: a fixed base
+ * plus the star's `glow`, itself capped so the halo's AREA stops responding to a
+ * supernova's ×14 luminosity spike. Past that the spike is spent on brightness
+ * (see {@link coronaIntensity}) and on `StarRenderer`'s viewport-relative size
+ * cap, never on more of the screen.
+ */
+export const CORONA_BASE_SWELL = 3.5;
+export const CORONA_GLOW_SWELL_CAP = 4;
+
+/**
+ * World-space radius (scene units) the additive glow halo wants for a star of
+ * drawn radius `starRadius` and the given `glow`. `StarRenderer` then floors AND
+ * caps its APPARENT size — this is only the physical size it asks for. Pure.
+ */
+export function coronaRadius(starRadius: number, glow: number): number {
+  const g = clamp(glow, 0, CORONA_GLOW_SWELL_CAP);
+  return Math.max(starRadius, 0) * (CORONA_BASE_SWELL + g);
+}
+
+/**
+ * Hard ceiling on the halo's brightness. The corona is an additive quad, so its
+ * contribution to the frame is `intensity × area`: once the area is capped this
+ * is the only thing left that can grow, and it too has to stop somewhere.
+ */
+export const MAX_CORONA_INTENSITY = 1.6;
+
+/**
+ * Brightness the glow halo is drawn at, for a star of the given `glow` whose
+ * apparent size was held back by a factor of `sizeOverflow` (1 = it fitted).
+ *
+ * Everything the halo cannot express as AREA it expresses as BRIGHTNESS: the
+ * `glow` above {@link CORONA_GLOW_SWELL_CAP} that no longer swells it, and the
+ * viewport cap `StarRenderer` applied on top. An ordinary star (`glow ≈ 1`,
+ * uncapped) is unchanged at 0.6; a supernova's ×14 breakout spike reaches the
+ * ceiling instead of reaching across the screen. Pure.
+ */
+export function coronaIntensity(glow: number, sizeOverflow = 1): number {
+  const base = Math.min(1, 0.35 + Math.max(glow, 0) * 0.25);
+  const beyondSwellCap = 1 + 0.06 * Math.max(0, glow - CORONA_GLOW_SWELL_CAP);
+  return clamp(base * beyondSwellCap * Math.max(sizeOverflow, 1), 0, MAX_CORONA_INTENSITY);
+}
 
 /**
  * True physical radius of a white dwarf, in scene units (AU). White dwarfs are
@@ -251,10 +403,11 @@ export const BLACK_HOLE_RADIUS = 1e-5;
  * True physical radius of a brown dwarf, in scene units (AU). Electron
  * degeneracy keeps every brown dwarf at roughly one Jupiter radius regardless
  * of mass: R_BD ≈ 70 000 km ≈ 5e-4 AU. Drawn at true scale: noticeably
- * larger than a white dwarf (4.3e-5 AU), yet clearly smaller than even the
- * faintest true star (≥ 0.001 AU after clamping).
+ * larger than a white dwarf (4.3e-5 AU), and — because it IS the drawn floor
+ * ({@link MIN_DRAWN_STELLAR_RADIUS}) — continuous with the faintest true star
+ * across the hydrogen-burning limit rather than half its size.
  */
-export const BROWN_DWARF_RADIUS = 5e-4;
+export const BROWN_DWARF_RADIUS = MIN_DRAWN_STELLAR_RADIUS;
 
 /**
  * Effective temperature of a brown dwarf, in Kelvin. L/T dwarfs sit at roughly
@@ -262,6 +415,83 @@ export const BROWN_DWARF_RADIUS = 5e-4;
  * they glow a dull red rather than shining.
  */
 export const BROWN_DWARF_TEMPERATURE_K = 1800;
+
+/**
+ * Ceiling on a COMPANION's corona/glow multiplier. The primary sits at
+ * `glow = 1` on the main sequence, and a companion may genuinely outshine it —
+ * but the halo is an additive billboard, so its growth has to stop well before
+ * it can wash the frame (reported bug 6). Everything above the cap is expressed
+ * as the companion's colour temperature, not as more screen area.
+ */
+export const MAX_COMPANION_GLOW = 1.6;
+
+/** Floor on a companion STAR's glow, so the faintest red dwarf still reads. */
+export const MIN_COMPANION_GLOW = 0.35;
+
+/** Glow multiplier of a brown-dwarf companion: barely more than a dark ember. */
+export const BROWN_DWARF_GLOW = 0.12;
+
+/** Visual parameters for one self-luminous companion in the body buffer. */
+export interface CompanionAppearance {
+  /** True for a hydrogen-fusing star, false for a deuterium-only brown dwarf. */
+  star: boolean;
+  /** Effective surface temperature in Kelvin. */
+  temperatureK: number;
+  /** Blackbody colour at {@link CompanionAppearance.temperatureK}. */
+  color: Rgb;
+  /** Photospheric radius in scene units (AU), at true physical scale. */
+  radius: number;
+  /** Corona/glow multiplier, on the same scale as {@link StarAppearance.glow}. */
+  glow: number;
+  /**
+   * Brightness the drawn disc is tinted to. Below 1 for the same reason the
+   * primary's is: the ACES tone-map desaturates anything near white, and a
+   * companion that reads as a white ball has lost the one cue — its colour —
+   * that says how massive it is.
+   */
+  surfaceLum: number;
+}
+
+/**
+ * Appearance of a self-luminous COMPANION of `massSolar` — a second star or a
+ * brown dwarf the kernel seeded and typed by its own mass (spec §4.2, §4.7).
+ *
+ * The primary is not in the body buffer, so it has {@link starAppearance} and a
+ * whole lifecycle; a companion is just a mass in the buffer, and this is the
+ * whole of its look. Everything comes from the same physics the primary uses:
+ * {@link mainSequenceTemperature} for the temperature, {@link blackbodyColor}
+ * for the hue and {@link mainSequenceRadius} for the size — so a 2 M☉ companion
+ * is drawn as the blue-white star it is instead of as the ringed gas giant a
+ * mass-blind renderer made of it (reported bugs 1 and 2).
+ *
+ * `glow` follows `M^0.5` rather than the true `M^3.5` luminosity law: the halo
+ * only has to ORDER companions by mass, and the real law's ×100 dynamic range is
+ * exactly what turned an additive billboard into a wall of light. Pure.
+ */
+export function companionAppearance(massSolar: number): CompanionAppearance {
+  const mass = Number.isFinite(massSolar) ? Math.max(massSolar, 0) : 0;
+  const star = mass >= FATE_THRESHOLDS.hydrogenBurningMinMass;
+  if (!star) {
+    return {
+      star: false,
+      temperatureK: BROWN_DWARF_TEMPERATURE_K,
+      color: blackbodyColor(BROWN_DWARF_TEMPERATURE_K),
+      radius: BROWN_DWARF_RADIUS,
+      glow: BROWN_DWARF_GLOW,
+      // Dull and deep red: a brown dwarf radiates mostly in the infrared.
+      surfaceLum: 0.35,
+    };
+  }
+  const temperatureK = mainSequenceTemperature(mass);
+  return {
+    star: true,
+    temperatureK,
+    color: blackbodyColor(temperatureK),
+    radius: mainSequenceRadius(mass),
+    glow: clamp(Math.sqrt(mass), MIN_COMPANION_GLOW, MAX_COMPANION_GLOW),
+    surfaceLum: 0.7,
+  };
+}
 
 /**
  * Composition-driven temperature multiplier (illustrative). Metal-rich gas is
@@ -320,16 +550,19 @@ export function starAppearance(
       return HIDDEN_STAR;
 
     case LifecycleStage.ProtostarCoalescence: {
-      // A cool, dim, contracting protostar warming from ~1200 K toward ~2800 K.
-      // Protostars are genuinely ~AU scale in reality before they settle onto
-      // the main sequence.  With true-scale msRadius (~0.00465 AU for 1 M☉)
-      // the old ×6 factor gave only 0.03 AU — a pixel.  We now use ×215 at
-      // the start (~1 AU for a solar star) shrinking to ×108 at the end
-      // (~0.5 AU), which hands off seamlessly to FusionIgnition's own contraction
-      // (see below).  Both factors scale the true-scale radius, so massive
-      // protostars (msRadius ≈ 0.038 AU at 14 M☉) are correctly larger (~8 AU).
+      // A cool, dim, contracting protostar warming from ~1200 K toward ~2800 K,
+      // drawn at its PHYSICAL Hayashi-track radius (~4 R☉ ≈ 0.019 AU for 1 M☉)
+      // and contracting to the ignition radius, which `FusionIgnition` picks up.
+      //
+      // It used to be drawn at ×215 the CLAMPED main-sequence radius — ~1 AU for
+      // a solar star and 10.75 AU for a 20 M☉ one, which swallowed every
+      // planetesimal the kernel seeds at this very stage (1–7 AU) and made the
+      // surviving worlds look as if they hugged the star (reported bugs 3 and 6).
+      // Legibility is the pixel FLOOR's job (`MIN_STAR_PIXELS`), not the physical
+      // radius's — that is the whole point of having a floor.
       const temperatureK = 1200 + 1600 * p;
-      const radius = msRadius * (215 - 107 * p);
+      const start = protostarRadius(mass);
+      const radius = start + (ignitionRadius(mass) - start) * p;
       return {
         visible: true,
         temperatureK,
@@ -348,11 +581,12 @@ export function starAppearance(
     case LifecycleStage.FusionIgnition: {
       // Ignition flash: temperature ramps sharply to the main-sequence value
       // while the star contracts.  Radius starts at the ProtostarCoalescence
-      // end value (×108 msRadius ≈ 0.5 AU for 1 M☉) and contracts to true
-      // main-sequence radius by p=1 — a seamless continuation of the
+      // end value (`ignitionRadius`, 1.5× the ZAMS radius) and contracts to the
+      // drawn main-sequence radius by p=1 — a seamless continuation of the
       // Kelvin-Helmholtz shrinkage that ends with hydrogen ignition.
       const temperatureK = 2800 + (msTemp - 2800) * p;
-      const radius = msRadius * (108 - 107 * p);
+      const start = ignitionRadius(mass);
+      const radius = start + (msRadius - start) * p;
       return {
         visible: true,
         temperatureK,
@@ -394,7 +628,10 @@ export function starAppearance(
       // most of the stage rather than only at the very end.
       const cool = Math.sqrt(p);
       const temperatureK = msTemp + (3100 - msTemp) * cool;
-      const radius = msRadius * (1 + (RED_GIANT_SWELL - 1) * p);
+      // Swells from the drawn main-sequence radius to the giant photosphere,
+      // which is derived from the TRUE (unclamped) radius — see
+      // `giantPhotosphereRadius`.
+      const radius = msRadius + (giantPhotosphereRadius(mass) - msRadius) * p;
       return {
         visible: true,
         temperatureK,
@@ -415,7 +652,11 @@ export function starAppearance(
       return deathAppearance(mass, p, supernova, composition, systemScale);
 
     case LifecycleStage.Remnant:
-      return remnantAppearance(remnant);
+      // `progress` here is the NEBULA's own clock (the kernel reports the
+      // remnant stage's progress as how far the shell has dispersed), so the
+      // compact object is drawn inside a shell that goes on expanding and fading
+      // instead of appearing alone against an empty sky.
+      return remnantAppearance(remnant, p, systemScale, supernova);
 
     default:
       return HIDDEN_STAR;
@@ -424,22 +665,75 @@ export function starAppearance(
 
 /**
  * How far the supernova fireball's photosphere expands, as a multiple of the
- * star's (true-scale) main-sequence radius. With `mainSequenceRadius` now at
- * physical scale (~0.037 AU for a 14 M☉ progenitor), this factor is set so
- * the fireball peaks at ~10 AU — visibly dwarfing the system's inner planets
- * while remaining a bounded sphere that does not swamp the camera. The
- * transparent BLAST SHELL driven by `SHOCKWAVE_REACH` sweeps far beyond it.
+ * star's TRUE (unclamped) main-sequence radius — see {@link trueStellarRadius}.
+ *
+ * Reconsidered against the same bound as every other swollen stage: the fireball
+ * peaks at `≈ 349 · SOLAR_RADIUS_AU · M^0.8 = 1.62 · M^0.8` scene units, i.e.
+ * 74 % of {@link engulfRadius}, at every mass. That is a bright ball visibly
+ * dwarfing the inner system yet still inside the volume the kernel has already
+ * cleared — where it used to be computed off the CLAMPED radius, which turned a
+ * 20 M☉ progenitor's fireball into a 17.5 AU sphere with a 262 AU corona quad
+ * in front of it (the reported screen-filling white-out). The transparent BLAST
+ * SHELL driven by `SHELL_STALL_REACH` still sweeps far beyond it.
  */
 export const FIREBALL_SWELL = 350;
 
 /**
- * How far the BLAST SHELL reaches by the end of the death stage, as a fraction
- * of the birth cloud's radius — matched to the distance the kernel's ejecta
- * particles actually cover in that time, so the drawn shock front and the real
- * expanding debris move together. The shell keeps going afterwards; from the
- * remnant stage on, the particles alone carry it.
+ * Radius at which the expanding shell finally STALLS, as a fraction of the birth
+ * cloud's radius. Mirror of `EJECTA_STALL_REACH_*` in `wasm/src/lib.rs`.
+ *
+ * A real remnant does not coast forever: it sweeps up the interstellar medium,
+ * decelerates and settles at a fixed radius, where it fades. The kernel
+ * integrates exactly that, and the drawn shock front has to be the same shell as
+ * the particles — so both use the same stall radius and the same sweep law.
  */
-export const SHOCKWAVE_REACH = { supernova: 3.3, nebula: 1.3 } as const;
+export const SHELL_STALL_REACH = { supernova: 1.5, nebula: 1.4 } as const;
+
+/**
+ * How far through that deceleration the shell is when the remnant appears, and
+ * when the nebula has finally faded — see {@link NEBULA_PHASES}, which owns both
+ * numbers because the kernel mirrors them.
+ *
+ * `deathSweep = 0.6` puts the shell edge at ~45 % of its stall radius: 0.6–1.1
+ * cloud radii, still comfortably inside the framed system. The shell used to be
+ * sized to cover 3.3 cloud radii by the same moment (165 AU for a 50 AU cloud,
+ * against a view about 62 AU high), so the nebula was already off-screen before
+ * it could be seen at all.
+ */
+export const DEATH_SWEEP = NEBULA_PHASES.deathSweep;
+/** How far it has swept once the nebula has faded out entirely. */
+export const REMNANT_SWEEP = NEBULA_PHASES.remnantSweep;
+
+/**
+ * Radius (scene units) of the decelerating shell after the given sweep, around a
+ * system of cloud radius `scale`. Pure; the single law both the death stage and
+ * the remnant stage draw the shell with, which is what makes the handover
+ * between them seamless.
+ */
+export function shellRadius(supernova: boolean, sweep: number, scale: number): number {
+  const stall = supernova ? SHELL_STALL_REACH.supernova : SHELL_STALL_REACH.nebula;
+  return Math.max(scale, 1) * stall * (1 - Math.exp(-Math.max(sweep, 0)));
+}
+
+/**
+ * Brightness the shell still carries at the moment the remnant appears — the
+ * value the death stage fades DOWN to and the remnant stage fades on FROM.
+ *
+ * It used to fade to exactly zero at the end of the death stage while
+ * `remnantAppearance` carried `...NO_BLAST`, so from the remnant on there was no
+ * drawn nebula at all: "there is no nebula, only the small star remnant".
+ */
+export const NEBULA_HANDOVER_BRIGHTNESS = 0.35;
+
+/**
+ * Colour temperature (K) of the shell at that same moment: gas ionised by the
+ * ferociously hot exposed core reads blue-white. Both death channels end here,
+ * so the handover has no colour step either.
+ */
+export const NEBULA_IONISED_K = 13000;
+
+/** …and the cooled, recombining colour the nebula has faded to by the end. */
+export const NEBULA_COOL_K = 3600;
 
 /** Cloud radius (scene units) assumed when the caller does not supply one. */
 export const DEFAULT_SYSTEM_SCALE = 50;
@@ -476,14 +770,17 @@ export function deathAppearance(
   systemScale = DEFAULT_SYSTEM_SCALE,
 ): StarAppearance {
   const p = clamp(progress, 0, 1);
-  const msRadius = mainSequenceRadius(mass);
+  // Every swollen radius here is derived from the TRUE (unclamped) radius, so a
+  // massive progenitor's fireball stays in proportion instead of being inflated
+  // by the drawn radius's 0.05 AU clamp.
+  const trueRadius = trueStellarRadius(mass);
   const msTemp = mainSequenceTemperature(mass) * compositionTempFactor(composition);
-  const giantRadius = msRadius * RED_GIANT_SWELL;
+  const giantRadius = giantPhotosphereRadius(mass);
   const scale = Math.max(systemScale, 1);
   const { shockBreakout, peakLuminosity } = DEATH_PHASES;
 
   if (!supernova) {
-    return planetaryNebulaAppearance(msRadius, giantRadius, p, scale);
+    return planetaryNebulaAppearance(giantRadius, p, scale);
   }
 
   if (p < shockBreakout) {
@@ -515,7 +812,7 @@ export function deathAppearance(
   // the shrinking star never has to jump discontinuously to the compact object.
   const expansion = 1 - Math.exp(-6 * q);
   const receding = q <= peakQ ? 0 : Math.pow((q - peakQ) / (1 - peakQ), 1.5);
-  const fireball = msRadius * (0.18 + FIREBALL_SWELL * expansion);
+  const fireball = trueRadius * (0.18 + FIREBALL_SWELL * expansion);
   const radius = Math.max(NEUTRON_STAR_RADIUS, fireball * (1 - 0.995 * receding));
 
   // Cools from the breakout flash through white and into the orange of an
@@ -532,7 +829,13 @@ export function deathAppearance(
   const spike = Math.exp(-Math.pow(q / 0.06, 2)); // the breakout flash itself
   const luminosity = rise * decay;
 
-  const shellColorK = clamp(BREAKOUT_TEMPERATURE_K * (1 - 0.8 * q) + 5000, 5000, 40000);
+  // Cools from the breakout flash to `NEBULA_IONISED_K`, which is exactly where
+  // the remnant stage's nebula picks the colour up.
+  const shellColorK = clamp(
+    BREAKOUT_TEMPERATURE_K * (1 - 0.8 * q) + NEBULA_IONISED_K - 0.2 * BREAKOUT_TEMPERATURE_K,
+    NEBULA_IONISED_K,
+    BREAKOUT_TEMPERATURE_K,
+  );
   return {
     visible: true,
     temperatureK,
@@ -549,11 +852,12 @@ export function deathAppearance(
     surfaceDetail: 0.15,
     magnetosphere: false,
     blackHole: false,
-    // The shell keeps expanding and fading for the whole sequence, reaching zero
-    // exactly as the stage ends: from there the ejecta PARTICLES the kernel
-    // integrates are the visible remnant shell, so the handover has no seam.
-    shockwave: clamp(0.35 + 0.65 * decay, 0, 1) * (1 - Math.pow(q, 3)),
-    shockwaveRadius: msRadius + scale * SHOCKWAVE_REACH.supernova * Math.pow(q, 0.85),
+    // The shell keeps expanding and fading for the whole sequence, and is handed
+    // over — still lit, still expanding — to `remnantAppearance`'s nebula, which
+    // continues it. It used to fade to exactly zero here while the remnant drew
+    // no shell at all, which is why the remnant stage had no nebula in it.
+    shockwave: clamp(NEBULA_HANDOVER_BRIGHTNESS + 0.65 * decay, 0, 1),
+    shockwaveRadius: shellRadius(true, DEATH_SWEEP * q, scale),
     shockwaveColor: blackbodyColor(shellColorK),
   };
 }
@@ -563,12 +867,7 @@ export function deathAppearance(
  * nebula and the exposed core — one of the hottest objects in the universe at
  * ~100 000 K — lights it up from inside before cooling into a white dwarf.
  */
-function planetaryNebulaAppearance(
-  msRadius: number,
-  giantRadius: number,
-  p: number,
-  scale: number,
-): StarAppearance {
+function planetaryNebulaAppearance(giantRadius: number, p: number, scale: number): StarAppearance {
   const SHED_END = 0.55;
   if (p < SHED_END) {
     // Pulsating, cooling envelope slowly being pushed away by radiation pressure.
@@ -585,9 +884,10 @@ function planetaryNebulaAppearance(
       surfaceDetail: 1,
       magnetosphere: false,
       blackHole: false,
-      // A slow, gentle shell rather than a blast wave.
+      // A slow, gentle shell rather than a blast wave — and it is drawn with the
+      // same decelerating law as everything else, so it hands straight over.
       shockwave: 0.45 * k,
-      shockwaveRadius: msRadius + scale * SHOCKWAVE_REACH.nebula * 0.45 * Math.pow(k, 0.85),
+      shockwaveRadius: shellRadius(false, DEATH_SWEEP * p, scale),
       shockwaveColor: blackbodyColor(4200),
     };
   }
@@ -605,10 +905,14 @@ function planetaryNebulaAppearance(
     surfaceDetail: 1 - 0.7 * k,
     magnetosphere: false,
     blackHole: false,
-    // Fades to nothing by the end of the stage, handing over to the ejecta cloud.
-    shockwave: 0.45 * (1 - Math.pow(k, 2)),
-    shockwaveRadius: msRadius + scale * SHOCKWAVE_REACH.nebula * (0.45 + 0.55 * Math.pow(k, 0.85)),
-    shockwaveColor: blackbodyColor(4200 + 8000 * k),
+    // Dims toward the handover brightness — NOT to nothing: the shell is still
+    // there when the white dwarf appears, and `remnantAppearance` goes on drawing
+    // it as the fading planetary nebula the star has just become.
+    shockwave: 0.45 + (NEBULA_HANDOVER_BRIGHTNESS - 0.45) * k,
+    shockwaveRadius: shellRadius(false, DEATH_SWEEP * p, scale),
+    // Warmed by the exposed core until the gas is fully ionised: the shell ends
+    // this stage at exactly the colour the remnant's nebula begins it.
+    shockwaveColor: blackbodyColor(4200 + (NEBULA_IONISED_K - 4200) * k),
   };
 }
 
@@ -620,8 +924,50 @@ function planetaryNebulaAppearance(
  */
 export const NEUTRON_STAR_TEMPERATURE_K = 40000;
 
-/** Visual appearance of the terminal compact remnant. */
-export function remnantAppearance(remnant: RemnantType | null): StarAppearance {
+/**
+ * The nebula the star left behind, as it looks `progress` of the way through the
+ * remnant stage (spec §4.4, decision D2).
+ *
+ * The dying star's receding photosphere hands over to THIS, not to nothing: the
+ * shell keeps expanding — ever more slowly, as it sweeps up the interstellar
+ * medium — and fades out over the whole remnant stage, ionised blue-white while
+ * it is still close to the searing core and cooling as it thins. `progress` and
+ * the fade are on the kernel's own nebula clock (`EJECTA_LIFETIME`), so the drawn
+ * shell and the ejecta particles inside it die out together.
+ *
+ * Pure; exported for unit testing.
+ */
+export function nebulaShell(
+  progress: number,
+  supernova: boolean,
+  systemScale: number,
+): Pick<StarAppearance, 'shockwave' | 'shockwaveRadius' | 'shockwaveColor'> {
+  const p = clamp(progress, 0, 1);
+  const temperatureK = NEBULA_IONISED_K - (NEBULA_IONISED_K - NEBULA_COOL_K) * Math.pow(p, 0.7);
+  return {
+    // Starts exactly where the death stage left it and thins away to nothing.
+    shockwave: NEBULA_HANDOVER_BRIGHTNESS * Math.pow(1 - p, 1.5),
+    shockwaveRadius: shellRadius(supernova, DEATH_SWEEP + REMNANT_SWEEP * p, systemScale),
+    shockwaveColor: blackbodyColor(temperatureK),
+  };
+}
+
+/**
+ * Visual appearance of the terminal compact remnant, inside the nebula it threw
+ * off. `progress` runs 0→1 as that nebula disperses; `supernova` and
+ * `systemScale` size the shell exactly as the death stage sized it.
+ */
+export function remnantAppearance(
+  remnant: RemnantType | null,
+  progress = 0,
+  systemScale = DEFAULT_SYSTEM_SCALE,
+  supernova = false,
+): StarAppearance {
+  // A brown dwarf is not a corpse: it never died, so there is no shell around it.
+  const nebula =
+    remnant === null || remnant === RemnantType.BrownDwarf
+      ? NO_BLAST
+      : nebulaShell(progress, supernova, systemScale);
   switch (remnant) {
     case RemnantType.BrownDwarf: {
       // Not a corpse but a failure-to-launch: an object that never fused
@@ -658,6 +1004,8 @@ export function remnantAppearance(remnant: RemnantType | null): StarAppearance {
         // A degenerate surface, but still a thin radiating atmosphere.
         surfaceDetail: 0.25,
         ...NO_BLAST,
+        // …inside the planetary nebula it just blew off.
+        ...nebula,
       };
     }
     case RemnantType.NeutronStar: {
@@ -672,6 +1020,8 @@ export function remnantAppearance(remnant: RemnantType | null): StarAppearance {
         // A smooth, degenerate crust: no convection, no granulation.
         surfaceDetail: 0,
         ...NO_BLAST,
+        // …inside the still-expanding supernova remnant.
+        ...nebula,
         magnetosphere: true,
       };
     }
@@ -686,6 +1036,7 @@ export function remnantAppearance(remnant: RemnantType | null): StarAppearance {
         pulsarBeam: true,
         surfaceDetail: 0,
         ...NO_BLAST,
+        ...nebula,
         magnetosphere: true,
       };
     }
@@ -704,6 +1055,7 @@ export function remnantAppearance(remnant: RemnantType | null): StarAppearance {
         pulsarBeam: false,
         surfaceDetail: 0,
         ...NO_BLAST,
+        ...nebula,
         blackHole: true,
       };
     }

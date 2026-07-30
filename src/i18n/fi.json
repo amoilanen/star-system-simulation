@@ -57,6 +57,8 @@
   "body.planet": "planeetta",
   "body.comet": "komeetta",
   "body.asteroid": "asteroidi",
+  "body.brownDwarf": "ruskea kääpiö",
+  "body.star": "kumppanitähti",
   "hud.focus.body": "{body} #{id}",
   "event.collapseOnset": "Pölypilvi alkaa luhistua oman painovoimansa vaikutuksesta.",
   "event.protostarFormed": "Pilven keskelle on muodostunut prototähti.",
@@ -102,6 +104,7 @@
   "label.stat.distance": "Etäisyys",
   "hud.labels": "Näytä nimikkeet",
   "event.bodyConsumed": "Planeetta on kiertynyt tähteen ja repeytynyt kappaleiksi.",
+  "event.companionIgnited": "Toinen tähti on syttynyt: {mass} kumppanitähti jakaa nyt järjestelmän.",
   "hud.orbits": "Näytä radat",
   "info.iceGiant.title": "Jaattilaisplaneetta (jaa)",
   "info.iceGiant.desc": "Vedesta, ammoniakista ja metaanijaasta koostuva maailma kivisen ytimen ymparilla, kuten Uranus tai Neptunus. Se syntyi lumirajan takana mutta liian kaukana kaapatakseen paljon kaasua.",
@@ -121,5 +124,10 @@
   "preset.neutronStar": "Neutronitähti",
   "preset.pulsar": "Pulsari",
   "setup.outcome.substellar": "→ muodostaa noin {jupiters} Jupiterin massaisen RUSKEAN KÄÄPIÖN, ei tähteä: alle 0,08 M☉ ytimestä ei koskaan tule tarpeeksi kuumaa vedyn fuusioon, joten se vain jäähtyy ikuisesti.",
-  "preset.directCollapse": "Suora romahdus (tähti katoaa)"
+  "preset.directCollapse": "Suora romahdus (tähti katoaa)",
+  "info.companionStar.title": "Seuralaistähti",
+  "info.companionStar.desc": "Toinen tähti, joka syntyi samasta romahtavasta pilvestä ja on sidottu ensimmäiseen. Yli 0,08 M☉ massalla sen ydin fuusioi vetyä, joten se loistaa omalla valollaan ja vetää puoleensa järjestelmän jokaista planeettaa — useimmat taivaan tähdet ovat tällaisia moninkertaisia järjestelmiä.",
+  "info.brownDwarfCompanion.title": "Ruskea kääpiöseuralainen",
+  "info.brownDwarfCompanion.desc": "Seuralainen, joka syntyi liian kevyenä fuusioimaan vetyä. Se polttaa deuteriumia, hehkuu tummanpunaisena infrapunassa ja vain jäähtyy järjestelmän loppuun asti — tähti, joka ei koskaan käynnistynyt.",
+  "info.note.noPlanets": "Tässä pilvessä ei ole raskaampia alkuaineita, joten kiekosta ei tiivisty mitään kiinteää: ei kiveä, ei jäätä eikä siis lainkaan planeettoja."
 }

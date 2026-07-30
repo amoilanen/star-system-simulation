@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { bodyInfoMessages, type PickTarget } from '../../src/ui/bodyInfo';
-import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
+import { bodyInfoMessages, planetClassTitleId, type PickTarget } from '../../src/ui/bodyInfo';
+import {
+  FATE_THRESHOLDS,
+  isSelfLuminous,
+  LifecycleStage,
+  RemnantType,
+} from '../../src/config/fateModel';
 import { BodyType } from '../../src/sim/PhysicsKernel';
 import { i18n } from '../../src/i18n/i18n';
 
@@ -59,6 +64,98 @@ describe('bodyInfoMessages', () => {
     expect(iceGiant.titleId).toBe('info.iceGiant.title');
   });
 
+  it('never describes a self-luminous mass as a planet', () => {
+    // Reported bug 1: the gas-giant class was open-ended at the top, so a 2–3 M☉
+    // companion — 660 000 M⊕ — came back as "gas giant".
+    for (const mass of [FATE_THRESHOLDS.hydrogenBurningMinMass, 0.5, 2, 3, 20]) {
+      expect(planetClassTitleId(mass), `${mass} M☉`).toBe('info.companionStar.title');
+    }
+    for (const mass of [FATE_THRESHOLDS.deuteriumBurningMinMass, 0.02, 0.079]) {
+      expect(planetClassTitleId(mass), `${mass} M☉`).toBe('info.brownDwarfCompanion.title');
+    }
+    // Just below the deuterium limit it is still a world, and still a gas giant.
+    expect(planetClassTitleId(FATE_THRESHOLDS.deuteriumBurningMinMass * 0.99)).toBe(
+      'info.gasGiant.title',
+    );
+  });
+
+  it('agrees with the predicate the RENDERER routes on', () => {
+    // `BodyRenderer` draws a body as a luminous companion iff `isSelfLuminous`,
+    // and the UI names it from `planetClassTitleId`. If the two ever disagree the
+    // scene shows a ringed world the panel calls a star, or a bare glowing ball
+    // the panel calls a gas giant — both are reported bug 2.
+    for (const mass of [0, 1e-9, 3e-6, 9.55e-4, 0.0129, 0.013, 0.05, 0.0799, 0.08, 1, 3, 20]) {
+      const luminous = isSelfLuminous(mass);
+      const titleId = planetClassTitleId(mass);
+      const named =
+        titleId === 'info.companionStar.title' || titleId === 'info.brownDwarfCompanion.title';
+      expect(named, `${mass} M☉ → ${titleId}`).toBe(luminous);
+    }
+  });
+
+  it('describes both kinds of companion from the kernel type lane', () => {
+    const star = bodyInfoMessages({
+      kind: 'body',
+      type: BodyType.Star,
+      radius: 0.01,
+      mass: 2,
+      captured: true,
+    });
+    expect(star.titleId).toBe('info.companionStar.title');
+    expect(star.descId).toBe('info.companionStar.desc');
+
+    const dwarf = bodyInfoMessages({
+      kind: 'body',
+      type: BodyType.BrownDwarf,
+      radius: 0.005,
+      mass: 0.03,
+      captured: true,
+    });
+    expect(dwarf.titleId).toBe('info.brownDwarfCompanion.title');
+    expect(dwarf.descId).toBe('info.brownDwarfCompanion.desc');
+
+    // A stellar mass mislabelled as a planet still resolves to a REAL card, not
+    // a `.desc` key derived from a planet title.
+    const mislabelled = bodyInfoMessages({
+      kind: 'body',
+      type: BodyType.Planet,
+      radius: 0.01,
+      mass: 3,
+      captured: true,
+    });
+    expect(mislabelled.titleId).toBe('info.companionStar.title');
+    for (const locale of ['en', 'fi'] as const) {
+      expect(i18n.translate(locale, mislabelled.descId)).not.toBe(mislabelled.descId);
+    }
+  });
+
+  it('notes that a metal-free cloud forms no planets, and only then', () => {
+    // Reported bug 4: with no heavier elements there are no condensable solids,
+    // so the disc seeds nothing at all — the star's card has to say so.
+    const barren = bodyInfoMessages({
+      kind: 'star',
+      stage: LifecycleStage.MainSequence,
+      remnant: null,
+      discMetallicity: 0,
+    });
+    expect(barren.titleId).toBe('info.mainSequenceStar.title');
+    expect(barren.noteId).toBe('info.note.noPlanets');
+
+    // Solar composition builds planets, so no note …
+    expect(
+      bodyInfoMessages({
+        kind: 'star',
+        stage: LifecycleStage.MainSequence,
+        remnant: null,
+        discMetallicity: 0.02,
+      }).noteId,
+    ).toBeUndefined();
+    // … and neither does a caller that simply does not know the composition.
+    expect(
+      bodyInfoMessages({ kind: 'star', stage: LifecycleStage.MainSequence, remnant: null }).noteId,
+    ).toBeUndefined();
+  });
+
   it('labels comets and asteroids with a captured/passing note', () => {
     const captured = bodyInfoMessages({
       kind: 'body',
@@ -84,6 +181,14 @@ describe('bodyInfoMessages', () => {
       { kind: 'star', stage: LifecycleStage.MainSequence, remnant: null },
       { kind: 'star', stage: LifecycleStage.Remnant, remnant: RemnantType.Pulsar },
       { kind: 'body', type: BodyType.Comet, radius: 0.3, captured: false },
+      { kind: 'body', type: BodyType.Star, radius: 0.01, mass: 2, captured: true },
+      { kind: 'body', type: BodyType.BrownDwarf, radius: 0.005, mass: 0.03, captured: true },
+      {
+        kind: 'star',
+        stage: LifecycleStage.MainSequence,
+        remnant: null,
+        discMetallicity: 0,
+      },
     ];
     for (const target of targets) {
       const { titleId, descId, noteId } = bodyInfoMessages(target);

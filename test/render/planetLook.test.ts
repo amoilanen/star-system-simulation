@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_MOONS_PER_PLANET,
+  MAX_SOLID_FRACTION,
+  MIN_SOLID_FRACTION_FOR_ROCK,
   PlanetClass,
+  SOLAR_METALLICITY,
   moonOffset,
   moonOrbit,
   planetClass,
   planetLook,
   bodyHash,
+  solidFraction,
 } from '../../src/render/planetLook';
 import { GAS_GIANT_MIN_EARTH_MASSES, ICE_GIANT_MIN_EARTH_MASSES } from '../../src/ui/bodyInfo';
 import { EARTH_MASSES_PER_SOLAR } from '../../src/sim/astro';
@@ -20,6 +24,77 @@ describe('planetClass', () => {
     expect(planetClass(solar(ICE_GIANT_MIN_EARTH_MASSES))).toBe(PlanetClass.IceGiant);
     expect(planetClass(solar(GAS_GIANT_MIN_EARTH_MASSES))).toBe(PlanetClass.GasGiant);
     expect(planetClass(solar(318))).toBe(PlanetClass.GasGiant);
+  });
+
+  it('assumes solar composition when none is given', () => {
+    expect(planetClass(solar(1))).toBe(planetClass(solar(1), SOLAR_METALLICITY));
+    expect(planetClass(solar(20))).toBe(planetClass(solar(20), SOLAR_METALLICITY));
+  });
+});
+
+describe('bug 4 — composition decides what a world can be made of', () => {
+  it('mirrors the kernel’s solid budget', () => {
+    // `solid_fraction` in wasm/src/nbody.rs: exactly 1 at solar, 0 without
+    // metals, linear in between and capped for contrived compositions.
+    expect(solidFraction(SOLAR_METALLICITY)).toBe(1);
+    expect(solidFraction(0)).toBe(0);
+    expect(solidFraction(-0.1)).toBe(0);
+    expect(solidFraction(Number.NaN)).toBe(0);
+    expect(solidFraction(SOLAR_METALLICITY / 2)).toBeCloseTo(0.5, 12);
+    expect(solidFraction(1)).toBe(MAX_SOLID_FRACTION);
+  });
+
+  it('never calls a world in a metal-free disc a stone planet', () => {
+    // The reported bug: a 100 % hydrogen cloud still produced worlds described
+    // and painted as rock. Rock IS metals, so there can be none.
+    for (const earth of [0.1, 1, 5, ICE_GIANT_MIN_EARTH_MASSES, 30]) {
+      expect(planetClass(solar(earth), 0)).toBe(PlanetClass.GasDwarf);
+    }
+    // A giant is hydrogen and helium, so it stays one at any composition.
+    expect(planetClass(solar(318), 0)).toBe(PlanetClass.GasGiant);
+  });
+
+  it('recovers rock and ice once the disc holds enough solids', () => {
+    const belowThreshold = SOLAR_METALLICITY * MIN_SOLID_FRACTION_FOR_ROCK * 0.99;
+    const atThreshold = SOLAR_METALLICITY * MIN_SOLID_FRACTION_FOR_ROCK;
+    expect(planetClass(solar(1), belowThreshold)).toBe(PlanetClass.GasDwarf);
+    expect(planetClass(solar(1), atThreshold)).toBe(PlanetClass.Rocky);
+    expect(planetClass(solar(20), atThreshold)).toBe(PlanetClass.IceGiant);
+  });
+
+  it('paints a metal-free world as a colourless hydrogen envelope, not warm rock', () => {
+    for (let id = 0; id < 24; id += 1) {
+      const { color } = planetLook(id, solar(1), 0);
+      // Rayleigh-scattering H/He: never warmer than it is blue, unlike the
+      // iron-rust and regolith hues of the rocky palette.
+      expect(color.b).toBeGreaterThanOrEqual(color.r);
+    }
+  });
+
+  it('gives a metal-free world no rings and no moons — both are debris', () => {
+    for (let id = 0; id < 200; id += 1) {
+      for (const earth of [1, 20, 200, 400]) {
+        const look = planetLook(id, solar(earth), 0);
+        expect(look.hasRings).toBe(false);
+        expect(look.ringProminence).toBe(0);
+        expect(look.moonCount).toBe(0);
+      }
+    }
+  });
+
+  it('leaves the solar case exactly as it was', () => {
+    for (let id = 0; id < 50; id += 1) {
+      for (const earth of [1, 20, 200]) {
+        expect(planetLook(id, solar(earth), SOLAR_METALLICITY)).toEqual(
+          planetLook(id, solar(earth)),
+        );
+      }
+    }
+    // Ringed and mooned worlds do still exist at solar composition, so the
+    // assertions above are not passing vacuously.
+    const solarGiants = Array.from({ length: 50 }, (_, id) => planetLook(id, solar(200)));
+    expect(solarGiants.some((l) => l.hasRings)).toBe(true);
+    expect(solarGiants.some((l) => l.moonCount > 0)).toBe(true);
   });
 });
 

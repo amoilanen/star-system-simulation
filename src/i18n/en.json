@@ -57,6 +57,8 @@
   "body.planet": "planet",
   "body.comet": "comet",
   "body.asteroid": "asteroid",
+  "body.brownDwarf": "brown dwarf",
+  "body.star": "companion star",
   "hud.focus.body": "{body} #{id}",
   "event.collapseOnset": "The dust cloud begins to collapse under its own gravity.",
   "event.protostarFormed": "A protostar has formed at the center of the cloud.",
@@ -102,6 +104,7 @@
   "label.stat.distance": "Distance",
   "hud.labels": "Show labels",
   "event.bodyConsumed": "A planet has spiralled into the star and been torn apart.",
+  "event.companionIgnited": "A second star has ignited: a companion of {mass} now shares the system.",
   "hud.orbits": "Show orbits",
   "info.iceGiant.title": "Ice giant",
   "info.iceGiant.desc": "A world of water, ammonia and methane ices around a rocky core, like Uranus or Neptune. It formed beyond the snow line but too far out to capture much gas.",
@@ -121,5 +124,10 @@
   "preset.neutronStar": "Neutron star",
   "preset.pulsar": "Pulsar",
   "setup.outcome.substellar": "→ forms a ~{jupiters} Jupiter-mass BROWN DWARF, not a star: below 0.08 M☉ the core never gets hot enough to fuse hydrogen, so it just cools forever.",
-  "preset.directCollapse": "Direct collapse (star winks out)"
+  "preset.directCollapse": "Direct collapse (star winks out)",
+  "info.companionStar.title": "Companion star",
+  "info.companionStar.desc": "A second star, born from the same collapsing cloud and bound to the first. Above 0.08 M☉ its core fuses hydrogen, so it shines with its own light and pulls on every planet in the system — most stars in the sky are in multiples like this.",
+  "info.brownDwarfCompanion.title": "Brown-dwarf companion",
+  "info.brownDwarfCompanion.desc": "A companion that formed too light to ever fuse hydrogen. It burns deuterium, glows a dull infrared red, and will simply cool for the rest of the system's life — a star that never quite started.",
+  "info.note.noPlanets": "This cloud contains no heavier elements, so nothing solid can condense out of the disk: no rock, no ice, and therefore no planets at all."
 }

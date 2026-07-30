@@ -18,6 +18,7 @@ import { i18n as sharedI18n, type I18n } from '../i18n/i18n';
 import { BODY_OFFSET, BODY_STRIDE, BodyType } from '../sim/PhysicsKernel';
 import { simSecondsToYears } from '../sim/timeFormat';
 import { createKernel } from '../sim/WasmKernel';
+import { MAX_VIEW_RADIUS } from '../render/cameraMath';
 import { SceneManager, type RenderState } from '../render/SceneManager';
 import { EventAnnotations, BODY_TYPE_MESSAGE_IDS } from '../ui/EventAnnotations';
 import { FOCUS_NONE, FOCUS_STAR, Hud, type FocusOption } from '../ui/Hud';
@@ -128,8 +129,13 @@ export class RunScreen {
       maxParticles: particleCount,
       // Comets grow tails once they reach roughly the inner half of the system.
       cometTailDistance: this.config.cloudExtent * 0.5,
-      // Keep hyperbolic fly-by arcs within the neighbourhood of the system.
-      orbitMaxRadius: this.config.cloudExtent * 2,
+      // What the worlds are made of follows the cloud they grew in (spec §4.3).
+      discMetallicity: this.config.composition.metals,
+      // Orbit paths are cut OUTSIDE any framable view, so a hyperbolic fly-by
+      // runs off the edge of the screen (spec §4.6). Cutting them at twice the
+      // cloud extent instead bent every unbound tail into a circular arc inside
+      // the frame — the reported "orbits cut into sectors".
+      orbitMaxRadius: MAX_VIEW_RADIUS,
       locale: this.locale,
       i18n: this.i18n,
     });
@@ -267,7 +273,14 @@ export class RunScreen {
     }
     const target: PickTarget =
       pick.kind === 'star'
-        ? { kind: 'star', stage: this.lastStage ?? 0, remnant: this.lastRemnant }
+        ? {
+            kind: 'star',
+            stage: this.lastStage ?? 0,
+            remnant: this.lastRemnant,
+            // So the card can explain an empty system: a cloud with no metals
+            // has no condensable solids and forms no planets (spec §4.3).
+            discMetallicity: this.config.composition.metals,
+          }
         : {
             kind: 'body',
             type: pick.type,

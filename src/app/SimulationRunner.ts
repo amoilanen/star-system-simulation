@@ -21,7 +21,12 @@ import {
 } from '../config/fateModel';
 import { Clock, type ClockOptions } from '../sim/Clock';
 import type { SimulationEvent } from '../sim/events';
-import { BODY_STRIDE, PARTICLE_STRIDE, type PhysicsKernel } from '../sim/PhysicsKernel';
+import {
+  ATTRACTOR_STRIDE,
+  BODY_STRIDE,
+  PARTICLE_STRIDE,
+  type PhysicsKernel,
+} from '../sim/PhysicsKernel';
 import { StateHistory } from '../sim/StateHistory';
 import { stellarMassFromCloud } from '../config/starFormation';
 import type { RenderState } from '../render/SceneManager';
@@ -265,11 +270,14 @@ export class SimulationRunner {
   private buildState(stage: LifecycleStage): RenderState {
     const particles = this.kernel.getParticleBuffer();
     const bodies = this.kernel.getBodyBuffer();
+    const attractors = this.kernel.getAttractorBuffer();
     return {
       particles,
       particleCount: Math.floor(particles.length / PARTICLE_STRIDE),
       bodies,
       bodyCount: Math.floor(bodies.length / BODY_STRIDE),
+      attractors,
+      attractorCount: this.kernel.attractorCount(),
       stage,
       stageProgress: this.progress,
       // The STAR's mass, not the cloud's — the renderer and every label describe
@@ -290,9 +298,10 @@ export class SimulationRunner {
 }
 
 /**
- * Deep-copy a {@link RenderState} for history recording. The particle/body
- * buffers are (for the WASM kernel) live views into linear memory that mutate
- * every step, so they MUST be copied out; the scalar fields are copied by value.
+ * Deep-copy a {@link RenderState} for history recording. The particle/body/
+ * attractor buffers are (for the WASM kernel) live views into linear memory that
+ * mutate every step, so they MUST be copied out; the scalar fields are copied by
+ * value.
  *
  * `simDt` is a per-frame delta (not a state snapshot) and must NOT be copied
  * into history so that replay frames always expose `simDt` as *absent* (not
@@ -309,6 +318,7 @@ function cloneRenderState(state: RenderState): RenderState {
     ...rest,
     particles: state.particles.slice(0, state.particleCount * PARTICLE_STRIDE),
     bodies: state.bodies.slice(0, state.bodyCount * BODY_STRIDE),
+    attractors: state.attractors.slice(0, state.attractorCount * ATTRACTOR_STRIDE),
     composition: { ...state.composition },
     // simDt intentionally absent — never persisted in history snapshots
   };

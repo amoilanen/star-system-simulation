@@ -14,6 +14,12 @@
 // integrates SOFTENED gravity, so the drawn conic is exact only for r ≫ the
 // softening length — true for every body outside the star's immediate vicinity.
 //
+// An open conic is infinite, so the sampled path is cut at a DRAW EXTENT that
+// sits outside the view (see `OrbitPathOptions.maxRadius`): the true-anomaly
+// range is solved for that crossing so the polyline ENDS there and leaves the
+// frame, rather than every far sample being pinned to the extent — which drew a
+// hyperbola's tail as a circular arc around the star (reported bug 5).
+//
 // Pure and DOM/Three.js-free so the orbital mechanics can be unit-tested.
 
 import type { Vec3 } from '../sim/PhysicsKernel';
@@ -109,19 +115,55 @@ export interface OrbitPathOptions {
   /** Number of sampled points along the path. Default 128. */
   segments?: number;
   /**
-   * For UNBOUND orbits, how much of the open branch to draw, as a fraction of
-   * the asymptotic true anomaly. Default 0.85 (keeps the arc finite).
+   * For UNBOUND orbits, how much of the open branch to sample, as a fraction of
+   * the asymptotic true anomaly. Default 0.999 — practically the whole branch,
+   * because it is {@link OrbitPathOptions.maxRadius} that keeps the arc finite.
+   * Lowering it truncates the fly-by *inside* the extent (and so, in general,
+   * inside the view).
    */
   hyperbolicSpan?: number;
-  /** Clamp on any sampled radius, so unbound arcs stay in frame. Default 4000. */
+  /**
+   * Draw extent (scene units): the radius at which the path is CUT OFF. Default
+   * 4000.
+   *
+   * The conic is sampled only over the true-anomaly interval that lies inside
+   * this radius, so the last point sits exactly on it and the line leaves the
+   * view. Sampling the whole branch and pinning each too-far sample to the
+   * extent instead drew the tail of a hyperbola as a circular arc of radius
+   * `maxRadius` — the reported "orbits cut into sectors" (bug 5).
+   */
   maxRadius?: number;
 }
 
 /**
- * Sample the orbit as a flat `[x,y,z, x,y,z, ...]` array of world-space points.
+ * True anomaly (positive root, radians) at which a conic `p / (1 + e·cos ν)`
+ * crosses `radius`, or null when it never does — i.e. the whole conic is inside
+ * that radius (a small ellipse) or the crossing is not on a real branch.
  *
- * A bound orbit yields a closed ellipse (first point repeated at the end);
- * an unbound orbit yields a finite arc of its hyperbolic branch. Returns an
+ * Solves r(ν) = p/(1 + e·cos ν) for cos ν = (p/r − 1)/e. The conic is symmetric
+ * about periapsis, so ±ν are the two crossings.
+ */
+function trueAnomalyAtRadius(p: number, e: number, radius: number): number | null {
+  if (!(e > 1e-9) || !(radius > 0)) {
+    return null;
+  }
+  const cosNu = (p / radius - 1) / e;
+  if (!(cosNu >= -1) || !(cosNu <= 1)) {
+    return null;
+  }
+  return Math.acos(cosNu);
+}
+
+/**
+ * Sample the orbit as a flat `[x,y,z, x,y,z, ...]` array of world-space points;
+ * `length / 3` is the number of emitted vertices, which varies with the state
+ * vector, so a caller drawing into a fixed-size buffer must bound its draw range
+ * by it.
+ *
+ * A bound orbit that fits inside the draw extent yields a closed ellipse (first
+ * point repeated at the end). Anything wider — an eccentric ellipse reaching
+ * past the extent, or the open branch of a hyperbola — yields the arc that lies
+ * inside the extent, ending exactly on it and therefore off-screen. Returns an
  * empty array when the state has no drawable orbit.
  */
 export function orbitPathPoints(
@@ -139,27 +181,43 @@ export function orbitPathPoints(
   const { eccentricity: e, semiLatusRectum: p, periapsisDir: P, inPlaneDir: Q } = elements;
 
   // A near-radial orbit (periapsis essentially at the star) samples as a line
-  // running from the star out to the radius clamp and back — visually a straight
+  // running from the star out to the draw extent and back — visually a straight
   // streak through the star rather than an orbit. Such a trajectory is a plunge,
   // not an orbit, so draw nothing.
   const periapsis = p / (1 + e);
   if (!(periapsis > 1e-3 * norm(pos))) {
     return new Float32Array(0);
   }
+  // Even the closest approach is outside the draw extent, so no part of this
+  // orbit is on screen. Drawing anything here could only be an artefact.
+  if (!(periapsis < maxRadius)) {
+    return new Float32Array(0);
+  }
 
-  // True-anomaly range: a full turn when bound, otherwise a bounded arc of the
-  // open branch (the conic diverges at ν → ±arccos(−1/e)).
+  // True-anomaly range. `cut` is where the conic leaves the draw extent — null
+  // only for a bound orbit that fits entirely inside it, which is the one case
+  // that closes into a full ellipse. Everything else is drawn as the arc between
+  // the two crossings, so the line runs out of the view rather than being bent
+  // around it.
+  const cut = trueAnomalyAtRadius(p, e, maxRadius);
   let start: number;
   let end: number;
   if (elements.bound) {
-    start = 0;
-    end = Math.PI * 2;
+    if (cut === null) {
+      start = 0;
+      end = Math.PI * 2;
+    } else {
+      start = -cut;
+      end = cut;
+    }
   } else {
-    const span = Math.min(Math.max(options.hyperbolicSpan ?? 0.85, 0.05), 0.98);
-    // e ≥ 1 ⇒ −1/e ∈ [−1, 0), so acos is always defined here.
-    const limit = Math.acos(Math.max(-1, -1 / Math.max(e, 1.0000001))) * span;
-    start = -limit;
-    end = limit;
+    // The conic diverges at ν → ±arccos(−1/e); e ≥ 1 ⇒ −1/e ∈ [−1, 0), so acos
+    // is always defined here. `cut` is always real for an unbound branch (whose
+    // radius grows without bound), but the span still caps the arc.
+    const span = Math.min(Math.max(options.hyperbolicSpan ?? 0.999, 0.05), 0.9999);
+    const asymptote = Math.acos(Math.max(-1, -1 / Math.max(e, 1.0000001))) * span;
+    end = cut === null ? asymptote : Math.min(asymptote, cut);
+    start = -end;
   }
 
   const count = segments + 1;
@@ -167,8 +225,11 @@ export function orbitPathPoints(
   for (let i = 0; i < count; i += 1) {
     const nu = start + ((end - start) * i) / segments;
     const denom = 1 + e * Math.cos(nu);
-    // Guard the asymptote; clamp instead of emitting an infinite point.
-    const radius = denom > 1e-6 ? Math.min(p / denom, maxRadius) : maxRadius;
+    // `end` is bounded by the extent crossing, so `p / denom ≤ maxRadius` holds
+    // by construction — the clamp is only a numerical backstop for the endpoint
+    // (and for a denominator driven to zero by rounding near the asymptote), and
+    // can no longer pin a whole run of samples to one radius.
+    const radius = denom > 1e-9 ? Math.min(p / denom, maxRadius) : maxRadius;
     const c = Math.cos(nu) * radius;
     const s = Math.sin(nu) * radius;
     out[i * 3] = P[0] * c + Q[0] * s;

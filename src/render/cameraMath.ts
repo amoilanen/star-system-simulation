@@ -68,6 +68,72 @@ export function nearPlaneFor(distance: number, min = 1e-6, max = 0.02): number {
   return clamp(distance * 0.01, Math.min(min, max), max);
 }
 
+/**
+ * Multiple of the keep-out radius the camera is pushed to when it has to be
+ * moved — enough headroom that the swelling star's surface (and the corona rim
+ * that hugs it) is in front of the lens rather than around it.
+ */
+export const KEEP_OUT_MARGIN = 1.6;
+
+/**
+ * Furthest the orbit camera can ever pull back from its focus target (scene
+ * units, i.e. AU). The zoom clamp in `CameraController`.
+ */
+export const MAX_CAMERA_DISTANCE = 5000;
+
+/**
+ * World radius that encloses everything the camera can ever frame: the furthest
+ * it can pull back, plus the view half-extent at that distance (the field of
+ * view is well under 90°, so that half-extent is smaller than the distance
+ * itself — one extra factor of the distance is a generous bound).
+ *
+ * Used as the draw extent for orbit paths: a path cut off HERE is always cut
+ * outside the frame, so a hyperbolic fly-by runs off the edge of the view at any
+ * zoom instead of bending into a circular arc around a nearby clamp radius
+ * (reported bug 5, the "orbits cut into sectors").
+ */
+export const MAX_VIEW_RADIUS = MAX_CAMERA_DISTANCE * 2;
+
+/**
+ * Push a camera at `position` OUT of a keep-out sphere of `keepOutRadius`
+ * centred on `center`, radially away from that centre.
+ *
+ * The star is not a kernel body, so nothing used to stop it from swelling over a
+ * camera that was already parked next to it: focusing on a 1 M☉ main-sequence
+ * star puts the camera ~0.02 AU from the origin, and by the red giant the
+ * photosphere is 1.16 AU — the camera is INSIDE the star and its additive
+ * corona, i.e. the whole screen is glow (reported bug 6). There is an equivalent
+ * guard for followed BODIES; this is the one for the star.
+ *
+ * Only ever pushes OUTWARD: a camera already clear of the sphere is returned
+ * untouched, so the user's zoom is never taken away from them, only given back.
+ * A camera exactly at the centre is pushed along +Z (any direction will do).
+ * Pure; exported for unit testing.
+ */
+export function pushOutOfKeepOut(
+  position: Vec3,
+  center: Vec3,
+  keepOutRadius: number,
+  margin = KEEP_OUT_MARGIN,
+): Vec3 {
+  if (!Number.isFinite(keepOutRadius) || keepOutRadius <= 0) {
+    return position;
+  }
+  const minimum = keepOutRadius * Math.max(margin, 1);
+  const dx = position[0] - center[0];
+  const dy = position[1] - center[1];
+  const dz = position[2] - center[2];
+  const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (distance >= minimum) {
+    return position;
+  }
+  if (distance < 1e-12) {
+    return [center[0], center[1], center[2] + minimum];
+  }
+  const k = minimum / distance;
+  return [center[0] + dx * k, center[1] + dy * k, center[2] + dz * k];
+}
+
 /** Squared Euclidean distance between two points. */
 export function distanceSquared(a: Vec3, b: Vec3): number {
   const dx = a[0] - b[0];

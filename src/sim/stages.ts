@@ -120,6 +120,34 @@ export const DEATH_PHASES = {
 } as const;
 
 /**
+ * What happens to the shell the star threw off, once the star itself is a
+ * compact remnant. Mirror in Rust (`EJECTA_DRAG`, `EJECTA_LIFETIME`,
+ * `DEATH_SWEEP` in `wasm/src/lib.rs`).
+ *
+ * The envelope does not coast away forever: it sweeps up the interstellar
+ * medium, decelerates and settles at a stall radius, where it fades out. Both
+ * numbers below are that deceleration expressed as the exponent of
+ * `1 − e^-sweep`, i.e. the fraction of the stall radius reached — the kernel
+ * integrates it, and `starVisual` draws the shock front with the same law, so
+ * the drawn shell and the ejecta particles inside it are one object.
+ *
+ * The terminal {@link LifecycleStage.Remnant} lasts forever, so the progress the
+ * kernel reports through it is precisely how far this dispersal has got: 0 as
+ * the compact object appears, 1 once the last of the gas has faded.
+ */
+export const NEBULA_PHASES = {
+  /**
+   * How far the shell has swept by the time the remnant appears. Chosen so the
+   * shell edge is still comfortably INSIDE the framed system at that moment —
+   * it used to be several cloud radii out, i.e. off-screen, before the death
+   * stage had even ended.
+   */
+  deathSweep: 0.6,
+  /** …and by the time the nebula has faded out, near the end of its expansion. */
+  remnantSweep: 3.25,
+} as const;
+
+/**
  * Illustrative duration (sim seconds) the star spends IN each stage before
  * advancing to the next, keyed on `mass` (M☉) and `composition`. The terminal
  * {@link LifecycleStage.Remnant} lasts forever (`Infinity`). Pure; exported for

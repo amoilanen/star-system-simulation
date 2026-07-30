@@ -31,7 +31,7 @@ The per-frame data flow (assembled in `./src/app/`) is:
 ```mermaid
 flowchart LR
   A[requestAnimationFrame] --> B[Clock: scaled dt]
-  B --> C[Kernel.step<br/>WASM or TS fallback]
+  B --> C[Kernel.step<br/>Rust/WASM]
   C --> D[Drain events -> EventBus]
   D --> E[HUD / Event annotations]
   C --> F[CameraController]
@@ -40,9 +40,16 @@ flowchart LR
 
 Key boundaries:
 
-- **`./src/sim/PhysicsKernel.ts`** — the kernel contract. Both `./src/sim/WasmKernel.ts`
-  (Rust/WASM) and `./src/sim/TsFallbackKernel.ts` (pure TS) implement it and expose state as
-  flat typed-array buffers. `WasmKernel` feature-detects WASM and falls back automatically.
+- **`./src/sim/PhysicsKernel.ts`** — the kernel contract, and the single source of truth for
+  the flat typed-array layouts the renderer reads each frame (particles, bodies and the
+  **attractor buffer**: the gravitating centres the kernel integrates against — the primary
+  at the scene origin plus any companion stars). `./src/sim/WasmKernel.ts` (Rust/WASM) is the
+  only implementation; the Rust strides and offsets must match this file exactly.
+- **Gravity has more than one centre.** A cloud can fragment into companion stars, so bodies
+  and dust are integrated against the whole attractor set, and the primary's own `mu` shrinks
+  as it sheds its envelope — which is what widens the surviving orbits. Anything host-side
+  that reconstructs an orbit must read `orbitalMu()` / `getAttractorBuffer()` per frame
+  rather than caching them.
 - **`./src/config/fateModel.ts`** — the single source of truth for the death path
   (white dwarf / neutron star / pulsar). Change lifecycle thresholds here.
 - **`./src/sim/stages.ts`** — the deterministic lifecycle FSM; emits exactly one event per
@@ -55,9 +62,8 @@ Key boundaries:
 
 - Use the browser **DevTools console** for runtime errors and the **Performance** tab for
   frame timing.
-- To confirm which kernel is active, watch the console on startup — `WasmKernel` logs when it
-  falls back to the TS kernel. You can force-test the fallback by temporarily renaming
-  `./wasm/pkg/` so the WASM import fails.
+- If nothing simulates at all, check that `./wasm/pkg/` exists: the WASM kernel is the only
+  physics implementation, and its import failing is reported on the console.
 - GLSL shader issues surface as WebGL warnings in the console; shaders live under
   `./src/render/shaders/`.
 - The setup form's **"show information about star system events"** checkbox enables the
@@ -68,8 +74,13 @@ Key boundaries:
 
 - Run kernel logic in isolation with `cargo test` (see below) rather than through the
   browser — it is far faster to iterate on.
-- The TS fallback kernel and the WASM kernel are kept in parity by a deterministic
-  small-scenario test (`./test/sim/WasmKernel.test.ts`); run it after any kernel change.
+- The kernel↔host buffer contract (strides, offsets, event payloads, the attractor lanes) is
+  pinned by a deterministic small-scenario test (`./test/sim/WasmKernel.test.ts`); run it
+  after any kernel change.
+- `./test/battery/simulationBattery.test.ts` runs full birth→death simulations across the
+  setup form's whole parameter space and asserts physical invariants on every one of them.
+  It runs 12 systems as part of `npm test`; the full audit is
+  `BATTERY_RUNS=100 npx vitest run test/battery`.
 
 ## Verification
 
@@ -128,8 +139,10 @@ Localization is data-only:
 - **ESLint + Prettier** — run `npm run format` before committing; lint must pass with zero
   warnings.
 - **No hard-coded user-facing strings** — route everything through i18n.
-- Keep the `PhysicsKernel` contract stable: if you change buffer layout, update **both**
-  kernel implementations and their parity tests.
+- Keep the `PhysicsKernel` contract stable: if you change a buffer layout or an enum, update
+  the Rust side and `./src/sim/PhysicsKernel.ts` **together** with the parity test — and
+  append enum values rather than inserting them, since the numeric value is what crosses the
+  WASM boundary.
 
 ## Commit / PR checklist
 

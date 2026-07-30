@@ -12,6 +12,7 @@
 import * as THREE from 'three';
 import { BODY_OFFSET, BODY_STRIDE, BodyType } from '../sim/PhysicsKernel';
 import type { Vec3 } from '../sim/PhysicsKernel';
+import { MAX_VIEW_RADIUS } from './cameraMath';
 import { orbitPathPoints } from './orbitPath';
 
 /** Maximum simultaneously drawn orbit paths (pooled lines). */
@@ -21,11 +22,13 @@ const MAX_ORBITS = 64;
 const ORBIT_SEGMENTS = 160;
 
 /**
- * How much of an UNBOUND body's open branch to draw. A hyperbola is nearly
- * straight far from the star, so drawing too much of it produces long lines that
- * dominate the view; this keeps the fly-by arc readable around periapsis.
+ * How much of an UNBOUND body's open branch to sample, as a fraction of its
+ * asymptotic true anomaly — practically all of it. What keeps the line finite is
+ * the draw extent it is cut at (see {@link OrbitRenderer.setMaxRadius}); also
+ * truncating the span, as this did at 0.55, ended the fly-by in mid-air well
+ * inside the frame (reported bug 5).
  */
-const HYPERBOLIC_SPAN = 0.55;
+const HYPERBOLIC_SPAN = 0.999;
 
 /** Per-body-kind orbit colours (planets warm, visitors cool). */
 const ORBIT_COLORS: Readonly<Record<BodyType, number>> = {
@@ -33,6 +36,11 @@ const ORBIT_COLORS: Readonly<Record<BodyType, number>> = {
   [BodyType.Planet]: 0x8fa8e8,
   [BodyType.Comet]: 0x6fd8e8,
   [BodyType.Asteroid]: 0xb9a184,
+  // A companion's orbit is drawn in its own light: warm white for a star, dim
+  // ember-red for a brown dwarf, so a stellar orbit is never mistaken for a
+  // planet's.
+  [BodyType.BrownDwarf]: 0xc98a6a,
+  [BodyType.Star]: 0xf2e2b8,
 };
 
 /** One pooled orbit line with its own geometry/material. */
@@ -52,8 +60,8 @@ export class OrbitRenderer {
 
   private readonly pool: OrbitLine[] = [];
   private enabled = false;
-  /** Clamp on drawn orbit radius, so unbound arcs stay near the system. */
-  private maxRadius = 400;
+  /** Radius at which a drawn path is cut off; see {@link setMaxRadius}. */
+  private maxRadius = MAX_VIEW_RADIUS;
 
   constructor() {
     this.group = new THREE.Group();
@@ -62,9 +70,12 @@ export class OrbitRenderer {
   }
 
   /**
-   * Bound the drawn extent of orbit paths (scene units). Typically a small
-   * multiple of the cloud extent, so hyperbolic fly-bys are trimmed to the
-   * neighbourhood of the star instead of shooting off to infinity.
+   * Set the extent (scene units) at which an orbit path is cut off — an open
+   * conic is infinite, so it has to end somewhere.
+   *
+   * Keep it OUTSIDE anything the camera can frame (see {@link MAX_VIEW_RADIUS}).
+   * A snug bound — this used to be twice the cloud extent — puts the cut inside
+   * the view, where a fly-by visibly stops instead of running off the edge.
    */
   setMaxRadius(radius: number): void {
     if (Number.isFinite(radius) && radius > 0) {
@@ -127,16 +138,15 @@ export class OrbitRenderer {
   /** Upload one orbit's vertices into the pooled line at `index`. */
   private writeOrbit(index: number, points: Float32Array, color: number): void {
     const entry = this.line(index);
-    entry.positions.set(points.subarray(0, Math.min(points.length, entry.positions.length)));
-    // If the path is shorter than the buffer, collapse the tail onto its end so
-    // no stale geometry from a previous body is drawn.
-    for (let i = points.length; i < entry.positions.length; i += 3) {
-      entry.positions[i] = points[points.length - 3] ?? 0;
-      entry.positions[i + 1] = points[points.length - 2] ?? 0;
-      entry.positions[i + 2] = points[points.length - 1] ?? 0;
-    }
+    const floats = Math.min(points.length, entry.positions.length);
+    entry.positions.set(points.subarray(0, floats));
     const attr = entry.geometry.getAttribute('position') as THREE.BufferAttribute;
     attr.needsUpdate = true;
+    // The pooled buffer is fixed-size but a path's vertex count varies, so draw
+    // only the vertices just written. Collapsing the unused tail onto the last
+    // point instead (what this did before) leaves a pile of degenerate vertices
+    // exactly where the line ends — which is now a point out at the draw extent.
+    entry.geometry.setDrawRange(0, Math.floor(floats / 3));
     entry.material.color.setHex(color);
     entry.line.visible = true;
   }

@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { I18n, CATALOGS, DEFAULT_LOCALE, formatMessage, i18n } from '../../src/i18n/i18n';
 
-// The nine SimEventType members from spec §4.3. i18n must provide exactly one
-// message per event so the HUD can annotate every lifecycle/body event (FR-9).
-// Kept as a literal here so the i18n step has no dependency on the (later)
-// events module while still enforcing coverage.
+// Every SimEventType from spec §4.3. i18n must provide exactly one message per
+// event so the HUD can annotate every lifecycle/body event (FR-9). Kept as a
+// literal here so the i18n step has no dependency on the (later) events module
+// while still enforcing coverage.
 const EVENT_MESSAGE_IDS = [
   'event.collapseOnset',
   'event.protostarFormed',
@@ -15,6 +15,23 @@ const EVENT_MESSAGE_IDS = [
   'event.remnantFormed',
   'event.bodyCaptured',
   'event.bodyEjected',
+  'event.bodyConsumed',
+  // A second star ignited in the same system (spec §4.2).
+  'event.companionIgnited',
+] as const;
+
+// Message ids the companion-star / metal-free-cloud presentation depends on
+// (spec §4.7). Every one is referenced from `bodyInfo`/`labelInfo` by a computed
+// id, so a missing key would surface in the UI as the raw id rather than as a
+// type error — hence the explicit coverage.
+const COMPANION_MESSAGE_IDS = [
+  'info.companionStar.title',
+  'info.companionStar.desc',
+  'info.brownDwarfCompanion.title',
+  'info.brownDwarfCompanion.desc',
+  'info.note.noPlanets',
+  'body.star',
+  'body.brownDwarf',
 ] as const;
 
 describe('catalog completeness', () => {
@@ -28,6 +45,15 @@ describe('catalog completeness', () => {
     for (const id of EVENT_MESSAGE_IDS) {
       expect(CATALOGS.en[id], `en missing ${id}`).toBeTruthy();
       expect(CATALOGS.fi[id], `fi missing ${id}`).toBeTruthy();
+    }
+  });
+
+  it('names and describes both kinds of companion in both locales', () => {
+    for (const id of COMPANION_MESSAGE_IDS) {
+      expect(CATALOGS.en[id], `en missing ${id}`).toBeTruthy();
+      expect(CATALOGS.fi[id], `fi missing ${id}`).toBeTruthy();
+      // The Finnish text must be a real translation, not the English copied over.
+      expect(CATALOGS.fi[id], `fi:${id} not translated`).not.toBe(CATALOGS.en[id]);
     }
   });
 

@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { STAGE_ORDER, STAGE_ENTRY_EVENT, DEATH_PHASES, stageDurations } from '../../src/sim/stages';
+import {
+  STAGE_ORDER,
+  STAGE_ENTRY_EVENT,
+  DEATH_PHASES,
+  NEBULA_PHASES,
+  stageDurations,
+} from '../../src/sim/stages';
 import { EVENT_MESSAGE_IDS, SimEventType } from '../../src/sim/events';
 import { LifecycleStage } from '../../src/config/fateModel';
 import { CATALOGS } from '../../src/i18n/i18n';
@@ -126,5 +132,31 @@ describe('DEATH_PHASES', () => {
     expect(DEATH_PHASES.minSteps).toBeGreaterThan(1);
     // The shock must not land on the very first step, or there is no build-up.
     expect(DEATH_PHASES.minSteps * DEATH_PHASES.shockBreakout).toBeGreaterThan(1);
+  });
+});
+
+describe('NEBULA_PHASES', () => {
+  it('leaves the shell inside the framed system when the remnant appears', () => {
+    // `1 − e^-0.6 ≈ 45 %` of the stall radius, which is 1.4–1.5 cloud radii, so
+    // the nebula is still on screen at the handover instead of long gone.
+    const atRemnant = 1 - Math.exp(-NEBULA_PHASES.deathSweep);
+    expect(atRemnant).toBeGreaterThan(0.3);
+    expect(atRemnant).toBeLessThan(0.6);
+  });
+
+  it('goes on expanding, ever more slowly, for the whole remnant stage', () => {
+    const atRemnant = 1 - Math.exp(-NEBULA_PHASES.deathSweep);
+    const atFade = 1 - Math.exp(-(NEBULA_PHASES.deathSweep + NEBULA_PHASES.remnantSweep));
+    expect(atFade).toBeGreaterThan(atRemnant);
+    // …and never past the stall radius: a nebula settles, it does not run away.
+    expect(atFade).toBeLessThan(1);
+  });
+
+  it('mirrors the kernel exactly (EJECTA_DRAG × its two clocks)', () => {
+    // Rust: DEATH_SWEEP = EJECTA_DRAG × DEATH_ORBITAL_SPAN and
+    // EJECTA_DRAG × EJECTA_LIFETIME — pinned on both sides so the drawn shock
+    // front cannot drift away from the gas it is drawn around.
+    expect(NEBULA_PHASES.deathSweep).toBe(0.6);
+    expect(NEBULA_PHASES.remnantSweep).toBe(3.25);
   });
 });

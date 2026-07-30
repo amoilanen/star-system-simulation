@@ -5,9 +5,11 @@
 use crate::nbody::{is_bound, magnitude, Vec3, ASTEROID_RADIUS, COMET_RADIUS};
 
 /// Kinds of orbiting/visiting bodies. Numeric values MUST match the TypeScript
-/// `BodyType` enum ordering (`src/sim/PhysicsKernel.ts`). The full contract is
-/// retained even though this kernel does not (yet) construct every variant
-/// (`Planet` is a renderer-side promotion of a `Protoplanet`).
+/// `BodyType` enum ordering (`src/sim/PhysicsKernel.ts`).
+///
+/// `BrownDwarf` and `Star` are APPENDED so the existing numeric values keep
+/// their meaning in the body buffer and in the packed events, both of which
+/// carry the raw discriminant across the WASM boundary.
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -16,6 +18,61 @@ pub enum BodyType {
     Planet = 1,
     Comet = 2,
     Asteroid = 3,
+    /// A SUBSTELLAR companion: heavy enough to have fused deuterium, too light
+    /// ever to fuse hydrogen (`DEUTERIUM_BURNING_MIN_MASS` ≤ m <
+    /// `HYDROGEN_BURNING_MIN_MASS`). It glows, so it is not a planet.
+    ///
+    /// ONE DOCUMENTED EXCEPTION to the mass range, and no other: a cloud
+    /// FRAGMENT is born at the opacity limit (~5 M♃, below the deuterium mass)
+    /// and carries this kind from birth, because it is a collapsing protostellar
+    /// core rather than a world and must be excluded from every `is_planetary`
+    /// rule (merging, engulfment, rings) while it grows. Such a body is always
+    /// identifiable by `accretion_target >= DEUTERIUM_BURNING_MIN_MASS` — it is
+    /// on the stellar track and will cross the limit. So the invariant any
+    /// consumer may rely on is:
+    ///
+    /// `kind == BrownDwarf` ⇒ `mass >= DEUTERIUM_BURNING_MIN_MASS`
+    ///                        **or** `accretion_target >= DEUTERIUM_BURNING_MIN_MASS`
+    ///
+    /// enforced by `a_substellar_body_is_either_burning_deuterium_or_on_its_way`
+    /// in `lib.rs`. Never assume the mass bound alone.
+    BrownDwarf = 4,
+    /// A companion STAR: at or above the hydrogen-burning minimum mass, so it
+    /// fuses hydrogen exactly as the primary does.
+    Star = 5,
+}
+
+impl BodyType {
+    /// Whether a body of this kind SHINES — i.e. it is a companion star or brown
+    /// dwarf and therefore a gravitating centre in its own right (spec §4.1,
+    /// Decision D1), rather than a world orbiting one.
+    ///
+    /// Written as an EXHAUSTIVE match rather than `matches!(…)` so that appending
+    /// a self-luminous variant does not silently classify it as a planet: the
+    /// compiler stops the build until it is listed here.
+    #[must_use]
+    pub fn is_stellar(self) -> bool {
+        match self {
+            BodyType::BrownDwarf | BodyType::Star => true,
+            BodyType::Protoplanet | BodyType::Planet | BodyType::Comet | BodyType::Asteroid => {
+                false
+            }
+        }
+    }
+
+    /// Whether this body is a WORLD — a planet or the embryo of one — as opposed
+    /// to a self-luminous companion or a visiting comet/asteroid.
+    ///
+    /// This is the predicate for every planet-only rule: mutual merging, being
+    /// engulfed by the red giant, retaining swept dust, and being unbound by the
+    /// supernova's impulse. A companion star must be excluded from all of them —
+    /// it does not coalesce with a planet, a red giant cannot swallow the star it
+    /// orbits, and its own accretion is rate-limited stellar accretion, not
+    /// planetesimal growth.
+    #[must_use]
+    pub fn is_planetary(self) -> bool {
+        matches!(self, BodyType::Protoplanet | BodyType::Planet)
+    }
 }
 
 /// A celestial body integrated by the kernel (spec §4.5).
@@ -29,6 +86,16 @@ pub struct CelestialBody {
     pub vel: Vec3,
     pub spin: f64,
     pub captured: bool,
+    /// Mass (M☉) this body is entitled to assemble from the natal cloud, or
+    /// `0.0` for everything that is not a cloud FRAGMENT (spec §4.2).
+    ///
+    /// Only a companion seeded by the fragmentation channel carries a target. It
+    /// is the fragment's share of the cloud, and it is drawn down from the same
+    /// inner-disc reservoir that feeds the primary, under the same finite
+    /// accretion rate — a fragment does not appear fully grown any more than the
+    /// primary does. Planetesimals grow the emergent way instead (by sweeping
+    /// dust), so their target stays zero.
+    pub accretion_target: f64,
 }
 
 /// Deterministic 32-bit PRNG (mulberry32). Bit-for-bit twin of the TypeScript
@@ -89,6 +156,13 @@ pub enum VisitorClassification {
 /// Classify a visiting comet/asteroid (FR-7). Bound ⇒ captured; unbound and
 /// receding past the boundary ⇒ ejected; otherwise still in transit. Mirrors
 /// `classifyVisitor`.
+///
+/// `mu` must be the TOTAL gravitational parameter of the system — every
+/// gravitating centre summed, not just the primary's (spec §4.1). The question
+/// being asked is whether the visitor is bound to the STAR SYSTEM, and a comet
+/// circling a wide binary is captured even though it is unbound from either star
+/// taken alone. The distinction is what a companion's mass buys: the capture
+/// cross-section of the system grows with it.
 #[must_use]
 pub fn classify_visitor(mu: f64, pos: Vec3, vel: Vec3, eject_radius: f64) -> VisitorClassification {
     let r = magnitude(pos);
@@ -208,6 +282,8 @@ pub fn make_visitor(rng: &mut Mulberry32, mu: f64, eject_radius: f64, id: f64) -
         vel: velocity,
         spin: rng.next_f64(),
         captured: false,
+        // A visitor assembled elsewhere; it has no share of this cloud.
+        accretion_target: 0.0,
     }
 }
 
@@ -237,6 +313,42 @@ mod tests {
             seed_from_config(1.0, 50.0, 0.5, 0.74, 0.24, 0.02),
             seed_from_config(2.0, 50.0, 0.5, 0.74, 0.24, 0.02)
         );
+    }
+
+    #[test]
+    fn body_type_numeric_values_are_append_only() {
+        // The discriminant is what crosses the WASM boundary — in the body
+        // buffer's type lane and in the `data_b` lane of body events — so the
+        // four original values MUST keep their meaning. Appending is the only
+        // safe way to add a kind; renumbering would silently turn every drawn
+        // comet into an asteroid.
+        assert_eq!(BodyType::Protoplanet as u32, 0);
+        assert_eq!(BodyType::Planet as u32, 1);
+        assert_eq!(BodyType::Comet as u32, 2);
+        assert_eq!(BodyType::Asteroid as u32, 3);
+        assert_eq!(BodyType::BrownDwarf as u32, 4);
+        assert_eq!(BodyType::Star as u32, 5);
+    }
+
+    #[test]
+    fn only_companions_shine_and_only_worlds_are_planetary() {
+        // `is_stellar` decides what becomes a gravitating centre; `is_planetary`
+        // decides what the planet-only rules (merging, engulfment, dust
+        // retention, supernova unbinding) apply to. Every kind must fall in
+        // exactly one of the two camps, or a companion star would be merged into
+        // a planet — or swallowed by the giant it orbits.
+        for kind in [BodyType::BrownDwarf, BodyType::Star] {
+            assert!(kind.is_stellar(), "{kind:?} should shine");
+            assert!(!kind.is_planetary(), "{kind:?} is not a world");
+        }
+        for kind in [BodyType::Protoplanet, BodyType::Planet] {
+            assert!(!kind.is_stellar(), "{kind:?} should not shine");
+            assert!(kind.is_planetary(), "{kind:?} is a world");
+        }
+        for kind in [BodyType::Comet, BodyType::Asteroid] {
+            assert!(!kind.is_stellar(), "{kind:?} should not shine");
+            assert!(!kind.is_planetary(), "{kind:?} is a visitor, not a world");
+        }
     }
 
     #[test]

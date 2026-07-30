@@ -135,6 +135,130 @@ describe('orbitPathPoints', () => {
   });
 });
 
+describe('paths that leave the frame (bug: orbits cut into sectors)', () => {
+  const mu = 100;
+
+  /** Component of the i-th sampled point along `axis` (0=x, 1=y, 2=z). */
+  function componentAt(points: Float32Array, i: number, axis: number): number {
+    return points[i * 3 + axis] ?? 0;
+  }
+
+  /** Number of ADJACENT sample pairs that both sit on the draw extent. */
+  function pinnedPairs(points: Float32Array, extent: number): number {
+    let pairs = 0;
+    for (let i = 1; i < points.length / 3; i += 1) {
+      if (radiusAt(points, i - 1) > extent * 0.999 && radiusAt(points, i) > extent * 0.999) {
+        pairs += 1;
+      }
+    }
+    return pairs;
+  }
+
+  it('never pins a run of samples to the draw extent (no circular arc)', () => {
+    // A strongly hyperbolic fly-by (e ≈ 5.5). Pinning every too-far sample to
+    // the extent drew this branch's tail as an arc of constant radius — the
+    // reported pie-slice "sector".
+    const r = 10;
+    const escape = Math.sqrt((2 * mu) / r);
+    const extent = 200;
+    const points = orbitPathPoints([r, 0, 0], [0, 0, escape * 1.8], mu, {
+      segments: 128,
+      maxRadius: extent,
+    });
+    expect(points.length).toBe(129 * 3);
+    expect(pinnedPairs(points, extent)).toBe(0);
+
+    // Radius grows STRICTLY away from periapsis (the middle sample, at ν = 0)
+    // all the way to the end of the arc; a clamped tail would be flat instead.
+    for (let i = 65; i < 129; i += 1) {
+      expect(radiusAt(points, i)).toBeGreaterThan(radiusAt(points, i - 1));
+    }
+  });
+
+  it('ends the unbound arc on the draw extent, not short of it', () => {
+    const r = 10;
+    const escape = Math.sqrt((2 * mu) / r);
+    const extent = 200;
+    const points = orbitPathPoints([r, 0, 0], [0, 0, escape * 1.8], mu, {
+      segments: 128,
+      maxRadius: extent,
+    });
+    // Both ends of the branch reach the extent (so the line runs off the view),
+    // and nothing overshoots it.
+    expect(radiusAt(points, 0)).toBeCloseTo(extent, 2);
+    expect(radiusAt(points, 128)).toBeCloseTo(extent, 2);
+    for (let i = 0; i < 129; i += 1) {
+      expect(radiusAt(points, i)).toBeLessThanOrEqual(extent * 1.001);
+    }
+    // The old 0.55 span stopped the branch at a fraction of its asymptote, well
+    // inside any sane extent; the arc must now be extent-limited.
+    const spanLimited = orbitPathPoints([r, 0, 0], [0, 0, escape * 1.8], mu, {
+      segments: 128,
+      maxRadius: extent,
+      hyperbolicSpan: 0.55,
+    });
+    expect(radiusAt(spanLimited, 128)).toBeLessThan(extent * 0.5);
+  });
+
+  it('leaves a bound ellipse that fits inside the extent unchanged', () => {
+    const r = 10;
+    const v = Math.sqrt(mu / r) * 0.75;
+    const segments = 96;
+    const points = orbitPathPoints([r, 0, 0], [0, 0, v], mu, { segments, maxRadius: 200 });
+    const el = orbitalElements([r, 0, 0], [0, 0, v], mu)!;
+    expect(el.semiLatusRectum / (1 - el.eccentricity)).toBeLessThan(200); // apoapsis inside
+    expect(points.length).toBe((segments + 1) * 3);
+
+    // Every vertex is still the unclamped conic sampled uniformly over a full
+    // turn, exactly as before this fix.
+    for (let i = 0; i <= segments; i += 1) {
+      const nu = (Math.PI * 2 * i) / segments;
+      const radius = el.semiLatusRectum / (1 + el.eccentricity * Math.cos(nu));
+      for (let axis = 0; axis < 3; axis += 1) {
+        const expected =
+          (el.periapsisDir[axis] ?? 0) * Math.cos(nu) * radius +
+          (el.inPlaneDir[axis] ?? 0) * Math.sin(nu) * radius;
+        expect(componentAt(points, i, axis)).toBeCloseTo(expected, 4);
+      }
+    }
+    // Still closed.
+    expect(componentAt(points, segments, 0)).toBeCloseTo(componentAt(points, 0, 0), 4);
+    expect(componentAt(points, segments, 2)).toBeCloseTo(componentAt(points, 0, 2), 4);
+  });
+
+  it('cuts a bound orbit whose apoapsis is beyond the extent into an open arc', () => {
+    const r = 10;
+    const v = Math.sqrt(mu / r) * 1.35; // e ≈ 0.82, apoapsis ≈ 103
+    const extent = 50;
+    const points = orbitPathPoints([r, 0, 0], [0, 0, v], mu, { segments: 128, maxRadius: extent });
+    const el = orbitalElements([r, 0, 0], [0, 0, v], mu)!;
+    expect(el.bound).toBe(true);
+    expect(el.semiLatusRectum / (1 - el.eccentricity)).toBeGreaterThan(extent);
+
+    expect(radiusAt(points, 0)).toBeCloseTo(extent, 2);
+    expect(radiusAt(points, 128)).toBeCloseTo(extent, 2);
+    expect(pinnedPairs(points, extent)).toBe(0);
+    // Open, not closed: the two ends are on opposite sides of the periapsis axis.
+    const endpointGap = Math.hypot(
+      componentAt(points, 0, 0) - componentAt(points, 128, 0),
+      componentAt(points, 0, 1) - componentAt(points, 128, 1),
+      componentAt(points, 0, 2) - componentAt(points, 128, 2),
+    );
+    expect(endpointGap).toBeGreaterThan(extent);
+  });
+
+  it('draws nothing when the whole orbit is outside the draw extent', () => {
+    const r = 300;
+    const points = orbitPathPoints([r, 0, 0], [0, 0, Math.sqrt(mu / r)], mu, { maxRadius: 100 });
+    expect(points).toHaveLength(0);
+  });
+
+  it('still draws nothing for a radial plunge, whatever the extent', () => {
+    expect(orbitPathPoints([10, 0, 0], [-1, 0, 0], mu, { maxRadius: 1e4 })).toHaveLength(0);
+    expect(orbitPathPoints([0, 0, 0], [0, 0, 1], mu, { maxRadius: 1e4 })).toHaveLength(0);
+  });
+});
+
 describe('degenerate radial trajectories (bug: straight lines through the star)', () => {
   it('draws nothing for a body falling straight at the star', () => {
     // Velocity exactly antiparallel to position ⇒ zero angular momentum. There

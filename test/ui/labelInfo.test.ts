@@ -6,10 +6,12 @@ import {
   formatMass,
   formatTemperature,
   formatVelocity,
+  isLuminousBody,
   starLabelContent,
   starSurfaceTemperatureK,
 } from '../../src/ui/labelInfo';
-import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
+import { FATE_THRESHOLDS, LifecycleStage, RemnantType } from '../../src/config/fateModel';
+import { BROWN_DWARF_TEMPERATURE_K, mainSequenceTemperature } from '../../src/render/starVisual';
 import { BodyType } from '../../src/sim/PhysicsKernel';
 import { auToScene, SOLAR_EFFECTIVE_TEMPERATURE_K } from '../../src/sim/astro';
 import { CATALOGS } from '../../src/i18n/i18n';
@@ -27,6 +29,19 @@ describe('formatters', () => {
     // Jupiter ≈ 9.55e-4 M☉ ≈ 318 M⊕.
     expect(formatMass(9.55e-4)).toContain('M⊕');
     expect(formatMass(0)).toBe('—');
+  });
+
+  it('switches to solar masses at the deuterium-burning limit', () => {
+    // Spec §4.2/§4.7: at and above 0.013 M☉ the object FUSES, so it is a brown
+    // dwarf or a star and must be quoted in M☉ — "4331 M⊕" reads as a planet.
+    const limit = FATE_THRESHOLDS.deuteriumBurningMinMass;
+    expect(formatMass(limit)).toContain('M☉');
+    expect(formatMass(limit)).not.toContain('M⊕');
+    expect(formatMass(limit * 0.99)).toContain('M⊕');
+    // Every companion mass the kernel can produce, including the reported 2–3 M☉.
+    for (const mass of [0.02, 0.08, 0.42, 1, 2, 3, 20]) {
+      expect(formatMass(mass), `${mass} M☉`).toContain('M☉');
+    }
   });
 
   it('formats velocity and distance', () => {
@@ -108,6 +123,84 @@ describe('bodyLabelContent', () => {
     expect(bodyTitleId({ type: BodyType.Planet, mass: earth })).toBe('info.rockyPlanet.title');
     expect(bodyTitleId({ type: BodyType.Planet, mass: earth * 17 })).toBe('info.iceGiant.title');
     expect(bodyTitleId({ type: BodyType.Planet, mass: earth * 318 })).toBe('info.gasGiant.title');
+  });
+
+  it('names a companion star and a brown dwarf, never a planet class', () => {
+    // Reported bug 1: a 2–3 M☉ protoplanet was labelled as a gas giant, because
+    // the mass classes were open-ended at the top.
+    expect(bodyTitleId({ type: BodyType.Star, mass: 2 })).toBe('info.companionStar.title');
+    expect(bodyTitleId({ type: BodyType.BrownDwarf, mass: 0.03 })).toBe(
+      'info.brownDwarfCompanion.title',
+    );
+    // Even when the TYPE lane still says "planet" or "protoplanet", the mass
+    // decides — a body over the hydrogen-burning limit is a star, full stop.
+    for (const type of [BodyType.Planet, BodyType.Protoplanet] as const) {
+      expect(bodyTitleId({ type, mass: 3 })).toBe('info.companionStar.title');
+      expect(bodyTitleId({ type, mass: 0.02 })).toBe('info.brownDwarfCompanion.title');
+    }
+  });
+
+  it('reports a companion by its OWN effective temperature, not an equilibrium one', () => {
+    const companion = {
+      id: 9,
+      type: BodyType.Star,
+      mass: 2,
+      radius: 0.01,
+      distanceScene: auToScene(30),
+    };
+    const content = bodyLabelContent(companion, 1, SOLAR_EFFECTIVE_TEMPERATURE_K);
+    const byId = new Map(content.stats.map((s) => [s.labelId, s.value]));
+    expect(content.titleId).toBe('info.companionStar.title');
+    // Mass in M☉ …
+    expect(byId.get('label.stat.mass')).toBe('2 M☉');
+    // … and its own ~9000 K photosphere, not the ~50 K a body 30 AU from the
+    // primary would be heated to.
+    expect(byId.get('label.stat.surfaceTemp')).toBe(formatTemperature(mainSequenceTemperature(2)));
+    expect(Number.parseFloat(byId.get('label.stat.surfaceTemp') ?? '0')).toBeGreaterThan(1);
+
+    const dwarf = bodyLabelContent(
+      { ...companion, type: BodyType.BrownDwarf, mass: 0.03 },
+      1,
+      SOLAR_EFFECTIVE_TEMPERATURE_K,
+    );
+    const dwarfTemp = dwarf.stats.find((s) => s.labelId === 'label.stat.surfaceTemp')?.value;
+    expect(dwarf.titleId).toBe('info.brownDwarfCompanion.title');
+    expect(dwarfTemp).toBe(formatTemperature(BROWN_DWARF_TEMPERATURE_K));
+  });
+
+  it('recognises a shining body from either the type lane or the mass', () => {
+    // The renderer routes on the same rule, so the two can never disagree about
+    // whether an object gets a ring system or a corona (reported bug 2).
+    expect(isLuminousBody(BodyType.Star, 2)).toBe(true);
+    expect(isLuminousBody(BodyType.BrownDwarf, 0.03)).toBe(true);
+    // Mass alone is enough, even when the type lane still says "planet" …
+    expect(isLuminousBody(BodyType.Planet, 3)).toBe(true);
+    expect(isLuminousBody(BodyType.Protoplanet, 0.02)).toBe(true);
+    // … and the type lane alone is enough, even for an implausibly light one.
+    expect(isLuminousBody(BodyType.Star, 0)).toBe(true);
+    // Worlds, comets and asteroids never shine.
+    for (const type of [
+      BodyType.Planet,
+      BodyType.Protoplanet,
+      BodyType.Comet,
+      BodyType.Asteroid,
+    ] as const) {
+      expect(isLuminousBody(type, 9.55e-4), `${type}`).toBe(false);
+    }
+  });
+
+  it('uses catalogued ids for a companion label in every locale', () => {
+    const content = bodyLabelContent(
+      { id: 4, type: BodyType.Star, mass: 0.5, radius: 0.01, distanceScene: auToScene(20) },
+      1,
+      SOLAR_EFFECTIVE_TEMPERATURE_K,
+    );
+    for (const catalog of Object.values(CATALOGS)) {
+      expect(catalog[content.titleId], `missing ${content.titleId}`).toBeTruthy();
+      for (const stat of content.stats) {
+        expect(catalog[stat.labelId], `missing ${stat.labelId}`).toBeTruthy();
+      }
+    }
   });
 
   it('uses message ids that exist in every catalog', () => {

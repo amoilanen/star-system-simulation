@@ -24,6 +24,42 @@ export enum PlanetClass {
   Rocky,
   IceGiant,
   GasGiant,
+  /**
+   * A world with no condensable solids at all: a small hydrogen/helium envelope
+   * with nothing rocky or icy underneath, which is the only kind of low-mass
+   * world a metal-poor disc could ever assemble (spec §4.3, Decision D3).
+   */
+  GasDwarf,
+}
+
+/**
+ * Metal mass fraction of the Sun's birth cloud — the reference composition, and
+ * the host mirror of `SOLAR_METALLICITY` in `wasm/src/nbody.rs`.
+ */
+export const SOLAR_METALLICITY = 0.02;
+
+/** Ceiling on the solid budget relative to solar (mirror of `MAX_SOLID_FRACTION`). */
+export const MAX_SOLID_FRACTION = 4;
+
+/**
+ * Smallest solid budget that still condenses rock, ice and the debris rings and
+ * moons are made of: an eighth of the solar value, which is exactly the budget
+ * below which the kernel can no longer assemble a single planetary embryo
+ * (`seeded_planetesimal_count` in `wasm/src/lib.rs`).
+ */
+export const MIN_SOLID_FRACTION_FOR_ROCK = 1 / 8;
+
+/**
+ * Condensable-solid budget at `metals`, relative to solar — the host mirror of
+ * `solid_fraction` in `wasm/src/nbody.rs`. In this three-species model the metals
+ * fraction holds every condensable species, so `metals = 0` means no rock, no
+ * ice, and therefore no solid surface, no ring and no moon anywhere in the disc.
+ */
+export function solidFraction(metals: number): number {
+  if (!Number.isFinite(metals) || metals <= 0) {
+    return 0;
+  }
+  return Math.min(metals / SOLAR_METALLICITY, MAX_SOLID_FRACTION);
 }
 
 /**
@@ -36,11 +72,24 @@ export function bodyHash(id: number, channel: number): number {
   return x - Math.floor(x);
 }
 
-/** Classify a planet by mass, matching the info-panel's terminology exactly. */
-export function planetClass(massSolar: number): PlanetClass {
+/**
+ * Classify a planet by mass and by the disc's composition, matching the
+ * info-panel's mass terminology exactly.
+ *
+ * Mass alone is not enough (reported bug 4): rock and ice are made of metals, so
+ * in a metal-poor disc a low-mass world cannot be a "stone" planet and a
+ * mid-mass one cannot be an ICE giant — both are hydrogen/helium puffballs. The
+ * disc's metallicity defaults to solar, which is the composition every existing
+ * classification was written against.
+ */
+export function planetClass(massSolar: number, metals: number = SOLAR_METALLICITY): PlanetClass {
   const earth = solarToEarthMasses(massSolar);
   if (earth >= GAS_GIANT_MIN_EARTH_MASSES) {
+    // A giant is mostly hydrogen and helium whatever the disc is made of.
     return PlanetClass.GasGiant;
+  }
+  if (solidFraction(metals) < MIN_SOLID_FRACTION_FOR_ROCK) {
+    return PlanetClass.GasDwarf;
   }
   if (earth >= ICE_GIANT_MIN_EARTH_MASSES) {
     return PlanetClass.IceGiant;
@@ -74,6 +123,14 @@ const PALETTES: Readonly<Record<PlanetClass, readonly Rgb[]>> = {
     { r: 0.72, g: 0.5, b: 0.36 }, // deep salmon
     { r: 0.66, g: 0.6, b: 0.7 }, // hazy lilac (a cool, methane-rich giant)
   ],
+  // Nothing condenses in a metal-free disc, so there are no oxides, no ices and
+  // none of the hazes that colour the worlds above: a hydrogen/helium envelope
+  // is nearly colourless, scattering blue-grey and washing out to pale.
+  [PlanetClass.GasDwarf]: [
+    { r: 0.58, g: 0.63, b: 0.7 }, // Rayleigh-scattering blue-grey
+    { r: 0.66, g: 0.68, b: 0.71 }, // pale, featureless hydrogen
+    { r: 0.6, g: 0.66, b: 0.68 }, // faint helium-tinted haze
+  ],
 };
 
 /** The full drawn appearance of one planet. */
@@ -100,11 +157,16 @@ export interface PlanetLook {
 export const MAX_MOONS_PER_PLANET = 4;
 
 /**
- * Derive a planet's whole appearance from its id and mass. Deterministic: the
- * same (id, mass class) always yields the same look.
+ * Derive a planet's whole appearance from its id, its mass and the composition
+ * of the disc it grew in. Deterministic: the same (id, class) always yields the
+ * same look.
  */
-export function planetLook(id: number, massSolar: number): PlanetLook {
-  const cls = planetClass(massSolar);
+export function planetLook(
+  id: number,
+  massSolar: number,
+  metals: number = SOLAR_METALLICITY,
+): PlanetLook {
+  const cls = planetClass(massSolar, metals);
   const palette = PALETTES[cls];
   const pick = Math.floor(bodyHash(id, 1) * palette.length) % palette.length;
   const base = palette[pick] ?? palette[0]!;
@@ -116,13 +178,17 @@ export function planetLook(id: number, massSolar: number): PlanetLook {
   //   - Gas giant:  prominent rings on ~30 % of worlds (Saturn-like is the exception)
   //   - Ice giant:  faint rings on ~25 % of worlds (Uranus/Neptune-style, low opacity)
   //   - Rocky:      never — rocky worlds lack the mass / Roche radius to sustain rings
+  // A ring is shattered ice and rock (spec §4.3), so it also needs the disc to
+  // have contained solids in the first place: a metal-free system can show no
+  // rings at all, whatever a world weighs.
+  const solids = solidFraction(metals) >= MIN_SOLID_FRACTION_FOR_ROCK;
   const ringRoll = bodyHash(id, 5);
   let hasRings: boolean;
   let ringProminence: number;
-  if (cls === PlanetClass.GasGiant) {
+  if (cls === PlanetClass.GasGiant && solids) {
     hasRings = ringRoll < 0.3;
     ringProminence = hasRings ? 1.0 : 0;
-  } else if (cls === PlanetClass.IceGiant) {
+  } else if (cls === PlanetClass.IceGiant && solids) {
     hasRings = ringRoll < 0.25;
     ringProminence = hasRings ? 0.3 : 0;
   } else {
@@ -141,14 +207,16 @@ export function planetLook(id: number, massSolar: number): PlanetLook {
     axialTilt: (bodyHash(id, 3) < 0.8 ? 0.6 : 1.9) * (bodyHash(id, 4) - 0.5) * 2,
     hasRings,
     ringProminence,
-    moonCount: moonCountFor(cls, id),
+    moonCount: solids ? moonCountFor(cls, id) : 0,
   };
 }
 
 /**
  * How many moons a world of this class keeps. Giants have deep gravity wells and
  * dozens of satellites; terrestrials have none or one. Bounded by
- * {@link MAX_MOONS_PER_PLANET} because these are drawn, not simulated.
+ * {@link MAX_MOONS_PER_PLANET} because these are drawn, not simulated. A moon is
+ * a solid body, so a disc with no solids hands out none of them (see the
+ * `solids` gate in {@link planetLook}).
  */
 function moonCountFor(cls: PlanetClass, id: number): number {
   const roll = bodyHash(id, 6);

@@ -4,3 +4,4 @@ wasm/target/
 wasm/pkg/
 package-lock.json
 .zenflow/
+.zenflow-attachments/

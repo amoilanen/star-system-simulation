@@ -48,10 +48,21 @@ export interface RenderState {
   /** Whether the simulation is paused — freezes every time-based visual effect. */
   paused?: boolean;
   /**
-   * Central gravitational parameter the kernel integrates against, so the
-   * orbit overlay can reconstruct the exact conics the bodies are following.
+   * The PRIMARY star's gravitational parameter, so the orbit overlay can
+   * reconstruct the conics the bodies are following about the origin. Varies
+   * over a run as a dying star sheds its envelope (Decision D4).
    */
   mu: number;
+  /**
+   * Interleaved buffer of every gravitating centre the kernel integrates
+   * against (ATTRACTOR_STRIDE lanes/centre: `[x, y, z, mu]`): the primary at the
+   * origin followed by any companion stars (Decision D1/D6). `mu` alone
+   * describes only the primary, so anything that has to reason about the whole
+   * field — a companion's light, its perturbation of an orbit — reads this.
+   */
+  attractors: Float32Array;
+  /** Number of active centres in {@link RenderState.attractors}. */
+  attractorCount: number;
   /** Terminal remnant kind, or null before the remnant stage. */
   remnant: RemnantType | null;
   /**
@@ -83,7 +94,17 @@ export interface SceneManagerOptions {
    * Typically derived from the cloud extent; defaults to a sensible value.
    */
   cometTailDistance?: number;
-  /** Bound on drawn orbit-path extent (scene units); trims hyperbolic fly-bys. */
+  /**
+   * Metal mass fraction of the birth cloud. Decides what the worlds can be made
+   * of (spec §4.3): a metal-free disc condenses no rock, ice, rings or moons.
+   * Defaults to solar composition.
+   */
+  discMetallicity?: number;
+  /**
+   * Radius at which an orbit path is cut off (scene units). Belongs OUTSIDE the
+   * framable view so an open conic leaves the screen; see
+   * `OrbitRenderer.setMaxRadius`.
+   */
   orbitMaxRadius?: number;
   /** Active locale for the on-screen body labels. */
   locale?: Locale;
@@ -155,6 +176,13 @@ export class SceneManager {
   private readonly labelLayer: HTMLDivElement;
   private readonly post: PostProcessing;
   private readonly starLight: THREE.PointLight;
+  /**
+   * Second light source, following the brightest self-luminous COMPANION the
+   * body renderer drew this frame (spec §4.7). In a multiple system the worlds
+   * are genuinely lit from two directions — with a single light a companion star
+   * cast no light at all, which is what made it read as one more planet.
+   */
+  private readonly companionLight: THREE.PointLight;
   private readonly resizeHandler: () => void;
 
   private lastBodies: Float32Array = new Float32Array(0);
@@ -201,6 +229,10 @@ export class SceneManager {
     // bloom threshold — planets should be lit, not glow like stars themselves.
     this.starLight = new THREE.PointLight(0xffffff, 1.4, 0, 0.0);
     this.scene.add(this.starLight);
+    // Off until a companion actually exists; positioned and tinted per frame.
+    this.companionLight = new THREE.PointLight(0xffffff, 0, 0, 0.0);
+    this.companionLight.visible = false;
+    this.scene.add(this.companionLight);
     this.scene.add(new THREE.AmbientLight(0x33445a, 0.5));
 
     this.starRenderer = new StarRenderer();
@@ -212,6 +244,9 @@ export class SceneManager {
     this.bodyRenderer = new BodyRenderer();
     if (options.cometTailDistance !== undefined) {
       this.bodyRenderer.setTailActivationDistance(options.cometTailDistance);
+    }
+    if (options.discMetallicity !== undefined) {
+      this.bodyRenderer.setDiscMetallicity(options.discMetallicity);
     }
     this.scene.add(this.bodyRenderer.group);
 
@@ -263,6 +298,22 @@ export class SceneManager {
     this.lastBodies = state.bodies;
     this.lastBodyCount = state.bodyCount;
 
+    // The star's appearance is derived BEFORE the camera settles, because its
+    // radius is the camera's keep-out radius: the star swells over three orders
+    // of magnitude across its life, and a camera focused on the main-sequence
+    // star (~0.02 AU away) would otherwise end up inside the red giant and its
+    // additive corona, filling the screen with glow (reported bug 6).
+    const appearance = starAppearance(
+      state.stage,
+      state.mass,
+      state.stageProgress,
+      state.remnant,
+      state.composition,
+      state.supernova === true,
+      state.cloudExtent,
+    );
+    this.cameraController.setKeepOutRadius(appearance.visible ? appearance.radius : 0);
+
     // Settle the camera FIRST. The renderers below floor every body to a minimum
     // apparent size, which is a function of its distance to the camera — so they
     // must see the camera where it ends up this frame, not where it was last
@@ -285,15 +336,22 @@ export class SceneManager {
     );
     this.orbits.update(state.bodies, state.bodyCount, state.mu);
 
-    const appearance = starAppearance(
-      state.stage,
-      state.mass,
-      state.stageProgress,
-      state.remnant,
-      state.composition,
-      state.supernova === true,
-      state.cloudExtent,
-    );
+    // A companion star lights the system too. Its intensity is derived from the
+    // same bounded `glow` the halo uses, and capped at the primary's so the
+    // second light can brighten a scene but never blow it out — lit planets must
+    // stay below the bloom threshold whichever star is lighting them.
+    const companion = this.bodyRenderer.luminousCompanion;
+    this.companionLight.visible = companion !== null;
+    if (companion !== null) {
+      this.companionLight.position.set(
+        companion.position[0],
+        companion.position[1],
+        companion.position[2],
+      );
+      this.companionLight.color.setRGB(companion.color.r, companion.color.g, companion.color.b);
+      this.companionLight.intensity = Math.min(1.4, 0.35 + companion.glow * 0.65);
+    }
+
     this.starRenderer.update(appearance, animDt, this.camera, viewportHeightPx);
     this.starLight.visible = appearance.visible;
     this.starLight.color.setRGB(appearance.color.r, appearance.color.g, appearance.color.b);

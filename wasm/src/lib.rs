@@ -24,30 +24,56 @@ use bodies::{
     VisitorClassification,
 };
 use nbody::{
-    accretion_efficiency, accretion_radius, body_radius_from_mass, circular_speed, integrate_orbit,
-    is_bound, magnitude, merge_radius, merged_velocity, orbital_step, periapsis_distance,
-    softened_accel, stable_substep, Vec3, BODY_DAMP_FRACTION, DISK_SETTLE, GAS_DRAG, GRAVITY,
-    MAX_PARTICLES, MAX_SUBSTEPS, ORBITAL_MASS_SCALE, ORBITAL_MAX, SNOW_LINE_AU, SOFTENING,
-    VERTICAL_DAMP,
+    accretion_efficiency, accretion_radius, attractor_accel, body_radius_from_mass, circular_speed,
+    integrate_orbit_attractors, is_bound, magnitude, merge_radius, merged_velocity, orbital_step,
+    periapsis_distance, solid_fraction, stable_substep, total_specific_energy_attractors,
+    Attractor, AttractorSet, Vec3, BODY_DAMP_FRACTION, DISK_SETTLE, GAS_DRAG, GRAVITY, INTERNAL_DT,
+    MAX_ATTRACTORS, MAX_PARTICLES, MAX_SUBSTEPS, ORBITAL_MASS_SCALE, ORBITAL_MAX, SNOW_LINE_AU,
+    SOFTENING, VERTICAL_DAMP,
 };
 #[cfg(test)]
 use stages::cloud_mass_for_star;
 use stages::{
-    bool_f64, determine_fate, is_substellar, remnant_mass, stage_durations,
-    stellar_mass_from_cloud, FateOutcome, LifecycleStage, PackedEvent, SimEventType,
+    bool_f64, companion_count, determine_fate, is_substellar, remnant_mass, stage_durations,
+    stellar_mass_from_cloud, FateOutcome, LifecycleStage, PackedEvent, RemnantType, SimEventType,
+    DEUTERIUM_BURNING_MIN_MASS, HYDROGEN_BURNING_MIN_MASS,
 };
 
 /// Number of Float32 lanes per particle (mirror `PARTICLE_STRIDE`).
 const PARTICLE_STRIDE: usize = 7;
 /// Number of Float32 lanes per body (mirror `BODY_STRIDE`).
 const BODY_STRIDE: usize = 12;
+/// Number of Float32 lanes per gravitating centre (mirror `ATTRACTOR_STRIDE`):
+/// `[x, y, z, mu]`.
+const ATTRACTOR_STRIDE: usize = 4;
 /// Number of Float64 lanes per packed event: [type, simTime, dataA, dataB].
 const EVENT_STRIDE: usize = 4;
 
-/// Number of planetesimal seeds placed in the disc (survivors become planets).
-/// 8 seeds → geometric spacing ratio ≈ 1.68 for a 50 AU disc, matching real
-/// adjacent-orbit ratios (Solar System ≈ 1.4–1.9).
+/// Number of planetesimal seeds placed in a disc with a SOLAR (or richer) solid
+/// budget; survivors become planets. 8 seeds → geometric spacing ratio ≈ 1.68
+/// for a 50 AU disc, matching real adjacent-orbit ratios (Solar System ≈ 1.4–1.9).
 const PLANETESIMAL_COUNT: usize = 8;
+
+/// How many planetesimal embryos a disc of metallicity `metals` can actually
+/// assemble (spec §4.3, Decision D3).
+///
+/// Embryos condense out of grains, and in this three-species model the grains
+/// ARE the metals — so the embryo count is the solar count scaled by the solid
+/// budget, measured in embryos: one embryo is an eighth of the condensable
+/// inventory of a solar-metallicity disc. Below an eighth of solar there is not
+/// enough solid material to assemble even one, and the disc seeds NOTHING: a
+/// 100 % hydrogen cloud forms no planets at all, rocky or otherwise (reported
+/// bug 4). The count is capped at `PLANETESIMAL_COUNT` because a metal-rich disc
+/// builds BIGGER worlds (through `accretion_efficiency`) rather than more of
+/// them — the disc's radial room for well-separated embryos is unchanged.
+fn seeded_planetesimal_count(metals: f64) -> usize {
+    let solids = solid_fraction(metals).min(1.0);
+    let embryos = (PLANETESIMAL_COUNT as f64 * solids).floor().max(0.0);
+    // `embryos` is finite, non-negative and ≤ PLANETESIMAL_COUNT by construction.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let count = embryos as usize;
+    count.min(PLANETESIMAL_COUNT)
+}
 /// Sim seconds between visiting comet/asteroid spawns (mirror).
 const VISITOR_SPAWN_INTERVAL: f64 = 8.0e15;
 /// Cap on simultaneously present visiting bodies so captured ones cannot
@@ -86,10 +112,50 @@ const BODY_SWALLOW_FRACTION: f64 = 0.6;
 const ESCAPE_EXTENT_FACTOR: f64 = 2.4;
 /// Death EJECTA is followed far further out than ordinary dust: the expanding
 /// shell IS the death scene, so it must survive while it sweeps outward through
-/// the planetary system and on past it (mirror of the TS fallback).
-const EJECTA_ESCAPE_EXTENT_FACTOR: f64 = 9.0;
-/// Number of ejecta particles thrown out when the star dies (nebula/supernova).
+/// the planetary system and on past it.
+///
+/// Deliberately far beyond anything the camera frames. The cull used to be the
+/// thing that ENDED the nebula — measured: 2198 fragments at step 800, none at
+/// step 1600, i.e. the whole shell vanished about fifteen seconds of playback
+/// after the remnant appeared, mid-flight and all at once. What ends it now is
+/// `EJECTA_LIFETIME`, which fades it out gradually; this radius only stops the
+/// book-keeping from following gas that left the scene long ago.
+const EJECTA_ESCAPE_EXTENT_FACTOR: f64 = 26.0;
+/// Number of ejecta particles the star's envelope is divided into. They are NOT
+/// thrown at once — see `shed_envelope`.
 const EJECTA_COUNT: usize = 2200;
+/// How long (orbital-time units) a fragment of the envelope stays visible, and
+/// the tail of that lifetime over which it fades out.
+///
+/// A planetary nebula really does disperse: it glows for a few tens of thousands
+/// of years and is then indistinguishable from the interstellar medium. So the
+/// shell must END — but as a NEBULA that thins and dims, not as 2200 particles
+/// deleted between two frames. The lifetime is randomised per fragment (see
+/// `shed_envelope`) so the count decays smoothly instead of stepping.
+///
+/// This is also the clock the REMNANT stage's `stage_progress` is reported on,
+/// so the drawn nebula (`remnantAppearance`) fades in step with the gas.
+const EJECTA_LIFETIME: f64 = 260.0;
+/// Share of `EJECTA_LIFETIME` spent visibly fading (brightness and size).
+const EJECTA_FADE_FRACTION: f64 = 0.65;
+/// Rate (per orbital-time unit) at which the death shell is slowed by the
+/// interstellar medium it sweeps up.
+///
+/// Real remnants do not coast forever: once a shell has swept up its own mass of
+/// ambient gas it enters the snowplough phase, decelerates and finally stalls at
+/// a fixed radius, where it fades. Here that is what keeps the nebula ON SCREEN
+/// — it settles at `EJECTA_STALL_REACH` cloud radii instead of leaving the
+/// system — and it removes the pace-dependence of how far a fragment can drift:
+/// however long it flies, it stops in the same place.
+///
+/// DERIVED from `DEATH_SWEEP`, so the choreography of the death is the primary
+/// statement and the deceleration merely implements it.
+const EJECTA_DRAG: f64 = DEATH_SWEEP / DEATH_ORBITAL_SPAN;
+/// How much of its stall radius the shell has swept by the time the remnant
+/// appears, as the exponent of `1 − e^-sweep` — `0.6` puts the shell edge at
+/// ~45 % of its stall radius, i.e. 0.6–1.1 cloud radii, still comfortably inside
+/// the framed system. Mirrored as `DEATH_SWEEP` in `starVisual.ts`.
+const DEATH_SWEEP: f64 = 0.6;
 /// Debris fragments spawned when a body is tidally disrupted by the star.
 const DEBRIS_PER_BODY: usize = 140;
 /// Orbital-time lifetime of a tidal-disruption debris stream (mirror of
@@ -103,22 +169,36 @@ const DEBRIS_LIFETIME: f64 = 6.0;
 /// stream is shredded, shocked and colliding with itself, so it loses angular
 /// momentum fast and spirals into the star.
 const DEBRIS_DRAG: f64 = 0.6;
-/// How far the death shell coasts, in multiples of the cloud extent, over the
-/// span of the DEATH stage (mirror of `EJECTA_SHELL_REACH`).
+/// Radius, in multiples of the cloud extent, at which the death shell finally
+/// STALLS (mirror of `SHELL_STALL_REACH` in `starVisual.ts` — the drawn shock
+/// front and the integrated fragments must move together).
 ///
-/// The speed is derived ASYMPTOTICALLY and GEOMETRICALLY. Asymptotically: the
-/// fragment's total specific energy is exactly v_inf^2/2 > 0, so it is provably
-/// unbound and no part of the shell can settle into a ring around the remnant.
-/// Geometrically: the shell sweeps the same fraction of the system over the same
-/// number of frames whatever the star's mass, so the death is framed identically
-/// for a red dwarf and for a black-hole progenitor.
-const EJECTA_SHELL_REACH_SUPERNOVA: f64 = 5.5;
-const EJECTA_SHELL_REACH_NEBULA: f64 = 2.2;
-/// Radius (scene units) at which the shell is launched: outside the softened
-/// core, where the integrator resolves the motion comfortably, and about where a
-/// red supergiant's photosphere sits when the shock breaks out.
-const EJECTA_LAUNCH_RADIUS_MIN: f64 = 3.0;
-const EJECTA_LAUNCH_RADIUS_MAX: f64 = 6.0;
+/// The shell is launched at `EJECTA_DRAG × stall × cloud_extent` and decelerates
+/// exponentially toward this radius, so it covers a fixed FRACTION of it over
+/// the death stage (~45 %, i.e. 0.7–1.1 cloud radii — still comfortably framed
+/// when the remnant appears) and then creeps outward for the rest of its life.
+///
+/// The old model instead gave the shell escape velocity from the visually
+/// inflated central potential and let it coast to 5.5 / 2.2 cloud radii within
+/// the death stage — 275 / 110 AU for a default 50 AU cloud, against a view
+/// about 62 AU high. The envelope was therefore already off-screen when the
+/// remnant appeared and was then deleted outright, which is exactly the reported
+/// "the matter condenses into a white dwarf; there is no nebula".
+const EJECTA_STALL_REACH_SUPERNOVA: f64 = 1.5;
+const EJECTA_STALL_REACH_NEBULA: f64 = 1.4;
+/// Stall radius of the slow SUPERWIND that leaves during the late red giant, in
+/// the same units.
+///
+/// An AGB star sheds much of its envelope in a dense, dusty wind at ~10 km/s
+/// long before the terminal event — far slower than the blast that follows and
+/// eventually ploughs into it. That is literally how a planetary nebula is made,
+/// and it is what lets the viewer SEE the gas leave the star instead of finding
+/// it already gone.
+const EJECTA_STALL_REACH_WIND: f64 = 0.5;
+/// Fractional thickness of the shell the wind is launched into: the photosphere
+/// is not a mathematical surface, and a shell of exactly one radius reads as a
+/// soap bubble rather than as gas.
+const EJECTA_LAUNCH_SPREAD: f64 = 0.3;
 
 /// Internal structure of the DEATH stage, as fractions of its duration (mirror
 /// of `DEATH_PHASES` in `src/sim/stages.ts`). A core-collapse supernova is a
@@ -131,10 +211,60 @@ const DEATH_SHOCK_BREAKOUT: f64 = 0.12;
 /// red giant straight to remnant. Capping how much of the stage a single step
 /// may consume makes the death always watchable.
 const DEATH_MIN_STEPS: f64 = 240.0;
+/// Orbital time the DEATH stage spans at the fastest pace: the bounded number of
+/// steps it must take, times the bounded orbital time each of them may advance.
+/// The unit the death scene is choreographed in — `EJECTA_DRAG` is set against
+/// it, and the renderer mirrors it as `DEATH_SWEEP` in `starVisual.ts`.
+const DEATH_ORBITAL_SPAN: f64 = DEATH_MIN_STEPS * ORBITAL_MAX;
+// --- Mass loss drives the orbits (Decision D4) -------------------------------
+//
+// A dying star's gravity WEAKENS as it sheds its envelope, and the orbits of the
+// worlds that survive widen because of it: `a ∝ 1/M` for slow (adiabatic) loss.
+// The kernel therefore carries a `mass_loss_factor` that scales the primary's
+// `mu`, and the widening is an OUTCOME of integrating with the weaker force.
+//
+// It used to be applied as a single algebraic rewrite of every surviving
+// planet's position and velocity at the Death→Remnant boundary (`r → r/retained`,
+// `v → v·√retained`). For a 3 M☉ star that teleported every planet outward by
+// ~4× in ONE frame — measured: 6.7/11.3/17.0/34.7 AU on one step, then
+// 27.7/46.2/69.4/135.4 AU on the next. Worlds hidden inside the red giant's glare
+// therefore seemed to POP INTO EXISTENCE at new radii the moment the star
+// collapsed, which is the reported "new planets emerge out of the collapsed
+// giant". Nothing was created; the orbits simply jumped.
+
+/// Progress through the RED GIANT stage at which the superwind starts carrying
+/// the envelope away. Before this the factor is exactly 1.0, so formation and the
+/// entire main sequence are numerically untouched by this mechanism.
+const REDGIANT_MASS_LOSS_ONSET: f64 = 0.55;
+/// Share of the star's TOTAL mass loss already gone by the end of the red giant.
+///
+/// Real AGB stars shed a substantial part of the envelope in a slow superwind
+/// long before the terminal event. Kept modest on purpose: an abrupt drop of more
+/// than half the gravity would unbind a circular orbit outright (`v² > 2mu'/r`),
+/// and the red-giant stage may legitimately be crossed in very few steps at a
+/// fast pace, so this share must stay safely below that limit.
+const REDGIANT_MASS_LOSS_SHARE: f64 = 0.25;
+/// Death-stage progress (measured from `DEATH_SHOCK_BREAKOUT`) over which the
+/// REST of the envelope leaves, for the two physically distinct channels.
+///
+/// A core-collapse supernova is IMPULSIVE: the envelope is gone in days — far
+/// less than an orbital period — so the surviving planets keep the velocity they
+/// had while the gravity holding them vanishes, and the loosely bound ones are
+/// unbound. A planetary nebula is puffed off over millennia, i.e. slowly compared
+/// with an orbit, so the orbits follow adiabatically and stay bound as they widen.
+const DEATH_MASS_LOSS_SPAN_IMPULSIVE: f64 = 0.04;
+const DEATH_MASS_LOSS_SPAN_ADIABATIC: f64 = 0.7;
+
 /// Red-giant photospheric reach in AU (= scene units) for a 1 M☉ star; scaled
 /// by mass^0.8 (matching mainSequenceRadius ∝ M^0.8 × RED_GIANT_SWELL). This
 /// ensures no planet survives visually inside the giant at any stellar mass.
 const REDGIANT_ENGULF_AU: f64 = 2.2;
+/// The star's photosphere on the main sequence as a fraction of its red-giant
+/// photosphere — the inverse of the drawn `RED_GIANT_SWELL` (×250). The giant
+/// SWELLS through the stage, so the surface the wind leaves from (and the
+/// surface a planet cannot survive inside) grows with it instead of appearing
+/// at full size the instant the stage begins.
+const MAIN_SEQUENCE_PHOTOSPHERE_FRACTION: f64 = 1.0 / 250.0;
 
 /// Core mass fractions — of the FINAL STELLAR MASS, not of the cloud — at which
 /// the FORMATION stages advance (mirror the TS fallback's `*_CORE_FRACTION`).
@@ -166,6 +296,65 @@ const IGNITED_RADIATION_BETA: f64 = 1.16;
 /// number of frames whatever the cloud mass.
 const CORE_ACCRETION_RATE: f64 = 0.008;
 
+// --- Companion stars from cloud fragmentation (spec §4.2, Decision D1) ------
+//
+// A cloud holding more than one Jeans mass cannot collapse as a single object:
+// it breaks into pieces (`stages::companion_count`). Each piece becomes a
+// SECOND star, with its own gravity acting on the planets and the dust — which
+// is what the user asked for, and what no amount of planetesimal accretion can
+// produce. The bug they actually saw is the other half of this: a body that DID
+// grow past the hydrogen-burning limit was still typed (and drawn) as a ringed
+// gas giant, which `promote_bodies` now fixes by classifying on mass.
+
+/// How many companions may exist: one per spare gravitating centre (Decision D6).
+const MAX_COMPANIONS: usize = MAX_ATTRACTORS - 1;
+
+/// Mass of each companion as a fraction of the PRIMARY's assembled mass — the
+/// binary mass ratio `q`, in fragment order (most massive first).
+///
+/// Always below 1 by construction: the primary is by definition the piece that
+/// won the competition for the cloud's gas. The values sit in the middle of the
+/// observed `q` distribution for wide multiples.
+const COMPANION_MASS_RATIOS: [f64; MAX_COMPANIONS] = [0.35, 0.15];
+
+/// Share of the cloud gas that NEVER reaches the primary and may therefore be
+/// claimed by the fragments.
+///
+/// A cloud only ever assembles a fraction of itself into its primary star (see
+/// `stellar_mass_from_cloud`); the rest is blown back into the interstellar
+/// medium. Companions are fed out of exactly that surplus, so the primary's
+/// budget — and with it the calibrated formation timing, the stage durations and
+/// the fate model, all of which are keyed on `star_mass` — is left untouched.
+const COMPANION_BUDGET_CAP: f64 = 0.6;
+
+/// Mass (M☉) a fragment is BORN with: the opacity limit for fragmentation, the
+/// smallest piece a collapsing cloud can resolve — a few Jupiter masses.
+///
+/// Below this the gas becomes optically thick, can no longer radiate away the
+/// heat of its own compression, and the rising pressure stops any further
+/// break-up. So every fragment starts as a bare hydrostatic core — well under
+/// the deuterium limit — and is SEEN to grow: first into a brown dwarf, and (if
+/// its share of the cloud is large enough) on through the hydrogen-burning limit
+/// into a star, which is the moment `CompanionIgnited` fires.
+const COMPANION_SEED_MASS: f64 = 0.005;
+
+/// Semi-major axis of the innermost companion, in cloud extents, and the random
+/// spread added to it.
+///
+/// Well outside the primary's dust disc (which ends at `DISC_OUTER_FRACTION`) so
+/// the companion is a WIDE binary: its worlds keep their orbits instead of being
+/// scattered, which is the configuration in which planets are actually observed
+/// around one member of a binary. Each further companion is
+/// `COMPANION_ORBIT_HIERARCHY` times wider still, making the system hierarchical
+/// — the only stable arrangement for three bodies.
+const COMPANION_ORBIT_INNER_FRACTION: f64 = 1.6;
+const COMPANION_ORBIT_SPREAD_FRACTION: f64 = 0.5;
+const COMPANION_ORBIT_HIERARCHY: f64 = 2.1;
+/// Companion orbital eccentricity range. Mildly eccentric, as observed for wide
+/// pairs, but far from the disc-crossing orbits that would wreck the planets.
+const COMPANION_ECCENTRICITY_MIN: f64 = 0.05;
+const COMPANION_ECCENTRICITY_SPAN: f64 = 0.25;
+
 /// Per-species dust colour tint (linear RGB) + point size, mirroring
 /// `SPECIES_COLOR` and `speciesColorSize` in the fallback.
 const SPECIES_HYDROGEN: ([f64; 3], f64) = ([0.45, 0.6, 1.0], 1.0);
@@ -178,6 +367,66 @@ const SPECIES_METALS: ([f64; 3], f64) = ([1.0, 0.62, 0.32], 1.4);
 #[must_use]
 pub fn kernel_version() -> u32 {
     2
+}
+
+/// What a body of this mass IS (spec §4.2). The single rule for typing every
+/// non-visiting body, applied to its OWN mass — which is precisely what the
+/// reported bug was missing: a 2–3 M☉ object was typed `Planet` because the
+/// promotion looked only at the lifecycle stage, so the renderer drew a star
+/// with rings and moons.
+///
+/// `ignited` distinguishes the two planetary kinds: a world is a `Protoplanet`
+/// while the star is still assembling and a `Planet` once it shines. It has no
+/// bearing on the substellar/stellar boundaries, which are set by physics the
+/// primary's lifecycle has no say in.
+#[must_use]
+fn classify_by_mass(mass: f64, ignited: bool) -> BodyType {
+    if mass >= HYDROGEN_BURNING_MIN_MASS {
+        BodyType::Star
+    } else if mass >= DEUTERIUM_BURNING_MIN_MASS {
+        BodyType::BrownDwarf
+    } else if ignited {
+        BodyType::Planet
+    } else {
+        BodyType::Protoplanet
+    }
+}
+
+/// Final masses (M☉) of the companions a cloud fragments into, in fragment order
+/// (spec §4.2). Empty when the cloud holds less than one spare Jeans mass.
+///
+/// Each fragment claims `COMPANION_MASS_RATIOS[i]` of the primary's assembled
+/// mass, and the whole set is clipped to the share of the cloud that never
+/// reaches the primary anyway (`COMPANION_BUDGET_CAP`) so no gram is invented and
+/// the primary's own budget is untouched. A fragment too light to become a star
+/// is dropped: this channel models the pieces a collapsing cloud resolves into,
+/// not the planets that condense in the disc.
+#[must_use]
+fn plan_companion_masses(cloud_mass: f64, cloud_extent: f64, star_mass: f64) -> Vec<f64> {
+    let count = companion_count(cloud_mass, cloud_extent, MAX_COMPANIONS);
+    if count == 0 || !star_mass.is_finite() || star_mass <= 0.0 {
+        return Vec::new();
+    }
+    let mut targets: Vec<f64> = COMPANION_MASS_RATIOS
+        .iter()
+        .take(count)
+        .map(|q| q * star_mass)
+        .collect();
+    // The gas the primary will never take: everything outside its own budget and
+    // outside the seed core it starts from.
+    let surplus = (cloud_mass * (1.0 - CORE_SEED_FRACTION) - star_mass).max(0.0);
+    let allowance = surplus * COMPANION_BUDGET_CAP;
+    let wanted: f64 = targets.iter().sum();
+    if wanted > allowance && wanted > 0.0 {
+        let scale = allowance / wanted;
+        for target in &mut targets {
+            *target *= scale;
+        }
+    }
+    // A piece that cannot even reach the deuterium-burning limit is not a
+    // fragment of the collapse in any meaningful sense.
+    targets.retain(|m| *m >= DEUTERIUM_BURNING_MIN_MASS);
+    targets
 }
 
 /// The `WebAssembly.Memory` backing this module, so TypeScript can build
@@ -283,19 +532,59 @@ pub struct Kernel {
     particles: Vec<Particle>,
     bodies: Vec<CelestialBody>,
 
+    /// Final mass (M☉) of each companion the cloud's fragmentation supports, in
+    /// fragment order (spec §4.2). Empty for any cloud that holds less than one
+    /// spare Jeans mass — most of them.
+    ///
+    /// Derived in the constructor because it depends only on the cloud's mass and
+    /// extent: the fragments' SHARE of the budget therefore exists from the first
+    /// frame, even though the fragment bodies themselves are not seeded until the
+    /// protostar (and its disc) exist.
+    companion_targets: Vec<f64>,
+
+    /// Fraction of the primary's gravity that is still there, i.e. `mu` is
+    /// multiplied by it (Decision D4). Exactly 1.0 until the late red giant, then
+    /// ramps monotonically down to `remnant_mass / star_mass`. This is the ONLY
+    /// mechanism that widens the surviving orbits — nothing rewrites positions.
+    mass_loss_factor: f64,
+    /// Envelope mass (M☉) the dying star has already handed to the wind. It is
+    /// MOVED out of `core_mass` into the ejecta particles, never deleted, so the
+    /// gas the viewer sees leaving is the mass the star actually lost.
+    shed_mass: f64,
+    /// How many of the envelope's `EJECTA_COUNT` fragments have been launched so
+    /// far. The wind is continuous, so this only ever grows, one batch per step.
+    ejecta_launched: usize,
+    /// Orbital time spent in the terminal `Remnant` stage — the nebula's age.
+    /// The stage itself lasts forever, so this (not the stage duration) is what
+    /// `compute_stage_progress` reports there, and it is the SAME clock the
+    /// ejecta's `ttl` runs on, so the drawn shell and the particles fade
+    /// together.
+    remnant_elapsed: f64,
+
     particle_buf: Vec<f32>,
     body_buf: Vec<f32>,
+    attractor_buf: Vec<f32>,
     event_buf: Vec<f64>,
 
     sim_time: f64,
     next_body_id: f64,
     spawn_accumulator: f64,
-    ejecta_done: bool,
+    /// Whether the leftover disc has been swept away at shock breakout (once).
+    disc_dissipated: bool,
     /// Whether planetesimals have been seeded yet. They are NOT seeded in the
     /// constructor: real planetesimals form in the protoplanetary disc alongside
     /// the protostar (spec §3.8), so they cannot predate it. Seeding is deferred
     /// to ProtostarCoalescence entry in `advance_stages`, guarded by this flag.
     planetesimals_seeded: bool,
+    /// How many embryos this cloud's SOLID budget can assemble (spec §4.3). Fixed
+    /// at construction from the composition, because the dust budget handed to the
+    /// particles has to reserve exactly the embryo mass that will later be seeded
+    /// — unseeded embryos leave their mass in the dust.
+    planetesimal_count: usize,
+    /// Whether the cloud's fragments have been seeded as bodies yet. Like the
+    /// planetesimals they appear at ProtostarCoalescence entry — fragmentation is
+    /// what the collapse DOES, so it cannot predate the collapse.
+    companions_seeded: bool,
 }
 
 #[wasm_bindgen]
@@ -342,23 +631,35 @@ impl Kernel {
             core_fraction: core_mass / star_mass,
             particles: Vec::new(),
             bodies: Vec::new(),
+            companion_targets: plan_companion_masses(cloud_mass, cloud_extent, star_mass),
+            // Full gravity: a star that has not started dying has lost nothing.
+            mass_loss_factor: 1.0,
+            shed_mass: 0.0,
+            ejecta_launched: 0,
+            remnant_elapsed: 0.0,
             particle_buf: Vec::new(),
             body_buf: Vec::new(),
+            attractor_buf: Vec::new(),
             event_buf: Vec::new(),
             sim_time: 0.0,
             next_body_id: 0.0,
             spawn_accumulator: 0.0,
-            ejecta_done: false,
+            disc_dissipated: false,
             // Planetesimals are NOT seeded here — they cannot predate the protostar
             // (spec §3.8). Seeding is deferred to ProtostarCoalescence entry in
             // `advance_stages`, triggered by `planetesimals_seeded`.
             planetesimals_seeded: false,
+            planetesimal_count: seeded_planetesimal_count(metals),
+            companions_seeded: false,
         };
         kernel.seed_particles(particle_count as usize);
         // bodies starts empty; `rebuild_body_buffer` grows it when bodies are seeded.
         kernel.particle_buf = vec![0.0; kernel.particles.len() * PARTICLE_STRIDE];
         kernel.body_buf = vec![];
         kernel.write_particle_buffer();
+        // The primary exists from the first frame, so the host can read the
+        // gravitating centres before the first `step`.
+        kernel.rebuild_attractor_buffer();
         kernel
     }
 
@@ -374,24 +675,41 @@ impl Kernel {
         let mut events: Vec<PackedEvent> = Vec::new();
         self.sim_time += dt_sim_seconds;
 
+        // How much of the primary's gravity is left (D4). Refreshed BEFORE the
+        // integration so a dying star's weakened pull is what this step's orbits
+        // actually feel, and the widening is emergent rather than applied.
+        self.update_mass_loss();
+
         // Emergent dynamics on the bounded, watchable orbital clock. This grows
         // the accreted core mass, which in turn drives the formation stages.
         let orbital = orbital_step(dt_sim_seconds);
+        // Orbital time this step actually advanced; also the clock the nebula
+        // ages on once the remnant has formed.
+        let mut orbital_advanced = 0.0;
         if orbital > 0.0 {
             // Resolve the FASTEST orbit present, not a fixed timestep: otherwise
             // a heavy, compact cloud under-samples its innermost orbit and the
             // integrator invents the energy that ejects the planet.
-            let h_max = stable_substep(self.mu(), SOFTENING, self.innermost_body_radius());
+            let h_max = self.stable_substep_for_attractors();
             let substeps = (orbital / h_max).ceil().max(1.0).min(MAX_SUBSTEPS as f64) as usize;
             // If even MAX_SUBSTEPS cannot resolve the step, advance LESS orbital
             // time rather than integrating it inaccurately: the dynamics run
             // slower on screen, which is honest, instead of flinging bodies out.
             let advanced = orbital.min(substeps as f64 * h_max);
+            orbital_advanced = advanced;
             let h = advanced / substeps as f64;
             let forming = (self.stage as u32) <= LifecycleStage::FusionIgnition as u32;
+            // WHICH bodies are centres is fixed for the whole loop — nothing here
+            // adds, removes or re-types a body — so the only part that walks the
+            // body list is done once instead of once per substep (up to
+            // `MAX_SUBSTEPS` times).
+            let (chosen, chosen_count) = self.attractor_indices();
             for _ in 0..substeps {
-                self.integrate_particles(h, forming);
-                self.integrate_bodies(h);
+                // Their POSITIONS are re-read every substep: a companion IS a
+                // body, so its attractor moves with it as the substep advances.
+                let attractors = self.attractor_set_from(&chosen[..chosen_count]);
+                self.integrate_particles(&attractors, h, forming);
+                self.integrate_bodies(&attractors, h);
             }
             let stage = self.stage;
             self.accrete(stage, advanced, h);
@@ -402,30 +720,48 @@ impl Kernel {
 
         // Drive the lifecycle: FORMATION from accreted core mass, STELLAR by time.
         self.core_fraction = self.core_mass / self.star_mass.max(f64::EPSILON);
+        let was_remnant = self.stage == LifecycleStage::Remnant;
         self.advance_stages(dt_sim_seconds, self.core_fraction, &mut events);
-
-        // Once the star ignites, the surviving planetesimals are full planets.
-        if self.stage as u32 >= LifecycleStage::FusionIgnition as u32 {
-            self.promote_planets();
+        if was_remnant {
+            // The nebula's own clock: it starts at exactly zero on the step the
+            // remnant appears, so the drawn shell hands over from the death
+            // sequence without a seam.
+            self.remnant_elapsed += orbital_advanced;
         }
-        // The shell is thrown at SHOCK BREAKOUT, not the instant the star enters
-        // its death throes: the core spends the first moments imploding, and
-        // only when the rebound shock reaches the surface is anything actually
-        // expelled. The renderer flashes on the same fraction, so the ejecta
-        // appears exactly when the star flares. Everything still circling the
-        // star is swept away at the same moment.
-        if !self.ejecta_done && self.has_shock_broken_out() {
+        // A stage boundary crossed just now changes how much envelope is gone, so
+        // the value the host reads (`orbital_mu`) matches this step's outcome.
+        self.update_mass_loss();
+
+        // Re-type every body from its own mass: the surviving planetesimals are
+        // full planets once the star ignites, and anything that has grown past a
+        // burning limit is a brown dwarf or a companion STAR (spec §4.2).
+        self.promote_bodies(&mut events);
+        // The swelling giant destroys whatever is inside its photosphere. Checked
+        // EVERY step for the whole red-giant/death phase, not once at red-giant
+        // onset: the star keeps swelling after the stage begins, and a world that
+        // drifts inward later is just as doomed as one that was already there.
+        self.engulf_inner_planets(&mut events);
+        // Whatever the star has lost by now LEAVES it, as gas. This is the same
+        // book-keeping that weakened its gravity a few lines above (D4), so the
+        // envelope the viewer sees departing and the widening of the surviving
+        // orbits are one mechanism rather than two that can disagree.
+        self.shed_envelope();
+        // Everything still circling the star is swept away when the shock breaks
+        // out: the core spends the first moments of the death imploding, and only
+        // when the rebound shock reaches the surface is the disc actually cleared.
+        if !self.disc_dissipated && self.has_shock_broken_out() {
             self.dissipate_disc_material();
-            self.spawn_ejecta();
-            self.ejecta_done = true;
+            self.disc_dissipated = true;
         }
 
         self.spawn_visitors(dt_sim_seconds);
         self.resolve_visitors(&mut events);
+        self.eject_escaping_worlds(&mut events);
         self.cull_particles();
 
         self.rebuild_particle_buffer();
         self.rebuild_body_buffer();
+        self.rebuild_attractor_buffer();
         self.pack_events(&events);
         events.len() as u32
     }
@@ -452,6 +788,27 @@ impl Kernel {
     #[must_use]
     pub fn body_len(&self) -> u32 {
         self.body_buf.len() as u32
+    }
+
+    /// Pointer to the interleaved attractor buffer in linear memory: the
+    /// gravitating centres this kernel is integrating against, `[x, y, z, mu]`
+    /// per centre (mirror `ATTRACTOR_STRIDE` / `ATTRACTOR_OFFSET`).
+    #[must_use]
+    pub fn attractor_ptr(&self) -> u32 {
+        self.attractor_buf.as_ptr() as usize as u32
+    }
+
+    /// Length (in f32 lanes) of the attractor buffer.
+    #[must_use]
+    pub fn attractor_len(&self) -> u32 {
+        self.attractor_buf.len() as u32
+    }
+
+    /// Number of gravitating centres present (primary + live companions), never
+    /// more than `MAX_ATTRACTORS`.
+    #[must_use]
+    pub fn attractor_count(&self) -> u32 {
+        (self.attractor_buf.len() / ATTRACTOR_STRIDE) as u32
     }
 
     /// Pointer to the packed events buffer (f64 lanes) drained each `step`.
@@ -500,14 +857,18 @@ impl Kernel {
         self.star_mass
     }
 
-    /// The central gravitational parameter this kernel is actually integrating
-    /// against.
+    /// The PRIMARY star's gravitational parameter, as this kernel is actually
+    /// integrating it right now.
     ///
     /// Exported so the renderer can reconstruct exactly the Kepler conics the
-    /// bodies are following (the orbit-path overlay). The kernel is the single
-    /// source of truth for it: the host used to recompute `mu` itself from
-    /// duplicated `GRAVITY` / `ORBITAL_MASS_SCALE` constants, which was one more
-    /// thing that had to be kept in sync by hand.
+    /// bodies are following about the origin (the orbit-path overlay). The kernel
+    /// is the single source of truth for it: the host used to recompute `mu`
+    /// itself from duplicated `GRAVITY` / `ORBITAL_MASS_SCALE` constants, which
+    /// was one more thing that had to be kept in sync by hand.
+    ///
+    /// This VARIES over a run: the dying star's gravity weakens as it sheds its
+    /// envelope (Decision D4). Read it per frame; do not cache it. Companions'
+    /// gravity is NOT included — see `attractor_ptr` for the full set.
     #[must_use]
     pub fn orbital_mu(&self) -> f64 {
         self.mu()
@@ -542,16 +903,105 @@ impl Kernel {
         sim_dt.min(dur / DEATH_MIN_STEPS)
     }
 
-    /// Gravitational parameter driving the dynamics (visual-scaled). Uses the
-    /// TOTAL cloud mass so collapse/orbits proceed from the start rather than
-    /// stalling until the seed core has grown.
+    /// The PRIMARY's gravitational parameter driving the dynamics
+    /// (visual-scaled), after whatever envelope the dying star has already shed
+    /// (Decision D4). Uses the TOTAL cloud mass so collapse/orbits proceed from
+    /// the start rather than stalling until the seed core has grown.
     fn mu(&self) -> f64 {
         // √M rather than M: at full mass-proportionality the inner dynamics of a
         // heavy cloud outrun the fixed integration substep and grains get flung
         // out instead of accreting. This only sets the VISUAL orbital rate —
         // every reported figure (orbital speed, period, temperature) is computed
         // from true Kepler physics host-side in `astro.ts`.
-        GRAVITY * ORBITAL_MASS_SCALE * self.cloud_mass.max(f64::EPSILON).sqrt()
+        //
+        // `mass_loss_factor` is exactly 1.0 for the whole of formation and the
+        // main sequence, so multiplying by it there is the identity and leaves the
+        // calibrated formation timing bit-identical.
+        GRAVITY
+            * ORBITAL_MASS_SCALE
+            * self.cloud_mass.max(f64::EPSILON).sqrt()
+            * self.mass_loss_factor
+    }
+
+    /// The gravitating centres the kernel integrates against right now: the
+    /// primary at the scene origin (Decision D5) plus one entry per live
+    /// companion star, capped at `MAX_ATTRACTORS` (Decision D6).
+    ///
+    /// Companions are ordinary bodies that happen to be massive enough to shine,
+    /// so their attractor entries are re-derived from `self.bodies` every time
+    /// this is called — they move. A cloud that does not fragment has no such
+    /// body, so the set is the primary alone and the dynamics are numerically
+    /// identical to the single-central-force model.
+    ///
+    /// When more bodies shine than there are spare centres, the HEAVIEST win: the
+    /// cap is there to bound the cost (FR-10), and dropping the strongest source
+    /// of gravity in favour of whichever body happened to be seeded first would
+    /// make the truncation visible in the dynamics.
+    fn attractor_set(&self) -> AttractorSet {
+        let (chosen, count) = self.attractor_indices();
+        self.attractor_set_from(&chosen[..count])
+    }
+
+    /// WHICH bodies are the companion centres — the selection half of
+    /// [`Kernel::attractor_set`], separated so it can be done ONCE per step
+    /// instead of once per integration substep.
+    ///
+    /// This is the only part that has to walk the whole body list, and its answer
+    /// can change only when a body is added, removed or re-typed — none of which
+    /// happens inside the substep loop. What DOES change there is where the
+    /// companions are, and that is re-read by [`Kernel::attractor_set_from`].
+    fn attractor_indices(&self) -> ([usize; MAX_COMPANIONS], usize) {
+        // Selection sort over at most `MAX_COMPANIONS` slots: it must not
+        // allocate or sort the whole list.
+        let mut chosen = [usize::MAX; MAX_COMPANIONS];
+        let mut count = 0usize;
+        for (index, body) in self.bodies.iter().enumerate() {
+            if !body.kind.is_stellar() {
+                continue;
+            }
+            if count < MAX_COMPANIONS {
+                chosen[count] = index;
+                count += 1;
+            } else if let Some(slot) = (0..count).min_by(|a, b| {
+                self.bodies[chosen[*a]]
+                    .mass
+                    .total_cmp(&self.bodies[chosen[*b]].mass)
+            }) {
+                if body.mass > self.bodies[chosen[slot]].mass {
+                    chosen[slot] = index;
+                }
+            }
+        }
+        (chosen, count)
+    }
+
+    /// The gravitating centres for an already-made selection, reading each
+    /// companion's CURRENT position and mass. Cheap: `O(MAX_COMPANIONS)`.
+    fn attractor_set_from(&self, chosen: &[usize]) -> AttractorSet {
+        let mut set = AttractorSet::new();
+        set.push(Attractor {
+            pos: [0.0, 0.0, 0.0],
+            mu: self.mu(),
+        });
+        for &index in chosen {
+            let body = &self.bodies[index];
+            // Same √M-scaled convention as the primary, so a companion's orbital
+            // rate reads consistently against the star it circles.
+            if !set.push(Attractor {
+                pos: body.pos,
+                mu: GRAVITY * ORBITAL_MASS_SCALE * body.mass.max(0.0).sqrt(),
+            }) {
+                break;
+            }
+        }
+        set
+    }
+
+    /// The TOTAL gravitational parameter of the system — primary plus every
+    /// companion. This, not the primary's `mu`, is what decides whether a body is
+    /// bound to the SYSTEM as a whole (visitor capture/ejection, ejecta escape).
+    fn total_mu(&self) -> f64 {
+        self.attractor_set().total_mu()
     }
 
     /// Effective radius within which the star captures dust: at least the
@@ -566,13 +1016,20 @@ impl Kernel {
         self.core_accretion_radius.max(2.0 * infall_per_substep)
     }
 
-    /// Closest approach to the star of ANY integrated body, in scene units — the
-    /// point that sets the shortest dynamical time and so the integration
-    /// substep. Uses each body's PERIAPSIS rather than its present distance, so
-    /// an eccentric planet's fast periapsis passage is resolved before it
-    /// happens instead of after it has already been flung outward. Visitors
-    /// count too: a comet's perihelion passage decides capture vs fly-by, so
-    /// integrating it coarsely would fake the outcome.
+    /// Closest approach to ONE gravitating centre — the centre at `index` in
+    /// `attractors` — of any integrated body, in scene units.
+    ///
+    /// About the PRIMARY (`index == 0`, at the origin) it uses each body's
+    /// PERIAPSIS rather than its present distance, so an eccentric planet's fast
+    /// periapsis passage is resolved before it happens instead of after it has
+    /// already been flung outward. Visitors count too: a comet's perihelion
+    /// passage decides capture vs fly-by, so integrating it coarsely would fake
+    /// the outcome.
+    ///
+    /// About a COMPANION it uses the present separation. A companion's own orbit
+    /// keeps changing the geometry of that encounter, so a conic periapsis about
+    /// it would be a fiction; the separation is the honest measure, and because
+    /// this is re-evaluated every step it tightens as an approach develops.
     ///
     /// NOT floored at the swallow radius: a body can be on a star-grazing orbit
     /// whose periapsis is far inside it yet still be caught mid-orbit by every
@@ -581,19 +1038,172 @@ impl Kernel {
     /// source of manufactured energy. No floor is needed to bound the cost:
     /// softening flattens the potential inside eps, so omega can never exceed
     /// sqrt(mu/eps^3) however small the periapsis gets.
-    fn innermost_body_radius(&self) -> f64 {
-        let mu = self.mu();
+    fn innermost_encounter_radius_to(&self, index: usize, attractors: &AttractorSet) -> f64 {
+        let Some(centre) = attractors.as_slice().get(index) else {
+            // No such centre: it constrains nothing.
+            return f64::INFINITY;
+        };
+        let primary = index == 0;
+        let primary_mu = attractors.primary_mu();
         let mut r_min = f64::INFINITY;
         for b in &self.bodies {
-            let q = periapsis_distance(mu, b.pos, b.vel);
-            if q < r_min {
-                r_min = q;
+            let r = if primary {
+                periapsis_distance(primary_mu, b.pos, b.vel)
+            } else {
+                // A companion is its own attractor, so skip the entry built from
+                // this very body: its "separation from itself" is exactly zero and
+                // would peg the substep at the softening-limited minimum forever,
+                // throttling the whole simulation for no dynamical reason. The
+                // entry is built from the body's own position in the same step, so
+                // the comparison is exact rather than a tolerance.
+                if centre.pos == b.pos {
+                    continue;
+                }
+                magnitude([
+                    b.pos[0] - centre.pos[0],
+                    b.pos[1] - centre.pos[1],
+                    b.pos[2] - centre.pos[2],
+                ])
+            };
+            if r < r_min {
+                r_min = r;
             }
         }
         if !r_min.is_finite() {
-            r_min = self.core_accretion_radius;
+            if primary {
+                // An empty system still has a feeding zone, and dust falls into
+                // it; keep the pre-companion behaviour exactly.
+                return self.core_accretion_radius;
+            }
+            // Nothing is anywhere near this companion, so it imposes no
+            // constraint at all. `stable_substep` reads an infinite radius as
+            // zero angular frequency and returns the unconstrained step.
+            return f64::INFINITY;
         }
         r_min.max(0.0)
+    }
+
+    /// The closest encounter to ANY centre — the minimum of
+    /// [`Kernel::innermost_encounter_radius_to`] over the whole set. This single
+    /// number, not the per-centre ones, is what the CFL guard integrates with;
+    /// see [`Kernel::stable_substep_for_attractors`] for why.
+    fn innermost_encounter_radius(&self, attractors: &AttractorSet) -> f64 {
+        (0..attractors.len()).fold(f64::INFINITY, |r, i| {
+            r.min(self.innermost_encounter_radius_to(i, attractors))
+        })
+    }
+
+    /// Largest substep that resolves the DEEPEST potential present — the
+    /// multi-centre CFL guard.
+    ///
+    /// `stable_substep` decreases in `mu` and increases in radius, so taking the
+    /// minimum over the centres at the single closest encounter radius is the
+    /// conservative combination: the guard can only ever over-resolve the motion.
+    /// With one centre it is exactly the single-central-force guard it replaces.
+    ///
+    /// DELIBERATELY SHARED across the centres (review finding P2-D asked for a
+    /// per-centre `r_min`, and the per-centre radii are computed above — they are
+    /// just not used here). Pairing a centre only with the closest approach made
+    /// to IT looks like the tighter physics and it is strictly LOOSER: for a body
+    /// in a close encounter with the companion it raises the step by
+    /// `sqrt(mu_primary / mu_companion)^(1/2)`. That margin is not waste. What has
+    /// to be resolved during such an encounter is the CROSSING time
+    /// `r_sep / v_rel`, and `v_rel` there is dominated by the Keplerian shear the
+    /// PRIMARY imposes, not by the companion's own escape speed — so the
+    /// primary's `mu` evaluated at the encounter separation is the term that
+    /// stands in for it. Relaxing it was measured: battery run #20
+    /// (21.9 M☉, Z = 0.05, 250 AU — a system that fragments) unbinds a planet
+    /// during `ProtostarCoalescence`, exactly the manufactured-energy failure the
+    /// guard exists to prevent. Pinned by
+    /// `the_cfl_guard_charges_every_centre_with_the_closest_encounter_present`.
+    fn stable_substep_for_attractors(&self) -> f64 {
+        let attractors = self.attractor_set();
+        let r_min = self.innermost_encounter_radius(&attractors);
+        attractors.as_slice().iter().fold(INTERNAL_DT, |h, a| {
+            h.min(stable_substep(a.mu, SOFTENING, r_min))
+        })
+    }
+
+    /// How much of the primary's gravity is left, given how far through its death
+    /// the star is (Decision D4). Monotonically non-increasing, so orbits only
+    /// ever widen.
+    ///
+    /// Exactly 1.0 until `REDGIANT_MASS_LOSS_ONSET`, so formation, the main
+    /// sequence and the early red giant are numerically untouched.
+    fn mass_loss_target(&self) -> f64 {
+        let retained = self.remnant_retained_fraction();
+        if retained >= 1.0 {
+            // Nothing to shed: a brown dwarf never dies, so it keeps every gram
+            // (and therefore all of its gravity) forever.
+            return 1.0;
+        }
+        let ramp = |t: f64| t.clamp(0.0, 1.0);
+        let progress = self.compute_stage_progress();
+        let shed = match self.stage {
+            LifecycleStage::RedGiant => {
+                REDGIANT_MASS_LOSS_SHARE
+                    * ramp((progress - REDGIANT_MASS_LOSS_ONSET) / (1.0 - REDGIANT_MASS_LOSS_ONSET))
+            }
+            LifecycleStage::Death => {
+                let span = if self.mass_loss_is_impulsive() {
+                    DEATH_MASS_LOSS_SPAN_IMPULSIVE
+                } else {
+                    DEATH_MASS_LOSS_SPAN_ADIABATIC
+                };
+                REDGIANT_MASS_LOSS_SHARE
+                    + (1.0 - REDGIANT_MASS_LOSS_SHARE)
+                        * ramp((progress - DEATH_SHOCK_BREAKOUT) / span)
+            }
+            LifecycleStage::Remnant => 1.0,
+            // Formation and the main sequence: the star has shed nothing at all.
+            _ => 0.0,
+        };
+        1.0 - (1.0 - retained) * shed.clamp(0.0, 1.0)
+    }
+
+    /// Fraction of the star's envelope that has ALREADY left it, derived from the
+    /// very `mass_loss_factor` that weakens its gravity.
+    ///
+    /// Deriving it rather than tracking it separately is the point: the gas the
+    /// viewer watches leave and the pull that lets the surviving orbits widen are
+    /// then provably the same quantity, and cannot drift apart.
+    fn shed_fraction(&self) -> f64 {
+        let retained = self.remnant_retained_fraction();
+        if retained >= 1.0 {
+            // Nothing to shed — a brown dwarf keeps its whole envelope forever.
+            return 0.0;
+        }
+        ((1.0 - self.mass_loss_factor) / (1.0 - retained)).clamp(0.0, 1.0)
+    }
+
+    /// Fraction of the star that survives as the compact object.
+    fn remnant_retained_fraction(&self) -> f64 {
+        (remnant_mass(self.star_mass, self.fate.remnant) / self.star_mass.max(f64::EPSILON))
+            .clamp(0.02, 1.0)
+    }
+
+    /// Whether the envelope leaves FASTER than an orbital period (so the
+    /// surviving worlds are left with a velocity the remaining gravity may not
+    /// hold) rather than slowly enough for the orbits to follow adiabatically.
+    ///
+    /// Core collapse — neutron star, pulsar or black hole — is impulsive. Shedding
+    /// a planetary nebula on the way to a white dwarf takes millennia, i.e. many
+    /// orbits, and a brown dwarf sheds nothing at all.
+    fn mass_loss_is_impulsive(&self) -> bool {
+        !matches!(
+            self.fate.remnant,
+            RemnantType::WhiteDwarf | RemnantType::BrownDwarf
+        )
+    }
+
+    /// Advance the shed fraction toward its target for the current stage. Clamped
+    /// to be monotone so numerical noise in the stage progress can never make a
+    /// dying star's gravity RECOVER (which would pull the orbits back in).
+    fn update_mass_loss(&mut self) {
+        let target = self.mass_loss_target();
+        if target.is_finite() {
+            self.mass_loss_factor = self.mass_loss_factor.min(target).clamp(0.0, 1.0);
+        }
     }
 
     // --- Formation/stellar evolution controller ------------------------------
@@ -614,6 +1224,15 @@ impl Kernel {
             if !self.planetesimals_seeded {
                 self.seed_planetesimals();
                 self.planetesimals_seeded = true;
+            }
+            // The collapse is also what FRAGMENTS the cloud, so the companion
+            // cores appear at the same moment (spec §4.2). Seeded after the
+            // planetesimals so the RNG stream — and therefore every existing
+            // deterministic expectation about the disc — is unchanged for the
+            // clouds that do not fragment at all.
+            if !self.companions_seeded {
+                self.seed_companions();
+                self.companions_seeded = true;
             }
         }
         if self.stage == LifecycleStage::ProtostarCoalescence && core_frac >= FUSION_CORE_FRACTION {
@@ -663,8 +1282,10 @@ impl Kernel {
                 match self.stage {
                     LifecycleStage::MainSequence => {
                         self.stage = LifecycleStage::RedGiant;
-                        // The swelling giant engulfs and destroys its inner planets.
-                        self.engulf_inner_planets(out);
+                        // The engulfment itself is NOT done here: the star has
+                        // only just begun to swell, and `step` re-checks its
+                        // photosphere against every world on every step from now
+                        // to the death.
                         self.emit_stage(SimEventType::RedGiantOnset, 0.0, 0.0, out);
                     }
                     LifecycleStage::RedGiant => {
@@ -681,8 +1302,11 @@ impl Kernel {
                     }
                     LifecycleStage::Death => {
                         self.stage = LifecycleStage::Remnant;
-                        // Mass loss adjusts surviving planets' orbits.
-                        self.expand_orbits_after_mass_loss(out);
+                        // The envelope is now entirely gone, so the primary's
+                        // gravity is down to the remnant's before the binding of
+                        // the survivors is judged against it.
+                        self.update_mass_loss();
+                        self.unbind_planets_after_mass_loss(out);
                         let remnant = self.fate.remnant as u32 as f64;
                         let sn = bool_f64(self.fate.supernova);
                         self.emit_stage(SimEventType::RemnantFormed, remnant, sn, out);
@@ -761,7 +1385,13 @@ impl Kernel {
                     1.0
                 }
             }
-            LifecycleStage::Remnant => 1.0,
+            // The remnant stage never ends, so "progress through it" can only be
+            // the progress of the one thing in it that DOES evolve: the nebula
+            // dispersing. Reported on the same clock and the same lifetime the
+            // ejecta particles age on, so the drawn shell and the gas fade out
+            // together (spec §4.4). It used to be a flat 1.0, which left the
+            // renderer with nothing to drive a fading shell from.
+            LifecycleStage::Remnant => clamp01(self.remnant_elapsed / EJECTA_LIFETIME),
         }
     }
 
@@ -772,8 +1402,12 @@ impl Kernel {
         let extent = self.cloud_extent;
         let cum = self.species_cumulative();
         let seed_mu = self.mu();
+        // Only the embryos this disc's solid budget can actually assemble are
+        // reserved out of the dust: in a metal-poor cloud the mass of the embryos
+        // that are never seeded simply STAYS in the dust (spec §4.3), so the
+        // cloud's mass book-keeping is untouched by the composition.
         let dust_budget = self.cloud_mass * (1.0 - CORE_SEED_FRACTION)
-            - PLANETESIMAL_COUNT as f64 * PLANETESIMAL_SEED_MASS;
+            - self.planetesimal_count as f64 * PLANETESIMAL_SEED_MASS;
         let per_particle = if count > 0 {
             (dust_budget / count as f64).max(0.0)
         } else {
@@ -820,6 +1454,16 @@ impl Kernel {
         // Do NOT reset `self.bodies` here: any visiting comets/asteroids that
         // arrived during DustCloud must be preserved. Planetesimals are simply
         // pushed onto the existing (possibly non-empty) body list.
+        //
+        // How many embryos condense is set by the disc's SOLID budget (spec §4.3,
+        // Decision D3). A cloud too metal-poor to assemble even one seeds nothing
+        // at all — and, drawing no random numbers here, leaves the RNG stream to
+        // the gas-only channels (companion fragmentation, visiting bodies) that
+        // need no solids.
+        let count = self.planetesimal_count;
+        if count == 0 {
+            return;
+        }
         let seed_mu = self.mu();
         // Geometric (Titius-Bode-like) spacing, each orbit ~30% wider than the
         // last, with small eccentricities and mutual inclinations.
@@ -832,12 +1476,12 @@ impl Kernel {
         // The outermost seed must sit INSIDE the dust disc it grows from.
         let outer = (inner * 6.0).max(self.cloud_extent * DISC_OUTER_FRACTION * 0.9);
         let mass = PLANETESIMAL_SEED_MASS;
-        let ratio = if PLANETESIMAL_COUNT > 1 {
-            (outer / inner).powf(1.0 / (PLANETESIMAL_COUNT - 1) as f64)
+        let ratio = if count > 1 {
+            (outer / inner).powf(1.0 / (count - 1) as f64)
         } else {
             1.0
         };
-        for i in 0..PLANETESIMAL_COUNT {
+        for i in 0..count {
             let a = inner * ratio.powi(i as i32) * (0.94 + 0.12 * self.rng.next_f64());
             let ecc = 0.02 + 0.13 * self.rng.next_f64();
             let inclination = (self.rng.next_f64() - 0.5) * 0.09;
@@ -863,15 +1507,99 @@ impl Kernel {
                 vel: velocity,
                 spin,
                 captured: true,
+                // Planetesimals grow the emergent way, by sweeping dust.
+                accretion_target: 0.0,
             });
             self.next_body_id += 1.0;
         }
     }
 
+    /// Seed the cloud's FRAGMENTS as companion cores (spec §4.2, Decision D1).
+    ///
+    /// Called once, at ProtostarCoalescence entry: fragmentation is what the
+    /// collapse does, so the pieces appear when the collapse does. Each core is
+    /// placed on a wide, mildly eccentric orbit outside the primary's feeding zone
+    /// and outside the dust disc the planets grow from, with every further
+    /// companion `COMPANION_ORBIT_HIERARCHY` times wider still — the hierarchy
+    /// being the only stable arrangement for three bodies.
+    ///
+    /// The innermost companion still sits close enough that the OUTER disc is near
+    /// the classical stability limit for a world orbiting one member of a pair
+    /// (`a_planet / a_binary` of a few tenths). That is deliberate: it keeps the
+    /// second star inside the volume the camera frames — the whole point of the
+    /// feature is to see it — and the consequence is real rather than a defect. The
+    /// outermost worlds are genuinely perturbed, and one that is thrown clear
+    /// leaves the system via `eject_escaping_worlds` instead of drifting for ever.
+    ///
+    /// The seed mass is taken OUT of the inner-disc reservoir, never created: the
+    /// fragment's remaining share is drawn from the same reservoir under the same
+    /// rate limit in `accrete`, so the cloud's mass budget is untouched by the
+    /// existence of companions.
+    fn seed_companions(&mut self) {
+        if self.companion_targets.is_empty() {
+            return;
+        }
+        let seed_mu = self.mu();
+        let extent = self.cloud_extent;
+        let targets = std::mem::take(&mut self.companion_targets);
+        for (index, target) in targets.iter().enumerate() {
+            let hierarchy = COMPANION_ORBIT_HIERARCHY.powi(index as i32);
+            let a = extent
+                * COMPANION_ORBIT_INNER_FRACTION
+                * hierarchy
+                * (1.0 + COMPANION_ORBIT_SPREAD_FRACTION * self.rng.next_f64());
+            let ecc =
+                COMPANION_ECCENTRICITY_MIN + COMPANION_ECCENTRICITY_SPAN * self.rng.next_f64();
+            // Companions are born from the same collapsing cloud as the disc, so
+            // they share its plane to within a few degrees.
+            let inclination = (self.rng.next_f64() - 0.5) * 0.12;
+            let phase = 2.0 * std::f64::consts::PI * self.rng.next_f64();
+            let at_periapsis = self.rng.next_f64() < 0.5;
+            let speed = circular_speed(seed_mu, SOFTENING, a)
+                * (1.0 + if at_periapsis { ecc } else { -ecc }).sqrt();
+            let cos_i = inclination.cos();
+            let sin_i = inclination.sin();
+            let position: Vec3 = [a * phase.cos(), a * sin_i, a * phase.sin() * cos_i];
+            let velocity: Vec3 = [
+                -speed * phase.sin(),
+                speed * sin_i * 0.5,
+                speed * phase.cos() * cos_i,
+            ];
+            let spin = 0.5 + self.rng.next_f64();
+            // Drawn from the reservoir, so the budget is conserved exactly; an
+            // empty reservoir simply means the fragment starts from nothing and
+            // assembles the whole of itself by accretion.
+            let seed = COMPANION_SEED_MASS
+                .min(*target)
+                .min(self.disc_reservoir)
+                .max(0.0);
+            self.disc_reservoir -= seed;
+            self.bodies.push(CelestialBody {
+                id: self.next_body_id,
+                // A fragment is a PROTOSTELLAR CORE, never a world. It is born at
+                // the opacity limit — below the deuterium-burning mass — but it is
+                // on the stellar track from the start and must be treated as such:
+                // it may not merge with a planetesimal, be engulfed by the giant it
+                // orbits, or be swept up by the planet-only rules that
+                // `is_planetary` gates. So it carries the substellar kind from
+                // birth, and `promote_bodies` never demotes a body that shines.
+                kind: BodyType::BrownDwarf,
+                mass: seed,
+                radius: body_radius_from_mass(seed, self.cloud_mass),
+                pos: position,
+                vel: velocity,
+                spin,
+                captured: true,
+                accretion_target: *target,
+            });
+            self.next_body_id += 1.0;
+        }
+        self.companion_targets = targets;
+    }
+
     // --- Integration ---------------------------------------------------------
 
-    fn integrate_particles(&mut self, h: f64, forming: bool) {
-        let mu = self.mu();
+    fn integrate_particles(&mut self, attractors: &AttractorSet, h: f64, forming: bool) {
         let vertical = (1.0 - VERTICAL_DAMP * h).max(0.0);
         let settle = (1.0 - DISK_SETTLE * h).max(0.0);
         let dust_drag = if forming {
@@ -882,6 +1610,11 @@ impl Kernel {
         // Debris from a disrupted body is shocked, self-colliding material on its
         // way into the star, so it bleeds angular momentum far faster than gas.
         let debris_drag = (1.0 - DEBRIS_DRAG * h).max(0.0);
+        // The death shell ploughs into the interstellar medium and sweeps it up,
+        // so it decelerates and finally stalls — the snowplough phase every real
+        // remnant ends in, and the reason an old nebula sits at a fixed size
+        // while it fades instead of racing away forever.
+        let ejecta_drag = (1.0 - EJECTA_DRAG * h).max(0.0);
         // Once fusion has ignited, the star's radiation pressure exceeds its pull
         // on the leftover grains (β > 1), so the residual cloud is driven OUT
         // instead of continuing to fall in. Only the dust feels this; ejecta and
@@ -891,17 +1624,37 @@ impl Kernel {
         } else {
             1.0 - IGNITED_RADIATION_BETA
         };
+        // Radiation pressure is a property of the STARS, so it scales every
+        // centre's pull — dust must not keep raining onto a companion either.
+        let dust_attractors = attractors.scaled(dust_gravity);
         for p in &mut self.particles {
             let dust = p.kind == ParticleKind::Dust;
-            let a = softened_accel(
-                if dust { mu * dust_gravity } else { mu },
-                SOFTENING,
-                [p.x, p.y, p.z],
-            );
+            // The escaping envelope COASTS at its terminal velocity: the dying
+            // star's radiation pressure on this dusty, line-opaque gas balances
+            // its gravity (that balance is what drives the wind off in the first
+            // place, and it is why real nebular shells expand at a constant speed
+            // for millennia). Modelling it as ballistic is also what makes the
+            // shell's speed a property of the DEATH rather than of the visually
+            // inflated orbital mass scale (×110): launched at escape speed from
+            // that scale the envelope crossed the entire 50 AU system in a fifth
+            // of the death stage and was far off-screen before the remnant
+            // appeared — the reported "there is no nebula".
+            let a = match p.kind {
+                ParticleKind::Ejecta => [0.0; 3],
+                _ => attractor_accel(
+                    if dust {
+                        dust_attractors.as_slice()
+                    } else {
+                        attractors.as_slice()
+                    },
+                    SOFTENING,
+                    [p.x, p.y, p.z],
+                ),
+            };
             let drag = match p.kind {
                 ParticleKind::Dust => dust_drag,
                 ParticleKind::Debris => debris_drag,
-                ParticleKind::Ejecta => 1.0,
+                ParticleKind::Ejecta => ejecta_drag,
             };
             // Vertical dissipation is a DISC phenomenon (grain-on-grain collisions
             // in a dense midplane). Applying it to the death shell would squash a
@@ -935,14 +1688,20 @@ impl Kernel {
         }
     }
 
-    fn integrate_bodies(&mut self, h: f64) {
-        let mu = self.mu();
+    fn integrate_bodies(&mut self, attractors: &AttractorSet, h: f64) {
         // Planetesimals damp toward the mid-plane far more weakly than the dust,
         // so the system keeps small mutual inclinations like a real one.
         let vertical = (1.0 - VERTICAL_DAMP * BODY_DAMP_FRACTION * h).max(0.0);
         for body in &mut self.bodies {
-            let (pos, mut vel) = integrate_orbit(body.pos, body.vel, mu, SOFTENING, h);
-            if matches!(body.kind, BodyType::Protoplanet | BodyType::Planet) {
+            // A companion is both a body and a centre; it must not attract itself.
+            let field = if body.kind.is_stellar() {
+                attractors.excluding(body.pos)
+            } else {
+                *attractors
+            };
+            let (pos, mut vel) =
+                integrate_orbit_attractors(body.pos, body.vel, field.as_slice(), SOFTENING, h);
+            if body.kind.is_planetary() {
                 vel[1] *= vertical;
             }
             body.pos = pos;
@@ -957,6 +1716,9 @@ impl Kernel {
     /// and feeds the star. Momentum is conserved on every merge.
     fn accrete(&mut self, stage: LifecycleStage, orbital_dt: f64, substep: f64) {
         let cloud_mass = self.cloud_mass;
+        // Retention depends on the disc's condensable-solid budget as well as on
+        // where the body orbits (spec §4.3): no metals, no grains, no growth.
+        let metals = self.composition[2];
         let capture_radius = self.capture_radius_for(substep);
         let core_r2 = capture_radius * capture_radius;
 
@@ -977,16 +1739,25 @@ impl Kernel {
         self.disc_reservoir -= from_reservoir;
         self.core_mass += from_reservoir;
         core_budget -= from_reservoir;
-        if star_full && self.disc_reservoir > 0.0 {
+        // The cloud's FRAGMENTS feed from the same reservoir, after the primary
+        // and under the same finite rate (spec §4.2). This is why a companion is
+        // seen to grow into a star rather than appearing as one.
+        self.feed_companions(orbital_dt);
+        if star_full && !self.companions_hungry() && self.disc_reservoir > 0.0 {
             // The star can take no more: the inner disc is photo-evaporated away.
+            // Held back while a fragment is still assembling — that gas is bound
+            // to the companion, not free to be blown off.
             self.dispersed_mass += self.disc_reservoir;
             self.disc_reservoir = 0.0;
         }
+        // Only WORLDS sweep dust into themselves. A companion's growth is
+        // rate-limited stellar accretion (`feed_companions`), not the grain-by-
+        // grain sweeping that builds a planet, so it must not do both.
         let body_r2: Vec<f64> = self
             .bodies
             .iter()
             .map(|b| {
-                if matches!(b.kind, BodyType::Protoplanet | BodyType::Planet) {
+                if b.kind.is_planetary() {
                     let ar = accretion_radius(b.mass, cloud_mass);
                     ar * ar
                 } else {
@@ -995,15 +1766,27 @@ impl Kernel {
             })
             .collect();
 
+        // While a fragment is still assembling, gas arriving at the inner disc has
+        // somewhere to go even after the primary is full, so it must not be
+        // dispersed as if nothing could take it.
+        let all_full = star_full && !self.companions_hungry();
         let mut to_reservoir = 0.0f64;
         let mut survivors: Vec<Particle> = Vec::with_capacity(self.particles.len());
         for p in std::mem::take(&mut self.particles) {
+            if p.kind == ParticleKind::Ejecta {
+                // The escaping envelope is not re-accreted. It is unbound, it is
+                // leaving, and it now CARRIES the mass the star shed — letting the
+                // star (or a planet it passes) eat it again would put that mass
+                // back where it came from and make the death reversible.
+                survivors.push(p);
+                continue;
+            }
             let r2 = p.x * p.x + p.y * p.y + p.z * p.z;
             if r2 <= core_r2 {
                 if core_budget >= p.mass {
                     core_budget -= p.mass;
                     self.core_mass += p.mass;
-                } else if star_full {
+                } else if all_full {
                     // The star has all the mass it will ever have; anything
                     // still falling in is blown back out rather than accreted.
                     self.dispersed_mass += p.mass;
@@ -1029,10 +1812,11 @@ impl Kernel {
                 let dy = p.y - b.pos[1];
                 let dz = p.z - b.pos[2];
                 if dx * dx + dy * dy + dz * dz <= body_r2[i] {
-                    // Retention depends on WHERE the body orbits: rock only
-                    // inside the snow line, ices + gas beyond it.
+                    // Retention depends on WHERE the body orbits — rock only
+                    // inside the snow line, ices + gas beyond it — and on how much
+                    // of either the cloud contains at all.
                     let orbit_radius = magnitude(b.pos);
-                    let retained = p.mass * accretion_efficiency(orbit_radius);
+                    let retained = p.mass * accretion_efficiency(orbit_radius, metals);
                     b.mass += retained;
                     b.radius = body_radius_from_mass(b.mass, cloud_mass);
                     // The remainder is NOT teleported to the star: it flows into
@@ -1054,6 +1838,50 @@ impl Kernel {
 
         if (stage as u32) <= LifecycleStage::MainSequence as u32 {
             self.merge_bodies();
+        }
+    }
+
+    /// Whether any cloud fragment has still not assembled its share of the cloud.
+    fn companions_hungry(&self) -> bool {
+        self.bodies
+            .iter()
+            .any(|b| b.accretion_target > 0.0 && b.mass < b.accretion_target)
+    }
+
+    /// Grow the cloud's fragments toward their share of it, drawing from the same
+    /// inner-disc reservoir that feeds the primary and under the same finite
+    /// accretion rate (spec §4.2).
+    ///
+    /// The rate is keyed on the fragment's OWN final mass, exactly as the
+    /// primary's is on `star_mass`, so every piece of the cloud assembles over the
+    /// same number of frames however the mass is divided — a companion is seen to
+    /// grow into a star over the formation phase instead of appearing as one.
+    ///
+    /// Mass is MOVED, never created: whatever the fragment takes leaves the
+    /// reservoir in the same statement.
+    fn feed_companions(&mut self, orbital_dt: f64) {
+        if self.disc_reservoir <= 0.0 || orbital_dt <= 0.0 {
+            return;
+        }
+        let cloud_mass = self.cloud_mass;
+        // Disjoint field borrows: the loop holds `self.bodies`, the transfer
+        // touches `self.disc_reservoir`.
+        for body in &mut self.bodies {
+            if body.accretion_target <= 0.0 {
+                continue;
+            }
+            let remaining = (body.accretion_target - body.mass).max(0.0);
+            if remaining <= 0.0 {
+                continue;
+            }
+            let rate_limit = CORE_ACCRETION_RATE * body.accretion_target * orbital_dt;
+            let taken = remaining.min(rate_limit).min(self.disc_reservoir);
+            if taken <= 0.0 {
+                break;
+            }
+            self.disc_reservoir -= taken;
+            body.mass += taken;
+            body.radius = body_radius_from_mass(body.mass, cloud_mass);
         }
     }
 
@@ -1090,31 +1918,61 @@ impl Kernel {
         }
     }
 
-    /// Red-giant photospheric reach in scene units. Scales as mass^0.8 to track
-    /// the drawn photosphere, ensuring no planet survives visually inside the
-    /// giant at any stellar mass (mirror of `redGiantEngulfRadius`).
-    fn red_giant_engulf_radius(&self) -> f64 {
-        REDGIANT_ENGULF_AU * self.star_mass.max(0.1).powf(0.8)
+    /// The star's photospheric radius RIGHT NOW, in scene units — the surface the
+    /// wind detaches from, and the surface no world can be inside and survive.
+    ///
+    /// Scales as mass^0.8 and reaches `REDGIANT_ENGULF_AU · M^0.8` at the tip of
+    /// the red-giant branch, tracking the drawn photosphere
+    /// (`giantPhotosphereRadius` = `trueStellarRadius` ∝ M^0.8 × `RED_GIANT_SWELL`)
+    /// with a constant 47 % margin at EVERY mass, so no planet ever survives
+    /// visually inside the giant — asserted host-side in
+    /// `test/render/starVisual.test.ts` against this exact law.
+    ///
+    /// It GROWS through the red giant instead of appearing at full size, because
+    /// that is what the renderer draws and because the whole point of the death
+    /// scene is to watch the star swell over its worlds rather than to find them
+    /// already gone.
+    fn photosphere_radius(&self) -> f64 {
+        let giant = REDGIANT_ENGULF_AU * self.star_mass.max(0.1).powf(0.8);
+        match self.stage {
+            LifecycleStage::RedGiant => {
+                let swell = MAIN_SEQUENCE_PHOTOSPHERE_FRACTION
+                    + (1.0 - MAIN_SEQUENCE_PHOTOSPHERE_FRACTION) * self.compute_stage_progress();
+                giant * swell
+            }
+            // Through the death the envelope is still there — expanding, and then
+            // transparent. Held at the giant's radius rather than at the drawn
+            // fireball's: the fireball is optically thin ejecta sweeping past the
+            // outer worlds, not a photosphere that swallows them.
+            LifecycleStage::Death => giant,
+            _ => giant * MAIN_SEQUENCE_PHOTOSPHERE_FRACTION,
+        }
     }
 
-    /// Engulf and destroy planets orbiting inside the swollen red giant. Done
-    /// ONCE at red-giant onset so it is deterministic at any pace (mirror of
-    /// `engulfInnerPlanets`).
+    /// Engulf and destroy planets orbiting inside the star's photosphere.
+    ///
+    /// Re-checked on EVERY step of the red-giant and death stages. It used to run
+    /// exactly once, at red-giant onset, against the giant's FINAL radius — so a
+    /// world that drifted inward afterwards (or one the star had not yet swollen
+    /// past) went on orbiting happily inside the star for the rest of its life.
     fn engulf_inner_planets(&mut self, events: &mut Vec<PackedEvent>) {
-        let r = self.red_giant_engulf_radius();
+        if !matches!(self.stage, LifecycleStage::RedGiant | LifecycleStage::Death) {
+            return;
+        }
+        let r = self.photosphere_radius();
         let r2 = r * r;
         let sim_time = self.sim_time;
         let doomed: Vec<CelestialBody> = self
             .bodies
             .iter()
             .filter(|b| {
-                matches!(b.kind, BodyType::Planet | BodyType::Protoplanet)
+                b.kind.is_planetary()
                     && b.pos[0] * b.pos[0] + b.pos[1] * b.pos[1] + b.pos[2] * b.pos[2] <= r2
             })
             .copied()
             .collect();
         self.bodies.retain(|b| {
-            !(matches!(b.kind, BodyType::Planet | BodyType::Protoplanet)
+            !(b.kind.is_planetary()
                 && b.pos[0] * b.pos[0] + b.pos[1] * b.pos[1] + b.pos[2] * b.pos[2] <= r2)
         });
         for body in doomed {
@@ -1129,66 +1987,57 @@ impl Kernel {
         }
     }
 
-    /// Adjust surviving planets' orbits when the dying star sheds its mass
-    /// (mirror of `expandOrbitsAfterMassLoss`).
+    /// Settle the surviving planets against the gravity the star has left, at the
+    /// moment the compact object appears (Decision D4).
     ///
-    /// **Adiabatic** (`!fate.supernova`): exact r → r/retained, v → v·√retained.
-    /// Energy-consistent circular orbit at new radius; no arcade cap.
+    /// The ORBIT WIDENING is deliberately NOT done here. It has already happened:
+    /// `mass_loss_factor` weakened the primary's `mu` across the late red giant
+    /// and the death stage, and the integrator carried every orbit outward under
+    /// that weakening pull, continuously and adiabatically. This function used to
+    /// apply the closed-form adiabatic result (`r → r/retained`,
+    /// `v → v·√retained`) in ONE step instead, which teleported every surviving
+    /// world outward by up to 4× between two consecutive frames and made planets
+    /// appear to emerge from the collapsing giant (reported bug 2).
     ///
-    /// **Impulsive** (`fate.supernova`): do NOT rescale pos/vel. Apply the
-    /// asymmetric natal kick, then eject planets unbound under mu_remnant = mu·retained
-    /// (v² > 2·mu_remnant/r), exactly like `resolve_visitors`.
-    fn expand_orbits_after_mass_loss(&mut self, out: &mut Vec<PackedEvent>) {
-        // How much of the star survives as the compact object.
-        let retained: f64 =
-            (remnant_mass(self.star_mass, self.fate.remnant) / self.star_mass).clamp(0.02, 1.0);
-
-        if self.fate.supernova {
-            // Impulsive: gravity drops to mu_remnant = mu · retained.
-            // Apply the asymmetric natal kick, then eject unbound planets.
-            let mu_remnant = self.mu() * retained;
-            let sim_time = self.sim_time;
-            let mut survivors: Vec<CelestialBody> = Vec::with_capacity(self.bodies.len());
-            for mut body in std::mem::take(&mut self.bodies) {
-                if !matches!(body.kind, BodyType::Planet | BodyType::Protoplanet) {
-                    survivors.push(body);
-                    continue;
-                }
-                let kick = 0.18 * magnitude(body.vel);
-                body.vel[0] += (self.rng.next_f64() - 0.5) * kick;
-                body.vel[1] += (self.rng.next_f64() - 0.5) * kick;
-                body.vel[2] += (self.rng.next_f64() - 0.5) * kick;
-                let r = magnitude(body.pos);
-                let speed = magnitude(body.vel);
-                if is_bound(mu_remnant, r, speed) {
-                    survivors.push(body);
-                } else {
-                    out.push(PackedEvent {
-                        kind: SimEventType::BodyEjected,
-                        sim_time,
-                        data_a: body.id,
-                        data_b: body.kind as u32 as f64,
-                    });
-                }
+    /// What genuinely IS instantaneous survives: a core-collapse supernova's
+    /// asymmetric explosion kicks the compact object (and, in this frame of
+    /// reference, the planets) and the loosely bound worlds are then unbound. The
+    /// binding test uses the SAME `mu` the integrator is now using, so a planet is
+    /// never reported as ejected while the kernel keeps integrating it as bound.
+    fn unbind_planets_after_mass_loss(&mut self, out: &mut Vec<PackedEvent>) {
+        if !self.fate.supernova {
+            // A planetary nebula is shed over millennia — many orbits — so there
+            // is no impulse at all. The orbits have already widened.
+            return;
+        }
+        // Whatever gravity is left, right now: primary (already reduced to
+        // `retained`) plus any companion.
+        let mu_remnant = self.total_mu();
+        let sim_time = self.sim_time;
+        let mut survivors: Vec<CelestialBody> = Vec::with_capacity(self.bodies.len());
+        for mut body in std::mem::take(&mut self.bodies) {
+            if !body.kind.is_planetary() {
+                survivors.push(body);
+                continue;
             }
-            self.bodies = survivors;
-        } else {
-            // Adiabatic: exact orbit widening. r → r/retained, v → v·√retained.
-            // Circular orbit stays circular at the new radius. No cap.
-            let f = 1.0 / retained; // expansion factor (≥ 1)
-            let v_scale = retained.sqrt(); // √retained (< 1 → orbit slows)
-            for body in &mut self.bodies {
-                if !matches!(body.kind, BodyType::Planet | BodyType::Protoplanet) {
-                    continue;
-                }
-                body.pos = [body.pos[0] * f, body.pos[1] * f, body.pos[2] * f];
-                body.vel = [
-                    body.vel[0] * v_scale,
-                    body.vel[1] * v_scale,
-                    body.vel[2] * v_scale,
-                ];
+            let kick = 0.18 * magnitude(body.vel);
+            body.vel[0] += (self.rng.next_f64() - 0.5) * kick;
+            body.vel[1] += (self.rng.next_f64() - 0.5) * kick;
+            body.vel[2] += (self.rng.next_f64() - 0.5) * kick;
+            let r = magnitude(body.pos);
+            let speed = magnitude(body.vel);
+            if is_bound(mu_remnant, r, speed) {
+                survivors.push(body);
+            } else {
+                out.push(PackedEvent {
+                    kind: SimEventType::BodyEjected,
+                    sim_time,
+                    data_a: body.id,
+                    data_b: body.kind as u32 as f64,
+                });
             }
         }
+        self.bodies = survivors;
     }
 
     /// Tear a doomed body into a glowing debris stream (mirror of `spawnDebris`).
@@ -1227,21 +2076,11 @@ impl Kernel {
         let n = self.bodies.len();
         let mut removed = vec![false; n];
         for i in 0..n {
-            if removed[i]
-                || !matches!(
-                    self.bodies[i].kind,
-                    BodyType::Protoplanet | BodyType::Planet
-                )
-            {
+            if removed[i] || !self.bodies[i].kind.is_planetary() {
                 continue;
             }
             for j in (i + 1)..n {
-                if removed[j]
-                    || !matches!(
-                        self.bodies[j].kind,
-                        BodyType::Protoplanet | BodyType::Planet
-                    )
-                {
+                if removed[j] || !self.bodies[j].kind.is_planetary() {
                     continue;
                 }
                 let a = self.bodies[i];
@@ -1301,43 +2140,101 @@ impl Kernel {
         self.particles.retain(|p| p.kind == ParticleKind::Ejecta);
     }
 
-    /// Throw a shell of glowing ejecta outward when the star dies (planetary
-    /// nebula / supernova). Reuses the particle pool so the death is visible.
-    fn spawn_ejecta(&mut self) {
+    /// Let go of however much of the envelope the star has lost by now, as gas
+    /// launched from its current photosphere (spec §4.4).
+    ///
+    /// This replaces a single instantaneous burst thrown at shock breakout from a
+    /// fixed 3–6 AU shell. That burst was the reason the collapse read as "the
+    /// matter condenses into a white dwarf": nothing left the star during the red
+    /// giant, nothing left it during the collapse, and the one shell that did
+    /// appear was already off-screen before the death ended.
+    ///
+    /// Now the envelope leaves CONTINUOUSLY and from the surface it is actually
+    /// leaving — a slow, dusty superwind through the late red giant, then the fast
+    /// shell once the shock breaks out — and how much has gone is read straight
+    /// off `mass_loss_factor`, the same quantity that weakens the star's gravity.
+    /// So the gas that departs, the star that lightens and the orbits that widen
+    /// are one mechanism.
+    ///
+    /// Mass is MOVED, never invented: every gram the wind carries is subtracted
+    /// from the star's core in the same statement that hands it to the particles.
+    fn shed_envelope(&mut self) {
+        let shed = self.shed_fraction();
+        if shed <= 0.0 {
+            return;
+        }
+        // The envelope is divided into a fixed number of fragments, so the share
+        // of it that has left decides how many of them are in flight.
+        let target_launched = (EJECTA_COUNT as f64 * shed).round() as usize;
+        if target_launched <= self.ejecta_launched {
+            return;
+        }
         let budget = MAX_PARTICLES.saturating_sub(self.particles.len());
-        let n = EJECTA_COUNT.min(budget);
+        let n = (target_launched - self.ejecta_launched).min(budget);
+        if n == 0 {
+            // No room this step; the wind catches up once the shell has thinned.
+            return;
+        }
+        let launched = self.ejecta_launched + n;
+
+        // Mass this batch carries away — taken out of the star, so the budget is
+        // conserved exactly and `star_mass_solar` shrinks toward the remnant's.
+        let envelope = self.star_mass * (1.0 - self.remnant_retained_fraction());
+        let target_shed = envelope * launched as f64 / EJECTA_COUNT as f64;
+        let taken = (target_shed - self.shed_mass).clamp(0.0, self.core_mass.max(0.0));
+        self.core_mass -= taken;
+        self.shed_mass += taken;
+        let per_fragment = taken / n as f64;
+
         let violent = self.fate.supernova;
-        // A supernova's envelope is accelerated by a single shock into a layered,
-        // velocity-stratified shell; a planetary nebula is puffed off gently over
-        // millennia, so it is slower and more ragged.
-        // Orbital time the death stage spans at the fastest pace: the bounded
-        // number of steps times the bounded orbital time each may advance.
-        let death_span = DEATH_MIN_STEPS * ORBITAL_MAX;
-        let reach = if violent {
-            EJECTA_SHELL_REACH_SUPERNOVA
-        } else {
-            EJECTA_SHELL_REACH_NEBULA
+        // Before the shock breaks out (and for the whole red giant) what leaves is
+        // the slow superwind; afterwards it is the blast. A supernova's envelope
+        // is accelerated by a single shock into a layered, velocity-stratified
+        // shell; a planetary nebula is puffed off gently, so it is slower and more
+        // ragged.
+        let blast = self.has_shock_broken_out();
+        let stall = match (blast, violent) {
+            (false, _) => EJECTA_STALL_REACH_WIND,
+            (true, true) => EJECTA_STALL_REACH_SUPERNOVA,
+            (true, false) => EJECTA_STALL_REACH_NEBULA,
         };
-        let terminal = reach * self.cloud_extent / death_span;
-        let spread = if violent { 0.5 } else { 0.28 };
-        let launch_span = EJECTA_LAUNCH_RADIUS_MAX - EJECTA_LAUNCH_RADIUS_MIN;
+        // Launch speed of a shell that decays as `exp(-EJECTA_DRAG · t)` and so
+        // travels exactly `stall × cloud_extent` in total.
+        let terminal = EJECTA_DRAG * stall * self.cloud_extent;
+        let spread = if blast && violent { 0.5 } else { 0.28 };
+        // Launched from the star's own surface — that is what makes the gas be
+        // SEEN to detach — but never from inside the softened core, where the
+        // integrator cannot resolve the motion.
+        let r_base = self.photosphere_radius().max(2.0 * SOFTENING);
         for _ in 0..n {
             let cos_t = 2.0 * self.rng.next_f64() - 1.0;
             let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
             let phi = 2.0 * std::f64::consts::PI * self.rng.next_f64();
             let dir: Vec3 = [sin_t * phi.cos(), cos_t, sin_t * phi.sin()];
-            let r0 = EJECTA_LAUNCH_RADIUS_MIN + self.rng.next_f64() * launch_span;
-            // Launch fast enough that, after climbing out of the star's potential
-            // well, the fragment still coasts at `v_infinity` — i.e. unbound with
-            // a known asymptotic speed.
-            let escape_speed = (2.0 * self.mu() / r0.max(f64::EPSILON)).sqrt();
+            let r0 = r_base * (1.0 + EJECTA_LAUNCH_SPREAD * self.rng.next_f64());
             let roll = self.rng.next_f64();
-            let v_infinity = terminal * (1.0 + spread * roll);
-            let speed = (v_infinity * v_infinity + escape_speed * escape_speed).sqrt();
-            // Velocity stratification: a supernova's ejecta is layered and the
-            // fastest, outermost material is the hottest, so the shell shades from
-            // a blue-white leading edge through white to a cooler interior.
+            // Velocity stratification: the shell is layered rather than a single
+            // surface — and every layer is launched radially OUTWARD, so no
+            // fragment can ever circle back or settle around the remnant.
+            let speed = terminal * (1.0 + spread * roll);
+            // The fastest, outermost material of a supernova is also the hottest,
+            // so the shell shades from a blue-white leading edge through white to
+            // a cooler interior. The AGB superwind that precedes it is the
+            // opposite — cool, dusty and red, the material the blast later lights
+            // up from inside.
             let heat = if violent { roll } else { roll * 0.5 };
+            let (r, g, b, size) = if !blast {
+                (0.95, 0.42 + 0.18 * roll, 0.22, 1.3)
+            } else if violent {
+                (
+                    1.0 - 0.35 * heat,
+                    0.45 + 0.45 * heat,
+                    0.3 + 0.7 * heat,
+                    1.5 + 0.8 * heat,
+                )
+            } else {
+                (0.95, 0.55, 0.85, 1.6)
+            };
             self.particles.push(Particle {
                 x: dir[0] * r0,
                 y: dir[1] * r0,
@@ -1345,15 +2242,20 @@ impl Kernel {
                 vx: dir[0] * speed,
                 vy: dir[1] * speed,
                 vz: dir[2] * speed,
-                r: if violent { 1.0 - 0.35 * heat } else { 0.95 },
-                g: if violent { 0.45 + 0.45 * heat } else { 0.55 },
-                b: if violent { 0.3 + 0.7 * heat } else { 0.85 },
-                size: if violent { 1.5 + 0.8 * heat } else { 1.6 },
-                mass: 0.0,
+                r,
+                g,
+                b,
+                size,
+                mass: per_fragment,
                 kind: ParticleKind::Ejecta,
-                ttl: f64::INFINITY,
+                // Finite, and randomised per fragment: the nebula thins and dims
+                // over the remnant stage and is gone at the end of it, the way a
+                // real one disperses into the interstellar medium — instead of
+                // 2200 particles winking out together mid-flight.
+                ttl: EJECTA_LIFETIME * (0.6 + 0.5 * self.rng.next_f64()),
             });
         }
+        self.ejecta_launched = launched;
     }
 
     // --- Visiting bodies (FR-7) ---------------------------------------------
@@ -1366,7 +2268,9 @@ impl Kernel {
             // Bound the number of visitors so captured ones can't accumulate
             // forever (mirror of the TS fallback).
             if self.visitor_count() < MAX_VISITORS {
-                let mu = self.mu();
+                // Arrival speed is set by escape from the SYSTEM, so a heavier
+                // (multiple) system genuinely accelerates its visitors more.
+                let mu = self.total_mu();
                 let visitor = make_visitor(&mut self.rng, mu, self.eject_radius, self.next_body_id);
                 self.next_body_id += 1.0;
                 self.bodies.push(visitor);
@@ -1375,11 +2279,51 @@ impl Kernel {
         }
     }
 
-    /// Promote any remaining protoplanets to full planets (idempotent).
-    fn promote_planets(&mut self) {
+    /// Re-type every non-visiting body from its OWN mass (spec §4.2), emitting
+    /// `CompanionIgnited` when one crosses the hydrogen-burning limit. Idempotent.
+    ///
+    /// This is the fix for the reported bug. The old `promote_planets` turned
+    /// every `Protoplanet` into a `Planet` the moment the primary ignited, no
+    /// matter how heavy it had become — so an object of 2–3 M☉ (which the core-
+    /// accretion channel does reach in a massive cloud) stayed typed as a planet
+    /// and was drawn by the renderer as a ringed gas giant. Mass, not the
+    /// primary's lifecycle, decides what an object IS:
+    ///
+    /// - `≥ HYDROGEN_BURNING_MIN_MASS` → a `Star`: it fuses hydrogen.
+    /// - `≥ DEUTERIUM_BURNING_MIN_MASS` → a `BrownDwarf`: substellar but glowing.
+    /// - otherwise a world, `Planet` once the primary shines and `Protoplanet`
+    ///   while it is still assembling.
+    ///
+    /// Runs on EVERY step rather than only after ignition, because a body can
+    /// cross a burning limit at any time — a fragment assembling during the
+    /// protostar phase does exactly that.
+    fn promote_bodies(&mut self, out: &mut Vec<PackedEvent>) {
+        let ignited = self.stage as u32 >= LifecycleStage::FusionIgnition as u32;
+        let sim_time = self.sim_time;
         for body in &mut self.bodies {
-            if matches!(body.kind, BodyType::Protoplanet) {
-                body.kind = BodyType::Planet;
+            // Visitors are assembled elsewhere and are never re-typed: a comet
+            // stays a comet however the star it is passing evolves.
+            if !(body.kind.is_planetary() || body.kind.is_stellar()) {
+                continue;
+            }
+            let next = classify_by_mass(body.mass, ignited);
+            if next == body.kind {
+                continue;
+            }
+            // Never step DOWN the ladder. Mass only ever grows here, so this is
+            // unreachable today; it is written so that adding any mass-losing
+            // mechanism cannot silently turn a companion star back into a planet.
+            if body.kind.is_stellar() && !next.is_stellar() {
+                continue;
+            }
+            body.kind = next;
+            if next == BodyType::Star {
+                out.push(PackedEvent {
+                    kind: SimEventType::CompanionIgnited,
+                    sim_time,
+                    data_a: body.id,
+                    data_b: body.mass,
+                });
             }
         }
     }
@@ -1392,8 +2336,67 @@ impl Kernel {
             .count()
     }
 
+    /// Remove worlds that are genuinely leaving the system, the way visiting
+    /// bodies already are (spec §4.1, §4.5).
+    ///
+    /// A single star cannot do this to its planets: its field is a monopole, so a
+    /// bound orbit stays bound. A COMPANION can. Two things now put a world onto
+    /// an escape trajectory — a close encounter with the second star, and the
+    /// widening of every orbit as the dying primary sheds its envelope (Decision
+    /// D4), which carries the outer worlds out into the companion's territory.
+    /// Without this the escapee stayed in the body list for ever, coasting
+    /// outward on a hyperbola: a planet that had unmistakably left the system was
+    /// still drawn, still labelled and still reported as one of its worlds.
+    ///
+    /// Three conditions, all required, so nothing is removed that might come back:
+    ///
+    /// - unbound in the FULL field of every gravitating centre, not merely with
+    ///   respect to the primary — a world captured by the companion is bound, and
+    ///   must be kept;
+    /// - beyond the same boundary a visitor is judged at, so a world never
+    ///   vanishes from the middle of the visible system;
+    /// - receding, so an inbound body on an eccentric pass is left alone.
+    fn eject_escaping_worlds(&mut self, events: &mut Vec<PackedEvent>) {
+        let attractors = self.attractor_set();
+        let eject_radius = self.eject_radius;
+        let sim_time = self.sim_time;
+        let mut survivors: Vec<CelestialBody> = Vec::with_capacity(self.bodies.len());
+        for body in std::mem::take(&mut self.bodies) {
+            if !body.kind.is_planetary() {
+                survivors.push(body);
+                continue;
+            }
+            let r = magnitude(body.pos);
+            let radial = if r > 0.0 {
+                (body.pos[0] * body.vel[0] + body.pos[1] * body.vel[1] + body.pos[2] * body.vel[2])
+                    / r
+            } else {
+                0.0
+            };
+            let energy = total_specific_energy_attractors(
+                attractors.as_slice(),
+                SOFTENING,
+                body.pos,
+                body.vel,
+            );
+            if r < eject_radius || radial <= 0.0 || energy <= 0.0 {
+                survivors.push(body);
+                continue;
+            }
+            events.push(PackedEvent {
+                kind: SimEventType::BodyEjected,
+                sim_time,
+                data_a: body.id,
+                data_b: body.kind as u32 as f64,
+            });
+        }
+        self.bodies = survivors;
+    }
+
     fn resolve_visitors(&mut self, events: &mut Vec<PackedEvent>) {
-        let mu = self.mu();
+        // Bound to the SYSTEM, not to the primary alone (spec §4.1): a comet
+        // circling a wide binary is captured even if neither star alone holds it.
+        let mu = self.total_mu();
         let eject_radius = self.eject_radius;
         let sim_time = self.sim_time;
         let mut survivors: Vec<CelestialBody> = Vec::with_capacity(self.bodies.len());
@@ -1442,15 +2445,26 @@ impl Kernel {
     }
 
     fn write_particle_buffer(&mut self) {
+        // Tail of an ejecta fragment's life over which it visibly fades out.
+        let fade_tail = EJECTA_LIFETIME * EJECTA_FADE_FRACTION;
         for (i, p) in self.particles.iter().enumerate() {
+            // An expanding nebula thins as it grows: it dims and its filaments
+            // wash out long before the gas is actually gone. Without this the
+            // shell kept its birth brightness right up to the instant it was
+            // deleted, which is what made it disappear rather than disperse.
+            let fade = if p.kind == ParticleKind::Ejecta {
+                (p.ttl / fade_tail).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
             let base = i * PARTICLE_STRIDE;
             self.particle_buf[base] = p.x as f32;
             self.particle_buf[base + 1] = p.y as f32;
             self.particle_buf[base + 2] = p.z as f32;
-            self.particle_buf[base + 3] = p.r as f32;
-            self.particle_buf[base + 4] = p.g as f32;
-            self.particle_buf[base + 5] = p.b as f32;
-            self.particle_buf[base + 6] = p.size as f32;
+            self.particle_buf[base + 3] = (p.r * fade) as f32;
+            self.particle_buf[base + 4] = (p.g * fade) as f32;
+            self.particle_buf[base + 5] = (p.b * fade) as f32;
+            self.particle_buf[base + 6] = (p.size * (0.45 + 0.55 * fade)) as f32;
         }
     }
 
@@ -1477,6 +2491,23 @@ impl Kernel {
             self.body_buf[base + 9] = body.vel[2] as f32;
             self.body_buf[base + 10] = body.spin as f32;
             self.body_buf[base + 11] = if body.captured { 1.0 } else { 0.0 };
+        }
+    }
+
+    /// Publish the gravitating centres for the host: `[x, y, z, mu]` per centre,
+    /// primary first (spec §5). Reallocated only when the count changes.
+    fn rebuild_attractor_buffer(&mut self) {
+        let attractors = self.attractor_set();
+        let needed = attractors.len() * ATTRACTOR_STRIDE;
+        if self.attractor_buf.len() != needed {
+            self.attractor_buf = vec![0.0; needed];
+        }
+        for (i, a) in attractors.as_slice().iter().enumerate() {
+            let base = i * ATTRACTOR_STRIDE;
+            self.attractor_buf[base] = a.pos[0] as f32;
+            self.attractor_buf[base + 1] = a.pos[1] as f32;
+            self.attractor_buf[base + 2] = a.pos[2] as f32;
+            self.attractor_buf[base + 3] = a.mu as f32;
         }
     }
 
@@ -1553,10 +2584,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(
-            kernel.stage(),
-            LifecycleStage::ProtostarCoalescence as u32
-        );
+        assert_eq!(kernel.stage(), LifecycleStage::ProtostarCoalescence as u32);
         assert_eq!(kernel.body_len() as usize % BODY_STRIDE, 0);
         assert!(kernel.body_len() > 0);
     }
@@ -1575,7 +2603,10 @@ mod tests {
             }
         }
         // After seeding, the type lane (offset 1) of every seeded body must be Protoplanet.
-        assert!(kernel.body_len() > 0, "no bodies after ProtostarCoalescence");
+        assert!(
+            kernel.body_len() > 0,
+            "no bodies after ProtostarCoalescence"
+        );
         // Drive enough accretion steps to grow the core past fusion ignition.
         for _ in 0..LIFECYCLE_STEPS {
             kernel.step(1.0e17);
@@ -1612,7 +2643,10 @@ mod tests {
     fn first_body_is_a_bound_protoplanet() {
         // §3.8: must drive to ProtostarCoalescence before any body exists.
         let mut kernel = solar_kernel(1.0, 10);
-        assert!(kernel.body_buf.is_empty(), "body buffer must be empty at init");
+        assert!(
+            kernel.body_buf.is_empty(),
+            "body buffer must be empty at init"
+        );
 
         for _ in 0..LIFECYCLE_STEPS {
             kernel.step(1.0e17);
@@ -1620,20 +2654,22 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(
-            kernel.stage(),
-            LifecycleStage::ProtostarCoalescence as u32
-        );
+        assert_eq!(kernel.stage(), LifecycleStage::ProtostarCoalescence as u32);
         // Type lane and captured lane of the first protoplanet body.
         // (Visitors are spawned at the boundary and may appear before planetesimals;
         //  find the first protoplanet in the buffer to be robust.)
         let n = kernel.body_buf.len() / BODY_STRIDE;
-        let first_proto = (0..n).find(|&i| {
-            kernel.body_buf[i * BODY_STRIDE + 1] == BodyType::Protoplanet as u32 as f32
-        });
-        assert!(first_proto.is_some(), "no protoplanet found after ProtostarCoalescence");
+        let first_proto = (0..n)
+            .find(|&i| kernel.body_buf[i * BODY_STRIDE + 1] == BodyType::Protoplanet as u32 as f32);
+        assert!(
+            first_proto.is_some(),
+            "no protoplanet found after ProtostarCoalescence"
+        );
         let base = first_proto.unwrap() * BODY_STRIDE;
-        assert_eq!(kernel.body_buf[base + 1], BodyType::Protoplanet as u32 as f32);
+        assert_eq!(
+            kernel.body_buf[base + 1],
+            BodyType::Protoplanet as u32 as f32
+        );
         assert_eq!(kernel.body_buf[base + 11], 1.0); // captured == true
     }
 
@@ -1759,11 +2795,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(
-            kernel.stage(),
-            LifecycleStage::ProtostarCoalescence as u32
+        assert_eq!(kernel.stage(), LifecycleStage::ProtostarCoalescence as u32);
+        assert!(
+            !kernel.body_buf.is_empty(),
+            "bodies must exist after seeding"
         );
-        assert!(!kernel.body_buf.is_empty(), "bodies must exist after seeding");
         let core_r = kernel.core_accretion_radius;
         for i in 0..(kernel.body_buf.len() / BODY_STRIDE) {
             let base = i * BODY_STRIDE;
@@ -1904,6 +2940,15 @@ mod tests {
 
     // --- Reported-bug regressions (mirror of the TS fallback's) -------------
 
+    /// How many fragments of the star's envelope are currently in flight.
+    fn ejecta_count(kernel: &Kernel) -> usize {
+        kernel
+            .particles
+            .iter()
+            .filter(|p| p.kind == ParticleKind::Ejecta)
+            .count()
+    }
+
     /// Drive a kernel to the remnant stage, returning whether it got there.
     fn drive_to_remnant(kernel: &mut Kernel) -> bool {
         for _ in 0..LIFECYCLE_STEPS {
@@ -2004,22 +3049,29 @@ mod tests {
         // orbit they inherited and were visibly circling the white dwarf forever.
         //
         // Physically, everything around a dying star is either accreted or blown
-        // away: the only particles that may remain are the UNBOUND death ejecta.
+        // away: the only particles that may remain are the death ejecta, and that
+        // shell is LEAVING — every fragment moves radially outward and decelerates
+        // toward its stall radius, so none of it can settle into an orbit.
         let mut kernel = solar_kernel(1.0, 3000);
         assert!(drive_to_remnant(&mut kernel));
-        // Let the shell fly for a while — anything bound would still be here.
+        // Let the shell fly for a while — anything on an orbit would still be here.
         for _ in 0..20 {
             kernel.step(1.0e17);
         }
-        let mu = ORBITAL_MASS_SCALE * GRAVITY;
         for p in &kernel.particles {
+            assert_eq!(p.kind, ParticleKind::Ejecta);
             let r = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
             let speed = (p.vx * p.vx + p.vy * p.vy + p.vz * p.vz).sqrt();
+            // Purely radial and outward: `pos · vel = |pos||vel|`, which is
+            // exactly the statement that the fragment has no angular momentum
+            // about the remnant and is receding from it.
+            let radial = p.x * p.vx + p.y * p.vy + p.z * p.vz;
             assert!(
-                !is_bound(mu, r, speed),
-                "bound particle still orbiting the remnant at r={r}"
+                radial > 0.0 && radial >= r * speed * (1.0 - 1e-9),
+                "a fragment is circling the remnant rather than leaving it \
+                 (r={r}, radial={radial}, r·v={})",
+                r * speed
             );
-            assert_eq!(p.kind, ParticleKind::Ejecta);
         }
     }
 
@@ -2100,8 +3152,10 @@ mod tests {
 
     #[test]
     fn the_shell_is_thrown_at_shock_breakout_not_before() {
-        // The core implodes first; nothing is expelled until the rebound shock
-        // reaches the surface.
+        // The envelope leaves as a slow superwind through the late red giant, and
+        // then the core implodes: through the implosion NOTHING more is expelled,
+        // because the star is falling inward, and only when the rebound shock
+        // reaches the surface is the rest of the envelope thrown off.
         let mut kernel = solar_kernel(14.0, 2000);
         for _ in 0..LIFECYCLE_STEPS {
             kernel.step(1.0e18);
@@ -2110,12 +3164,35 @@ mod tests {
             }
         }
         assert_eq!(kernel.stage(), LifecycleStage::Death as u32);
-        // Still collapsing: no ejecta yet.
+        // Still collapsing: the shell has not been thrown.
         assert!((kernel.stage_progress() as f64) < DEATH_SHOCK_BREAKOUT);
-        assert!(!kernel
-            .particles
-            .iter()
-            .any(|p| p.kind == ParticleKind::Ejecta));
+        let wind = ejecta_count(&kernel);
+        // The superwind has already been at work for the late red giant, so the
+        // envelope is visibly leaving BEFORE the star dies (spec §4.4)…
+        assert!(
+            wind > 0,
+            "no envelope had left the star by the time it started to die"
+        );
+        // …but only its red-giant share of it.
+        assert!(
+            (wind as f64) < EJECTA_COUNT as f64 * (REDGIANT_MASS_LOSS_SHARE + 0.02),
+            "{wind} fragments before shock breakout — the blast came early"
+        );
+
+        // Nothing more leaves while the core is imploding.
+        for _ in 0..8 {
+            kernel.step(1.0);
+            if kernel.stage() != LifecycleStage::Death as u32
+                || (kernel.stage_progress() as f64) >= DEATH_SHOCK_BREAKOUT
+            {
+                break;
+            }
+            assert_eq!(
+                ejecta_count(&kernel),
+                wind,
+                "the imploding star expelled gas before the shock broke out"
+            );
+        }
 
         // Step until the shock breaks out, then the shell must exist.
         for _ in 0..LIFECYCLE_STEPS {
@@ -2126,19 +3203,21 @@ mod tests {
                 break;
             }
         }
-        let ejecta = kernel
-            .particles
-            .iter()
-            .filter(|p| p.kind == ParticleKind::Ejecta)
-            .count();
-        assert!(ejecta > 100, "the blast threw only {ejecta} fragments");
+        // The blast is thrown over the few steps the shock takes to unwrap the
+        // envelope (`DEATH_MASS_LOSS_SPAN_IMPULSIVE`), not in a single frame.
+        for _ in 0..24 {
+            kernel.step(1.0e18);
+        }
+        let ejecta = ejecta_count(&kernel);
+        assert!(
+            ejecta > wind * 2,
+            "the blast threw only {ejecta} fragments on top of the {wind} the wind had"
+        );
 
-        // Every fragment is unbound: the shell disperses and leaves a bare remnant.
-        let mu = kernel.mu();
+        // Every fragment is receding: the shell disperses and leaves a bare remnant.
         for p in &kernel.particles {
-            let r = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
-            let speed = (p.vx * p.vx + p.vy * p.vy + p.vz * p.vz).sqrt();
-            assert!(!is_bound(mu, r, speed), "a fragment fell back at r={r}");
+            let radial = p.x * p.vx + p.y * p.vy + p.z * p.vz;
+            assert!(radial > 0.0, "a fragment fell back toward the star");
         }
     }
 
@@ -2218,7 +3297,15 @@ mod tests {
         }
         assert_eq!(kernel.stage(), LifecycleStage::Remnant as u32);
         for p in &kernel.particles {
-            assert!(p.mass <= 0.0, "primordial dust left at remnant: {}", p.mass);
+            // Mass-bearing particles ARE expected here now — they are the star's
+            // own shed envelope, which carries the mass it lost (spec §4.4). What
+            // must be gone is the primordial disc it was born with.
+            assert_eq!(
+                p.kind,
+                ParticleKind::Ejecta,
+                "primordial dust left at remnant: {} M☉",
+                p.mass
+            );
         }
     }
 
@@ -2233,10 +3320,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(
-            kernel.stage(),
-            LifecycleStage::ProtostarCoalescence as u32
-        );
+        assert_eq!(kernel.stage(), LifecycleStage::ProtostarCoalescence as u32);
         let mass0 = total_body_mass(&kernel.body_buf);
         assert!(mass0 > 0.0, "planetesimals should be seeded");
         for _ in 0..60 {
@@ -2295,8 +3379,7 @@ mod tests {
                 );
             }
             kernel.step(1.0e17);
-            if kernel.stage() >= LifecycleStage::ProtostarCoalescence as u32
-                && seeded_at.is_none()
+            if kernel.stage() >= LifecycleStage::ProtostarCoalescence as u32 && seeded_at.is_none()
             {
                 seeded_at = Some(step);
                 break;
@@ -2314,6 +3397,213 @@ mod tests {
             proto_count, PLANETESIMAL_COUNT,
             "expected {PLANETESIMAL_COUNT} protoplanets, got {proto_count}"
         );
+    }
+
+    // --- §4.4 progressive envelope loss and the persistent nebula ----------
+
+    #[test]
+    fn the_envelope_leaves_as_a_wind_and_not_as_one_burst() {
+        // Reported bug 7: "when a red giant collapses it seems as if the matter
+        // condenses into a white dwarf; it is not visible at all that the outer
+        // layers of the gas escape". The envelope used to be thrown in ONE frame
+        // at shock breakout, so there was nothing to see leaving before it and
+        // nothing after. Now it leaves over many steps, starting in the late red
+        // giant, and every batch is launched from the star's own photosphere.
+        let mut kernel = solar_kernel(1.0, 2500);
+        let mut launching_steps = 0;
+        let mut seen_before_death = false;
+        let mut previous = 0usize;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e16);
+            let count = ejecta_count(&kernel);
+            if count > previous {
+                launching_steps += 1;
+                if kernel.stage() == LifecycleStage::RedGiant as u32 {
+                    seen_before_death = true;
+                }
+            }
+            previous = count;
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::Remnant as u32);
+        assert!(
+            seen_before_death,
+            "nothing left the star until it was already dying — the red giant's \
+             superwind is missing"
+        );
+        assert!(
+            launching_steps >= 20,
+            "the envelope was expelled over only {launching_steps} steps; it must \
+             be SEEN to leave, not appear between two frames"
+        );
+        assert_eq!(
+            kernel.ejecta_launched, EJECTA_COUNT,
+            "the envelope was not fully expelled by the time the remnant formed"
+        );
+    }
+
+    #[test]
+    fn the_shells_sweep_numbers_are_the_ones_the_renderer_draws() {
+        // The drawn shock front (`starVisual.ts`) is `stall · (1 − e^-sweep)`,
+        // with `DEATH_SWEEP` reached at the end of the death stage and
+        // `REMNANT_SWEEP` at the end of the nebula's life. Both are functions of
+        // THIS kernel's drag and clocks; pinning them here means the drawn shell
+        // and the gas it is meant to be part of cannot drift apart silently.
+        assert!((EJECTA_DRAG * DEATH_ORBITAL_SPAN - 0.6).abs() < 1e-12);
+        assert!((EJECTA_DRAG * EJECTA_LIFETIME - 3.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_shed_envelope_carries_exactly_the_mass_the_star_lost() {
+        // Mass is MOVED, not invented: the gas the viewer watches leave IS the
+        // mass the star no longer has. Sampled before the shell has reached the
+        // cull radius or begun to expire, so nothing has left the system yet.
+        let mut kernel = solar_kernel(1.0, 2000);
+        let mut checked = 0;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e16);
+            if kernel.shed_mass <= 0.0 {
+                continue;
+            }
+            let carried: f64 = kernel
+                .particles
+                .iter()
+                .filter(|p| p.kind == ParticleKind::Ejecta)
+                .map(|p| p.mass)
+                .sum();
+            assert!(
+                (carried - kernel.shed_mass).abs() <= kernel.shed_mass * 1e-9,
+                "the star shed {} M☉ but its ejecta carries {carried} M☉",
+                kernel.shed_mass
+            );
+            checked += 1;
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        assert!(checked > 0, "the star never shed anything");
+        // …and what it shed is its whole envelope, down to the remnant's share.
+        let retained = kernel.remnant_retained_fraction();
+        let envelope = kernel.star_mass * (1.0 - retained);
+        assert!(
+            (kernel.shed_mass - envelope).abs() <= envelope * 1e-6,
+            "shed {} M☉ of a {envelope} M☉ envelope",
+            kernel.shed_mass
+        );
+    }
+
+    #[test]
+    fn the_nebula_is_still_framed_when_the_remnant_appears() {
+        // The old shell was sized to cover 2.2 (nebula) / 5.5 (supernova) cloud
+        // radii within the death stage — 110 / 275 AU for a 50 AU cloud, against a
+        // view about 62 AU high. It was therefore off-screen before the death even
+        // ended, which is why "there is no nebula, only the small star remnant".
+        for star_mass in [1.0, 14.0] {
+            let mut kernel = solar_kernel(star_mass, 2500);
+            assert!(drive_to_remnant(&mut kernel));
+            let mut radii: Vec<f64> = kernel
+                .particles
+                .iter()
+                .filter(|p| p.kind == ParticleKind::Ejecta)
+                .map(|p| magnitude([p.x, p.y, p.z]))
+                .collect();
+            assert!(
+                radii.len() > EJECTA_COUNT / 2,
+                "only {} fragments survived to the remnant",
+                radii.len()
+            );
+            radii.sort_by(|a, b| a.total_cmp(b));
+            let edge = radii[radii.len() * 9 / 10];
+            let extent = kernel.cloud_extent;
+            assert!(
+                edge >= 0.2 * extent && edge <= 1.4 * extent,
+                "at {star_mass} M☉ the shell's edge is at {edge} AU — outside the \
+                 framed {extent} AU system"
+            );
+        }
+    }
+
+    #[test]
+    fn the_nebula_fades_out_instead_of_being_deleted_mid_flight() {
+        // Measured before the fix: 2198 fragments at one moment and 0 about
+        // fifteen seconds of playback later, because `cull_particles` deleted the
+        // whole shell the instant it crossed the escape radius. A nebula must
+        // DISPERSE — thinning and dimming over the remnant stage.
+        let mut kernel = solar_kernel(1.0, 2500);
+        assert!(drive_to_remnant(&mut kernel));
+        let mut counts = vec![ejecta_count(&kernel)];
+        let mut steps_alive = 0;
+        for step in 0..2000 {
+            kernel.step(1.0e17);
+            let count = ejecta_count(&kernel);
+            let previous = *counts.last().unwrap();
+            // No cliff: at most an eighth of what is left may go in one step
+            // (plus a few, so the last handful of fragments may simply expire).
+            assert!(
+                count + previous / 8 + 8 >= previous,
+                "the shell lost {} of its {previous} fragments in a single step",
+                previous - count
+            );
+            counts.push(count);
+            if count == 0 {
+                steps_alive = step;
+                break;
+            }
+        }
+        assert!(
+            steps_alive > 600,
+            "the nebula was gone after {steps_alive} steps — it must linger and fade"
+        );
+        // It really does end: a shell that never disperses is not a nebula either.
+        assert_eq!(*counts.last().unwrap(), 0);
+        // …and it dimmed on the way out, rather than vanishing at full brightness.
+        assert!(
+            counts.windows(2).filter(|w| w[1] < w[0]).count() > 30,
+            "the count fell in too few distinct steps to read as a fade"
+        );
+    }
+
+    #[test]
+    fn a_world_inside_the_swollen_photosphere_is_destroyed_whenever_it_gets_there() {
+        // `engulf_inner_planets` used to run exactly ONCE, at red-giant onset. A
+        // world that drifted inside the star afterwards — or one the star had not
+        // yet swollen past — went on orbiting inside the photosphere for the rest
+        // of its life.
+        let mut kernel = solar_kernel(1.0, 1200);
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e15);
+            if kernel.stage() == LifecycleStage::RedGiant as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::RedGiant as u32);
+        // Drop a world well inside the star's current surface, long after onset.
+        let doomed_id = kernel.next_body_id;
+        let r = kernel.photosphere_radius() * 0.5;
+        kernel.bodies.push(CelestialBody {
+            id: doomed_id,
+            kind: BodyType::Planet,
+            mass: 3.0e-6,
+            radius: 0.01,
+            pos: [r, 0.0, 0.0],
+            vel: [0.0, 0.0, 0.4],
+            spin: 0.0,
+            captured: false,
+            accretion_target: 0.0,
+        });
+        let events = kernel.step(1.0e15);
+        assert!(
+            !kernel.bodies.iter().any(|b| b.id == doomed_id),
+            "a planet orbiting INSIDE the red giant survived it"
+        );
+        assert!(events > 0, "the star ate a world without saying so");
+        let buf = &kernel.event_buf;
+        let consumed = buf
+            .chunks_exact(EVENT_STRIDE)
+            .any(|e| e[0] as u32 == SimEventType::BodyConsumed as u32 && e[2] == doomed_id);
+        assert!(consumed, "no BodyConsumed event for the engulfed world");
     }
 
     // --- §3.7 post-mass-loss orbit tests -----------------------------------
@@ -2378,8 +3668,19 @@ mod tests {
         // and must be ejected. Confirm no Planet/Protoplanet bodies remain.
         //
         // The 15 M☉ stellar mass needs a cloud ~54 M☉.
+        //
+        // Spread over a 250 AU extent so the cloud stays SINGLE: this invariant is
+        // about the gravity a LONE remnant has left. A companion star would
+        // legitimately keep survivors bound — the binding test is made against the
+        // whole system's `mu` (spec §4.1) — so the premise "retained < 0.5 ⇒ every
+        // circular orbit is unbound" only holds for a single star.
         let cloud = cloud_mass_for_star(15.0, 0.02);
-        let mut kernel = Kernel::new(cloud, 50.0, 0.5, 0.74, 0.24, 0.02, 2000);
+        let extent = 250.0;
+        let mut kernel = Kernel::new(cloud, extent, 0.5, 0.74, 0.24, 0.02, 2000);
+        assert!(
+            kernel.companion_targets.is_empty(),
+            "this test needs a single star; the cloud fragmented instead"
+        );
         let reached_remnant = drive_to_remnant(&mut kernel);
         // A 15 M☉ star always produces a supernova.
         if !reached_remnant {
@@ -2407,6 +3708,276 @@ mod tests {
         );
     }
 
+    // --- §4.1 multi-attractor gravity + §D4 mass-loss-driven orbits ---------
+
+    /// Positions of every world (planet/protoplanet) keyed by body id.
+    fn planet_positions(kernel: &Kernel) -> Vec<(f64, Vec3)> {
+        kernel
+            .bodies
+            .iter()
+            .filter(|b| matches!(b.kind, BodyType::Planet | BodyType::Protoplanet))
+            .map(|b| (b.id, b.pos))
+            .collect()
+    }
+
+    /// Distance of the innermost surviving world, or infinity if none is left.
+    fn innermost_planet(kernel: &Kernel) -> f64 {
+        kernel
+            .bodies
+            .iter()
+            .filter(|b| matches!(b.kind, BodyType::Planet | BodyType::Protoplanet))
+            .fold(f64::INFINITY, |acc, b| acc.min(magnitude(b.pos)))
+    }
+
+    #[test]
+    fn exposes_the_gravitating_centres_over_the_buffer_contract() {
+        // The host needs the SET of centres, not just the primary's mu, to draw
+        // and describe a multiple system. Until a companion forms there is exactly
+        // one centre — the primary, pinned at the scene origin (Decision D5).
+        let mut kernel = solar_kernel(1.0, 100);
+        assert_eq!(kernel.attractor_count(), 1);
+        assert_eq!(kernel.attractor_len() as usize, ATTRACTOR_STRIDE);
+        assert_eq!(kernel.attractor_len() as usize % ATTRACTOR_STRIDE, 0);
+        for lane in 0..3 {
+            assert_eq!(
+                kernel.attractor_buf[lane], 0.0,
+                "the primary must sit exactly at the origin"
+            );
+        }
+        let published = f64::from(kernel.attractor_buf[3]);
+        assert!(
+            (published - kernel.orbital_mu()).abs() <= kernel.orbital_mu() * 1e-6,
+            "published mu {published} disagrees with orbital_mu {}",
+            kernel.orbital_mu()
+        );
+        // ...and it keeps agreeing once the star starts dying and mu shrinks.
+        assert!(drive_to_remnant(&mut kernel));
+        assert_eq!(kernel.attractor_count(), 1);
+        let published = f64::from(kernel.attractor_buf[3]);
+        assert!(
+            (published - kernel.orbital_mu()).abs() <= kernel.orbital_mu() * 1e-6,
+            "published mu {published} drifted from orbital_mu {}",
+            kernel.orbital_mu()
+        );
+        assert!(kernel.attractor_count() as usize <= nbody::MAX_ATTRACTORS);
+    }
+
+    #[test]
+    fn gravity_is_exactly_untouched_until_the_star_starts_dying() {
+        // The calibrated formation timing rests on `mu` — so `mass_loss_factor`
+        // must be the exact identity (not merely ~1) for the whole of formation,
+        // the main sequence and the early red giant. Asserted on the BITS: a
+        // factor of 0.999999 would silently re-tune every accretion threshold.
+        let mut kernel = solar_kernel(1.0, 500);
+        let base = GRAVITY * ORBITAL_MASS_SCALE * kernel.cloud_mass.sqrt();
+        let ms_dur = kernel.durations[LifecycleStage::MainSequence as usize];
+        let rg_dur = kernel.durations[LifecycleStage::RedGiant as usize];
+
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            assert_eq!(kernel.mass_loss_factor.to_bits(), 1.0f64.to_bits());
+            assert_eq!(kernel.orbital_mu().to_bits(), base.to_bits());
+            if kernel.stage() >= LifecycleStage::MainSequence as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::MainSequence as u32);
+
+        // Across the main sequence, in steps small enough to stay inside it.
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(ms_dur / 50.0);
+            if kernel.stage() != LifecycleStage::MainSequence as u32 {
+                break;
+            }
+            assert_eq!(kernel.mass_loss_factor.to_bits(), 1.0f64.to_bits());
+            assert_eq!(kernel.orbital_mu().to_bits(), base.to_bits());
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::RedGiant as u32);
+
+        // ...and through the EARLY red giant, until the superwind starts.
+        let mut saw_wind = false;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(rg_dur / 60.0);
+            if kernel.stage() != LifecycleStage::RedGiant as u32 {
+                break;
+            }
+            if (kernel.stage_progress() as f64) < REDGIANT_MASS_LOSS_ONSET {
+                assert_eq!(
+                    kernel.mass_loss_factor.to_bits(),
+                    1.0f64.to_bits(),
+                    "the star shed mass before the superwind began"
+                );
+            } else if kernel.mass_loss_factor < 1.0 {
+                saw_wind = true;
+            }
+        }
+        assert!(
+            saw_wind,
+            "the red giant never started losing its envelope's gravity"
+        );
+    }
+
+    #[test]
+    fn mass_loss_weakens_gravity_monotonically_down_to_the_remnants_share() {
+        // D4: `mass_loss_factor` is the whole mechanism behind orbit widening, so
+        // it must never recover (that would pull the orbits back IN) and it must
+        // land exactly on the fraction of the star that survives.
+        let mut kernel = solar_kernel(1.0, 1500);
+        let mut previous = 1.0f64;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            assert!(
+                kernel.mass_loss_factor <= previous + 1e-15,
+                "gravity recovered: {previous} -> {}",
+                kernel.mass_loss_factor
+            );
+            assert!(kernel.mass_loss_factor > 0.0);
+            previous = kernel.mass_loss_factor;
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::Remnant as u32);
+        let retained = kernel.remnant_retained_fraction();
+        assert!(retained < 1.0, "a white dwarf must have shed something");
+        assert!(
+            (kernel.mass_loss_factor - retained).abs() < 1e-12,
+            "factor {} should have landed on the retained fraction {retained}",
+            kernel.mass_loss_factor
+        );
+        // The exported mu is the reduced one — the host draws conics from it.
+        let base = GRAVITY * ORBITAL_MASS_SCALE * kernel.cloud_mass.sqrt();
+        assert!((kernel.orbital_mu() - base * retained).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_brown_dwarf_never_loses_any_gravity() {
+        // It never dies, so it never sheds an envelope: the factor must stay the
+        // exact identity for the whole run, or its planets would drift outward for
+        // no reason at all.
+        let cloud = cloud_mass_for_star(0.05, 0.02);
+        let mut kernel = Kernel::new(cloud, 50.0, 0.5, 0.74, 0.24, 0.02, 800);
+        assert!(kernel.substellar);
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            assert_eq!(kernel.mass_loss_factor.to_bits(), 1.0f64.to_bits());
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::Remnant as u32);
+    }
+
+    #[test]
+    fn no_planet_jumps_position_when_the_remnant_appears() {
+        // REPORTED BUG 2: "after the red giant collapse new planets emerge out of
+        // it". Nothing was ever created — every surviving world was TELEPORTED
+        // outward by up to 4× in the single step that entered the Remnant stage
+        // (the closed-form adiabatic rewrite `r → r/retained`), so worlds hidden
+        // inside the giant's glare appeared at new radii the instant it collapsed.
+        //
+        // The widening now comes from integrating with weakened gravity, so the
+        // transition step must be an ORDINARY step: no world may move further than
+        // its own ordinary orbital motion.
+        let mut kernel = solar_kernel(1.0, 2000);
+        let mut saw_transition = false;
+        let mut compared = 0usize;
+        let mut worst_shift = 0.0f64;
+        let mut worst_radial = 0.0f64;
+        for _ in 0..LIFECYCLE_STEPS {
+            let before = planet_positions(&kernel);
+            let was_dying = kernel.stage() == LifecycleStage::Death as u32;
+            kernel.step(1.0e17);
+            let crossed = was_dying && kernel.stage() == LifecycleStage::Remnant as u32;
+            if crossed {
+                saw_transition = true;
+                let after = planet_positions(&kernel);
+                for (id, p0) in &before {
+                    let Some((_, p1)) = after.iter().copied().find(|(i, _)| i == id) else {
+                        continue; // ejected by the natal kick — not a teleport
+                    };
+                    let r0 = magnitude(*p0);
+                    if r0 <= 0.0 {
+                        continue;
+                    }
+                    let shift = magnitude([p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]]);
+                    worst_shift = worst_shift.max(shift / r0);
+                    worst_radial = worst_radial.max((magnitude(p1) - r0).abs() / r0);
+                    compared += 1;
+                }
+            }
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        assert!(
+            saw_transition,
+            "the Death -> Remnant transition was never observed"
+        );
+        assert!(
+            compared > 0,
+            "no world survived to the transition, so nothing was actually checked"
+        );
+        // The old rewrite moved planets by ~3× their own orbital radius in one
+        // step (r -> r/0.24 for a 3 M☉ star). Ordinary motion is a fraction of it.
+        assert!(
+            worst_shift < 0.5,
+            "a planet moved {worst_shift:.2}× its orbital radius in the single \
+             step that formed the remnant — that is a teleport, not an orbit"
+        );
+        assert!(
+            worst_radial < 0.25,
+            "a planet's distance from the star changed by {worst_radial:.2}× in \
+             the single step that formed the remnant"
+        );
+    }
+
+    #[test]
+    fn surviving_orbits_widen_gradually_because_gravity_weakened() {
+        // The physics the teleport was standing in for must still happen: as the
+        // star sheds its envelope the survivors' orbits widen (`a ∝ 1/M`) — but
+        // spread over the many steps the death takes, not in one frame.
+        let mut kernel = solar_kernel(1.0, 2000);
+        // Reach the red giant, then record the innermost survivor.
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            if kernel.stage() >= LifecycleStage::RedGiant as u32 {
+                break;
+            }
+        }
+        let before = innermost_planet(&kernel);
+        assert!(
+            before.is_finite(),
+            "no world survived the red giant's onset"
+        );
+
+        let mut worst_step_ratio = 1.0f64;
+        let mut previous = before;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            let now = innermost_planet(&kernel);
+            if now.is_finite() && previous.is_finite() && previous > 0.0 {
+                worst_step_ratio = worst_step_ratio.max(now / previous);
+            }
+            previous = now;
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::Remnant as u32);
+        let after = innermost_planet(&kernel);
+        assert!(after.is_finite(), "no world survived to the remnant");
+        assert!(
+            after > before * 1.15,
+            "orbits did not widen as the star lost mass: {before:.2} -> {after:.2} AU"
+        );
+        assert!(
+            worst_step_ratio < 1.5,
+            "the widening was a jump, not a drift: one step grew the innermost \
+             orbit by {worst_step_ratio:.2}×"
+        );
+    }
+
     #[test]
     fn supernova_unbinds_when_v_squared_exceeds_two_mu_r() {
         // Unit test for the binding condition: a circular-orbit planet (v² = mu/r)
@@ -2428,6 +3999,794 @@ mod tests {
         assert!(
             is_bound(mu_remnant_high, r, v_circ),
             "circular orbit must remain bound when retained = 0.6 > 0.5"
+        );
+    }
+
+    // --- §4.2 companion stars from cloud fragmentation ----------------------
+
+    /// A cloud massive enough to hold a spare Jeans mass, at the default extent.
+    /// `cloud_mass_for_star` is not used here on purpose: what fragments is the
+    /// CLOUD, and the test is about the cloud's own mass and size.
+    fn fragmenting_kernel(cloud_mass: f64, extent: f64, particles: u32) -> Kernel {
+        Kernel::new(cloud_mass, extent, 0.5, 0.74, 0.24, 0.02, particles)
+    }
+
+    /// Drive until every fragment has finished assembling (or the budget runs
+    /// out), returning the step at which that happened.
+    fn drive_until_companions_are_grown(kernel: &mut Kernel) -> Option<usize> {
+        for step in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            if kernel.companions_seeded && !kernel.companions_hungry() {
+                return Some(step);
+            }
+        }
+        None
+    }
+
+    fn companions(kernel: &Kernel) -> Vec<&CelestialBody> {
+        kernel
+            .bodies
+            .iter()
+            .filter(|b| b.accretion_target > 0.0)
+            .collect()
+    }
+
+    #[test]
+    fn a_massive_cloud_fragments_into_a_companion_star() {
+        // The reported bug: "it should be possible to form multiple stars in the
+        // same star system if the star dust mass allows". A 120 M☉ cloud holds
+        // several Jeans masses, so it cannot collapse as one object — it must
+        // produce at least one genuine, hydrogen-burning companion.
+        let mut kernel = fragmenting_kernel(120.0, 50.0, 1200);
+        assert!(
+            !kernel.companion_targets.is_empty(),
+            "a 120 M☉ cloud must fragment"
+        );
+        let mut ignitions: Vec<(f64, f64)> = Vec::new();
+        let mut seen_star = false;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            for chunk in kernel.event_buf.chunks(EVENT_STRIDE) {
+                if chunk[0] as u32 == SimEventType::CompanionIgnited as u32 {
+                    ignitions.push((chunk[2], chunk[3]));
+                }
+            }
+            if kernel.bodies.iter().any(|b| b.kind == BodyType::Star) {
+                seen_star = true;
+                break;
+            }
+        }
+        assert!(seen_star, "no companion star formed in a 120 M☉ cloud");
+
+        // The star announces itself, with its identity and mass in the payload.
+        assert!(
+            !ignitions.is_empty(),
+            "a companion became a star without emitting CompanionIgnited"
+        );
+        for (id, mass) in &ignitions {
+            assert!(
+                mass >= &HYDROGEN_BURNING_MIN_MASS,
+                "CompanionIgnited reported {mass} M☉, below the H-burning limit"
+            );
+            assert!(
+                kernel.bodies.iter().any(|b| b.id == *id),
+                "CompanionIgnited names body {id}, which does not exist"
+            );
+        }
+
+        // ...and it is a real gravitating centre, not just a differently-drawn
+        // planet (spec §4.1, Decision D1).
+        assert!(
+            kernel.attractor_count() >= 2,
+            "the companion is not in the attractor set: count = {}",
+            kernel.attractor_count()
+        );
+
+        // It keeps growing to its full share of the cloud and stays a star.
+        let grown = drive_until_companions_are_grown(&mut kernel);
+        assert!(grown.is_some(), "the fragments never finished assembling");
+        for companion in companions(&kernel) {
+            assert_eq!(
+                companion.kind,
+                BodyType::Star,
+                "a {} M☉ companion is typed {:?}",
+                companion.mass,
+                companion.kind
+            );
+            // Fragments grow ONLY by rate-limited accretion of their own share:
+            // exceeding it would mean they were also sweeping the disc like a
+            // planetesimal, which would double-count the disc's mass.
+            assert!(
+                companion.mass <= companion.accretion_target * (1.0 + 1e-9),
+                "companion overshot its share: {} > {}",
+                companion.mass,
+                companion.accretion_target
+            );
+        }
+    }
+
+    #[test]
+    fn a_cloud_that_makes_one_star_makes_exactly_one() {
+        // The other half of the criterion: a cloud that assembles a ~1 M☉ star
+        // holds only a single Jeans mass, so it must stay single from the first
+        // frame to the remnant — no companion, no brown dwarf, one attractor.
+        let mut kernel = solar_kernel(1.0, 800);
+        assert!(
+            kernel.companion_targets.is_empty(),
+            "a solar cloud must not fragment"
+        );
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            assert_eq!(
+                kernel.attractor_count(),
+                1,
+                "a single star must be the only gravitating centre"
+            );
+            assert!(
+                !kernel.bodies.iter().any(|b| b.kind.is_stellar()),
+                "a solar cloud produced a self-luminous body"
+            );
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::Remnant as u32);
+    }
+
+    #[test]
+    fn no_body_above_a_burning_limit_is_ever_typed_a_world() {
+        // The reported symptom itself: an object of stellar mass was typed
+        // `Planet`, so the renderer drew it as a gas giant complete with rings.
+        // Every body, on every step, must be typed by its OWN mass.
+        for (cloud, extent) in [(120.0, 50.0), (36.0, 25.0), (3.2, 50.0)] {
+            let mut kernel = fragmenting_kernel(cloud, extent, 900);
+            for _ in 0..LIFECYCLE_STEPS {
+                kernel.step(1.0e17);
+                for body in &kernel.bodies {
+                    if body.kind == BodyType::Comet || body.kind == BodyType::Asteroid {
+                        continue;
+                    }
+                    if body.mass >= HYDROGEN_BURNING_MIN_MASS {
+                        assert_eq!(
+                            body.kind,
+                            BodyType::Star,
+                            "{} M☉ body typed {:?} in a {cloud} M☉ cloud",
+                            body.mass,
+                            body.kind
+                        );
+                    } else if body.mass >= DEUTERIUM_BURNING_MIN_MASS {
+                        assert_eq!(
+                            body.kind,
+                            BodyType::BrownDwarf,
+                            "{} M☉ body typed {:?} in a {cloud} M☉ cloud",
+                            body.mass,
+                            body.kind
+                        );
+                    } else if body.accretion_target > 0.0 {
+                        // A cloud FRAGMENT is born at the opacity limit, below the
+                        // deuterium mass, and is a protostellar core rather than a
+                        // world: it is typed substellar from birth and grows into a
+                        // star (`seed_companions`).
+                        assert!(
+                            body.kind.is_stellar(),
+                            "a fragment is typed {:?} — it is not a world",
+                            body.kind
+                        );
+                    } else {
+                        assert!(
+                            body.kind.is_planetary(),
+                            "{} M☉ body typed {:?} — too light to shine",
+                            body.mass,
+                            body.kind
+                        );
+                    }
+                }
+                if kernel.stage() == LifecycleStage::Remnant as u32 {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_type_lane_publishes_the_new_kinds_over_the_buffer_contract() {
+        // The host reads the kind from the body buffer's type lane, so a companion
+        // must be identifiable there — otherwise `BodyRenderer` keeps drawing it
+        // as a planet no matter what the kernel decided.
+        let mut kernel = fragmenting_kernel(120.0, 50.0, 800);
+        assert!(drive_until_companions_are_grown(&mut kernel).is_some());
+        let n = kernel.body_buf.len() / BODY_STRIDE;
+        let stars = (0..n)
+            .filter(|i| kernel.body_buf[i * BODY_STRIDE + 1] == BodyType::Star as u32 as f32)
+            .count();
+        assert!(
+            stars >= 1,
+            "no body published BodyType::Star in the type lane"
+        );
+        // Mass lane agrees with the classification the type lane claims.
+        for i in 0..n {
+            let base = i * BODY_STRIDE;
+            if kernel.body_buf[base + 1] == BodyType::Star as u32 as f32 {
+                assert!(
+                    f64::from(kernel.body_buf[base + 2]) >= HYDROGEN_BURNING_MIN_MASS,
+                    "a body published as a Star is below the H-burning limit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn companion_gravity_measurably_perturbs_the_planets() {
+        // Decision D1 is FULL companion gravity: the second star must actually
+        // pull on the worlds, not merely be drawn. Compared against the
+        // single-centre field the kernel used to integrate, at the position of a
+        // real planetesimal in a real run.
+        let mut kernel = fragmenting_kernel(14.0, 50.0, 900);
+        assert!(drive_until_companions_are_grown(&mut kernel).is_some());
+        let attractors = kernel.attractor_set();
+        assert!(
+            attractors.len() >= 2,
+            "no companion in the attractor set to perturb anything"
+        );
+        let primary_only = {
+            let mut set = AttractorSet::new();
+            set.push(attractors.as_slice()[0]);
+            set
+        };
+        let planet = kernel
+            .bodies
+            .iter()
+            .find(|b| b.kind.is_planetary())
+            .expect("no planet to be perturbed");
+
+        let with_companion = attractor_accel(attractors.as_slice(), SOFTENING, planet.pos);
+        let alone = attractor_accel(primary_only.as_slice(), SOFTENING, planet.pos);
+        let difference = magnitude([
+            with_companion[0] - alone[0],
+            with_companion[1] - alone[1],
+            with_companion[2] - alone[2],
+        ]);
+        let relative = difference / magnitude(alone).max(f64::EPSILON);
+        assert!(
+            relative > 1e-4,
+            "companion contributes only {relative:.3e} of the acceleration — \
+             its gravity is not reaching the planets"
+        );
+
+        // ...and the perturbation accumulates into a different TRAJECTORY, which
+        // is what the user sees.
+        let mut with_pos = planet.pos;
+        let mut with_vel = planet.vel;
+        let mut without_pos = planet.pos;
+        let mut without_vel = planet.vel;
+        for _ in 0..600 {
+            let (p, v) = integrate_orbit_attractors(
+                with_pos,
+                with_vel,
+                attractors.as_slice(),
+                SOFTENING,
+                INTERNAL_DT,
+            );
+            with_pos = p;
+            with_vel = v;
+            let (p, v) = integrate_orbit_attractors(
+                without_pos,
+                without_vel,
+                primary_only.as_slice(),
+                SOFTENING,
+                INTERNAL_DT,
+            );
+            without_pos = p;
+            without_vel = v;
+        }
+        let drift = magnitude([
+            with_pos[0] - without_pos[0],
+            with_pos[1] - without_pos[1],
+            with_pos[2] - without_pos[2],
+        ]);
+        assert!(
+            drift > 1e-3,
+            "the planet's path is unchanged by the companion (drift {drift:.3e} AU)"
+        );
+    }
+
+    #[test]
+    fn a_fragmenting_cloud_still_conserves_its_mass_budget() {
+        // Companions must be paid for out of the cloud, not created: every gram a
+        // fragment assembles leaves the inner-disc reservoir in the same
+        // statement. Same invariant as `the_mass_budget_is_conserved_and_never_grows`,
+        // run on a cloud that fragments — the case the accounting is new for.
+        let mut kernel = fragmenting_kernel(120.0, 50.0, 2000);
+        let cloud = kernel.cloud_mass;
+        assert!(!kernel.companion_targets.is_empty(), "cloud must fragment");
+        let mut max_total = f64::NEG_INFINITY;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            let dust: f64 = kernel.particles.iter().map(|p| p.mass).sum();
+            let bodies: f64 = kernel.bodies.iter().map(|b| b.mass).sum();
+            let total =
+                kernel.core_mass + kernel.disc_reservoir + kernel.dispersed_mass + dust + bodies;
+            assert!(
+                total <= cloud * 1.005 + 1e-9,
+                "mass created: budget total {total} > cloud {cloud}"
+            );
+            if max_total != f64::NEG_INFINITY {
+                assert!(
+                    total <= max_total + cloud * 0.002,
+                    "mass budget grew {max_total} -> {total}"
+                );
+            }
+            max_total = max_total.max(total);
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+        // The companions really did assemble stellar masses out of that budget.
+        let companion_mass: f64 = companions(&kernel).iter().map(|b| b.mass).sum();
+        assert!(
+            companion_mass >= HYDROGEN_BURNING_MIN_MASS,
+            "the fragments assembled only {companion_mass} M☉ between them"
+        );
+        // The primary's own budget is untouched by the split: companions are fed
+        // from the surplus the star was never going to take, which is what keeps
+        // the stage durations and the fate model (both keyed on `star_mass`) valid.
+        assert_eq!(
+            kernel.star_mass.to_bits(),
+            stellar_mass_from_cloud(cloud, 0.02).to_bits()
+        );
+    }
+
+    #[test]
+    fn a_multiple_system_is_still_deterministic() {
+        // Determinism underpins every other test here, and companion seeding adds
+        // new RNG draws — so the whole multiple-star run must still be bit-exact.
+        fn run() -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u32>) {
+            let mut kernel = fragmenting_kernel(120.0, 50.0, 600);
+            let mut kinds = Vec::new();
+            for _ in 0..220 {
+                kernel.step(1.0e17);
+                for chunk in kernel.event_buf.chunks(EVENT_STRIDE) {
+                    kinds.push(chunk[0] as u32);
+                }
+            }
+            (
+                kernel.particle_buf.clone(),
+                kernel.body_buf.clone(),
+                kernel.attractor_buf.clone(),
+                kinds,
+            )
+        }
+        let a = run();
+        let b = run();
+        assert_eq!(a.0, b.0, "particle buffers diverged");
+        assert_eq!(a.1, b.1, "body buffers diverged");
+        assert_eq!(a.2, b.2, "attractor buffers diverged");
+        assert_eq!(a.3, b.3, "event streams diverged");
+        assert!(
+            a.3.contains(&(SimEventType::CompanionIgnited as u32)),
+            "the run under test never ignited a companion"
+        );
+    }
+
+    #[test]
+    fn a_metal_free_cloud_can_still_fragment() {
+        // Decision D3: fragmentation is self-gravity against thermal pressure in
+        // hydrogen, so a 100 % hydrogen cloud makes a multiple system exactly as
+        // readily as an enriched one — even though (bug 4) it can condense no
+        // solids and therefore no planets.
+        let mut kernel = Kernel::new(120.0, 50.0, 0.5, 1.0, 0.0, 0.0, 800);
+        assert!(
+            !kernel.companion_targets.is_empty(),
+            "a pure-hydrogen cloud must still fragment"
+        );
+        assert!(drive_until_companions_are_grown(&mut kernel).is_some());
+        assert!(
+            kernel.bodies.iter().any(|b| b.kind == BodyType::Star),
+            "no companion star formed in a metal-free cloud"
+        );
+    }
+
+    #[test]
+    fn a_companion_is_never_treated_as_a_planet() {
+        // Every planet-only rule must skip it: the red giant cannot engulf the
+        // star it orbits, it cannot coalesce with a planetesimal, and the
+        // supernova's impulse does not unbind it. So it must still be there —
+        // still a star — when the primary is a corpse.
+        let mut kernel = fragmenting_kernel(120.0, 50.0, 1200);
+        assert!(drive_until_companions_are_grown(&mut kernel).is_some());
+        let before: Vec<f64> = companions(&kernel).iter().map(|b| b.id).collect();
+        assert!(!before.is_empty());
+        assert!(
+            drive_to_remnant(&mut kernel),
+            "the primary never reached its remnant stage"
+        );
+        let after: Vec<f64> = companions(&kernel).iter().map(|b| b.id).collect();
+        assert_eq!(
+            before, after,
+            "a companion was engulfed, merged or ejected as if it were a planet"
+        );
+        for companion in companions(&kernel) {
+            assert_eq!(companion.kind, BodyType::Star);
+        }
+        // ...and it is still holding up its half of the gravitational field.
+        assert!(kernel.attractor_count() >= 2);
+    }
+
+    #[test]
+    fn a_companion_does_not_throttle_the_integrator() {
+        // A companion is both a body and a centre, so its separation from ITSELF
+        // is zero. Feeding that to the CFL guard would peg the substep at the
+        // softening-limited minimum for the whole run and the simulation would
+        // crawl. The guard must see the same encounter radius it would without
+        // the companion's self-pairing.
+        let mut kernel = fragmenting_kernel(120.0, 50.0, 400);
+        assert!(drive_until_companions_are_grown(&mut kernel).is_some());
+        let attractors = kernel.attractor_set();
+        assert!(attractors.len() >= 2);
+        let r_min = kernel.innermost_encounter_radius(&attractors);
+        assert!(
+            r_min > 0.0,
+            "the CFL guard sees a zero encounter radius — a companion is pairing \
+             with itself"
+        );
+        for index in 0..attractors.len() {
+            assert!(
+                kernel.innermost_encounter_radius_to(index, &attractors) > 0.0,
+                "centre {index} sees a zero encounter radius"
+            );
+        }
+        assert!(
+            kernel.stable_substep_for_attractors() > 0.0,
+            "the substep collapsed to zero"
+        );
+    }
+
+    #[test]
+    fn the_cfl_guard_charges_every_centre_with_the_closest_encounter_present() {
+        // Review P2-D asked for a PER-CENTRE encounter radius, on the grounds that
+        // charging the primary for an encounter happening at the companion
+        // over-resolves the frame. The per-centre radii are computed (and checked
+        // here), but the guard deliberately keeps the shared minimum, because the
+        // "waste" is the term that resolves the CROSSING time of a companion
+        // encounter — where the relative speed comes from the primary's Keplerian
+        // shear, not from the companion's own well. Relaxing it unbinds a planet
+        // in battery run #20. This test pins BOTH halves so neither can drift.
+        let mut kernel = fragmenting_kernel(120.0, 50.0, 400);
+        assert!(drive_until_companions_are_grown(&mut kernel).is_some());
+        let attractors = kernel.attractor_set();
+        assert!(attractors.len() >= 2, "need a companion to tell them apart");
+
+        // Put one world deep inside the companion's well, on a wide circular
+        // orbit about the primary so its periapsis about the primary is far out.
+        // Only the companion's own term may notice it.
+        let companion = *attractors.as_slice().last().expect("a companion centre");
+        let primary_before = kernel.innermost_encounter_radius_to(0, &attractors);
+        let pos: Vec3 = [
+            companion.pos[0] + 0.02,
+            companion.pos[1],
+            companion.pos[2] + 0.02,
+        ];
+        let r = magnitude(pos);
+        let speed = circular_speed(attractors.primary_mu(), SOFTENING, r);
+        kernel.bodies.push(CelestialBody {
+            id: 9_001.0,
+            kind: BodyType::Planet,
+            mass: 1e-9,
+            radius: 0.01,
+            pos,
+            vel: [-speed * pos[2] / r, 0.0, speed * pos[0] / r],
+            spin: 1.0,
+            captured: true,
+            accretion_target: 0.0,
+        });
+        // Re-derived so the companion centre still matches the same body.
+        let attractors = kernel.attractor_set();
+        let primary_r = kernel.innermost_encounter_radius_to(0, &attractors);
+        let companion_r = kernel.innermost_encounter_radius_to(attractors.len() - 1, &attractors);
+        assert!(
+            companion_r < 0.1,
+            "the companion must see the close world: {companion_r}"
+        );
+        assert!(
+            primary_r > companion_r * 10.0,
+            "the PRIMARY was charged for an encounter at the companion: \
+             {primary_r} vs {companion_r}"
+        );
+        assert_eq!(
+            primary_r.to_bits(),
+            primary_before.to_bits(),
+            "a world far from the primary changed the primary's encounter radius"
+        );
+        // The SHARED minimum has collapsed onto the companion's encounter, and it
+        // is that number every centre — the primary included — is charged with.
+        let shared = kernel.innermost_encounter_radius(&attractors);
+        assert!(shared <= companion_r);
+        let h = kernel.stable_substep_for_attractors();
+        assert!(h > 0.0 && h <= INTERNAL_DT, "substep out of range: {h}");
+        let expected = attractors.as_slice().iter().fold(INTERNAL_DT, |acc, a| {
+            acc.min(stable_substep(a.mu, SOFTENING, shared))
+        });
+        assert_eq!(
+            h.to_bits(),
+            expected.to_bits(),
+            "the guard stopped resolving the companion encounter with the \
+             primary's mu — see the doc comment: that term is the crossing-time \
+             bound, and dropping it unbinds planets"
+        );
+        // And it is strictly tighter than the per-centre alternative, which is the
+        // whole reason it is kept.
+        let per_centre =
+            attractors
+                .as_slice()
+                .iter()
+                .enumerate()
+                .fold(INTERNAL_DT, |acc, (index, a)| {
+                    let r = kernel.innermost_encounter_radius_to(index, &attractors);
+                    acc.min(stable_substep(a.mu, SOFTENING, r))
+                });
+        assert!(
+            h <= per_centre,
+            "the shared guard must never be looser than the per-centre one: \
+             {h} vs {per_centre}"
+        );
+    }
+
+    #[test]
+    fn a_substellar_body_is_either_burning_deuterium_or_on_its_way() {
+        // Review P2-C. `BodyType::BrownDwarf` documents ONE exception to its mass
+        // range: a cloud fragment is born below the deuterium limit because it is
+        // a protostellar core, not a world. That exception must be bounded — such
+        // a body is always a fragment with a stellar-track `accretion_target` —
+        // so no consumer is ever surprised by a substellar kind on something that
+        // is not on the stellar track.
+        let mut kernel = fragmenting_kernel(120.0, 50.0, 400);
+        assert!(!kernel.companion_targets.is_empty(), "cloud must fragment");
+        let mut saw_a_young_fragment = false;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            for body in &kernel.bodies {
+                if body.kind != BodyType::BrownDwarf {
+                    continue;
+                }
+                if body.mass < DEUTERIUM_BURNING_MIN_MASS {
+                    saw_a_young_fragment = true;
+                    assert!(
+                        body.accretion_target >= DEUTERIUM_BURNING_MIN_MASS,
+                        "a sub-deuterium brown dwarf that is NOT a cloud fragment: \
+                         m={} target={}",
+                        body.mass,
+                        body.accretion_target
+                    );
+                }
+                assert!(
+                    body.mass < HYDROGEN_BURNING_MIN_MASS,
+                    "a hydrogen-burning body is still typed BrownDwarf: {}",
+                    body.mass
+                );
+            }
+        }
+        assert!(
+            saw_a_young_fragment,
+            "the exception was never exercised — the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_world_scattered_out_of_the_system_is_ejected_not_kept_forever() {
+        // A companion can put a world onto an escape trajectory — directly, or by
+        // way of the orbit widening that follows the primary's mass loss. Such a
+        // world has left; it must not keep coasting outward in the body list,
+        // still drawn and still counted as one of the system's planets.
+        //
+        // Driven as a state check rather than by waiting for a scattering event:
+        // the invariant is "no world is unbound, outside the boundary and
+        // receding", and it must hold on EVERY step of a multiple system.
+        let mut kernel = fragmenting_kernel(21.4, 50.0, 1200);
+        assert!(!kernel.companion_targets.is_empty(), "cloud must fragment");
+        let mut ejections = 0usize;
+        for _ in 0..(LIFECYCLE_STEPS * 2) {
+            kernel.step(1.0e17);
+            for chunk in kernel.event_buf.chunks(EVENT_STRIDE) {
+                if chunk[0] as u32 == SimEventType::BodyEjected as u32
+                    && (chunk[3] as u32 == BodyType::Planet as u32
+                        || chunk[3] as u32 == BodyType::Protoplanet as u32)
+                {
+                    ejections += 1;
+                }
+            }
+            let attractors = kernel.attractor_set();
+            for body in &kernel.bodies {
+                if !body.kind.is_planetary() {
+                    continue;
+                }
+                let r = magnitude(body.pos);
+                if r < kernel.eject_radius {
+                    continue;
+                }
+                let radial = (body.pos[0] * body.vel[0]
+                    + body.pos[1] * body.vel[1]
+                    + body.pos[2] * body.vel[2])
+                    / r.max(f64::EPSILON);
+                if radial <= 0.0 {
+                    continue;
+                }
+                let energy = total_specific_energy_attractors(
+                    attractors.as_slice(),
+                    SOFTENING,
+                    body.pos,
+                    body.vel,
+                );
+                assert!(
+                    energy <= 0.0,
+                    "an unbound world is still being carried at r={r:.1} (E={energy:.3})"
+                );
+            }
+        }
+        // The mechanism has to actually fire in this system, or the invariant above
+        // is being satisfied vacuously.
+        assert!(
+            ejections > 0,
+            "no world was ever scattered out of a triple system — \
+             the check above proves nothing"
+        );
+    }
+
+    #[test]
+    fn a_single_star_never_ejects_one_of_its_own_worlds() {
+        // The counterpart: a monopole cannot unbind a bound orbit, so a lone star
+        // that dies quietly (a 1 M☉ progenitor sheds a planetary nebula, with no
+        // impulse — `supernova_ejects_unbound_planets` covers the violent case)
+        // must never lose a world this way. This is what stops the new rule from
+        // quietly deleting planets because of integration error.
+        let mut kernel = solar_kernel(1.0, 900);
+        assert!(kernel.companion_targets.is_empty());
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            for chunk in kernel.event_buf.chunks(EVENT_STRIDE) {
+                if chunk[0] as u32 == SimEventType::BodyEjected as u32 {
+                    assert!(
+                        chunk[3] as u32 == BodyType::Comet as u32
+                            || chunk[3] as u32 == BodyType::Asteroid as u32,
+                        "a single star ejected one of its own worlds"
+                    );
+                }
+            }
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                break;
+            }
+        }
+    }
+
+    // --- §4.3 composition-driven planet formation ---------------------------
+
+    /// A cloud of the given metallicity, sized to make a ~1 M☉ star, with the
+    /// remainder of the composition in hydrogen and helium.
+    fn cloud_of_metallicity(metals: f64, particles: u32) -> Kernel {
+        let cloud = cloud_mass_for_star(1.0, metals);
+        Kernel::new(cloud, 50.0, 0.5, 0.76 - metals, 0.24, metals, particles)
+    }
+
+    #[test]
+    fn seeded_planetesimal_count_scales_with_the_solid_budget() {
+        // The calibration point is untouched: a solar disc still seeds every
+        // embryo, so every existing solar-composition expectation holds.
+        assert_eq!(seeded_planetesimal_count(0.02), PLANETESIMAL_COUNT);
+        // A metal-RICH disc builds bigger worlds (through the retention curve),
+        // not more of them — the room for well-separated embryos is unchanged.
+        assert_eq!(seeded_planetesimal_count(0.2), PLANETESIMAL_COUNT);
+        // Reported bug 4: a 100 % hydrogen cloud has no grains, so no embryos.
+        assert_eq!(seeded_planetesimal_count(0.0), 0);
+        // In between, the count follows the solid budget, and the last embryo
+        // disappears when the budget can no longer supply even one.
+        assert_eq!(seeded_planetesimal_count(0.01), PLANETESIMAL_COUNT / 2);
+        assert_eq!(seeded_planetesimal_count(0.02 / 8.0), 1);
+        assert_eq!(seeded_planetesimal_count(0.02 / 8.0 * 0.99), 0);
+
+        let mut previous = 0usize;
+        for i in 0..=60 {
+            let metals = f64::from(i) * 0.001;
+            let n = seeded_planetesimal_count(metals);
+            assert!(n >= previous, "embryo count fell at metals = {metals}");
+            previous = n;
+        }
+    }
+
+    #[test]
+    fn a_metal_free_cloud_forms_no_planets_at_any_stage() {
+        // Reported bug 4, Decision D3: metals are the only condensable species,
+        // so a pure-hydrogen cloud condenses no grains, seeds no embryos and
+        // grows no worlds — rocky or otherwise — for the whole life of the star.
+        let mut kernel = cloud_of_metallicity(0.0, 1500);
+        assert_eq!(
+            kernel.planetesimal_count, 0,
+            "embryos seeded without metals"
+        );
+        let mut reached_remnant = false;
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            let worlds = kernel
+                .bodies
+                .iter()
+                .filter(|b| b.kind.is_planetary())
+                .count();
+            assert_eq!(
+                worlds,
+                0,
+                "a 100 % hydrogen cloud formed {worlds} planets at stage {}",
+                kernel.stage()
+            );
+            if kernel.stage() == LifecycleStage::Remnant as u32 {
+                reached_remnant = true;
+                break;
+            }
+        }
+        assert!(
+            reached_remnant,
+            "the metal-free star never finished its life, so the check above \
+             only covered part of the run"
+        );
+    }
+
+    #[test]
+    fn a_metal_free_cloud_keeps_its_whole_mass_budget() {
+        // The embryos that are never seeded must leave their mass in the DUST,
+        // not vanish from the book-keeping: the cloud weighs the same either way.
+        let kernel = cloud_of_metallicity(0.0, 1500);
+        let dust: f64 = kernel.particles.iter().map(|p| p.mass).sum();
+        let bodies: f64 = kernel.bodies.iter().map(|b| b.mass).sum();
+        let total =
+            kernel.core_mass + kernel.disc_reservoir + kernel.dispersed_mass + dust + bodies;
+        assert!(
+            (total - kernel.cloud_mass).abs() <= kernel.cloud_mass * 1e-9,
+            "metal-free budget {total} != cloud {}",
+            kernel.cloud_mass
+        );
+    }
+
+    #[test]
+    fn planet_count_and_mass_grow_with_metallicity() {
+        // The whole model in one assertion: no solids, no planets; a quarter of
+        // the solar solids, a handful of small ones; solar solids, the calibrated
+        // architecture. Growth in BOTH the number of worlds and their total mass.
+        let sample = |metals: f64| -> (usize, f64) {
+            let mut kernel = cloud_of_metallicity(metals, 2000);
+            for _ in 0..LIFECYCLE_STEPS {
+                kernel.step(1.0e17);
+                if kernel.stage() >= LifecycleStage::MainSequence as u32 {
+                    break;
+                }
+            }
+            assert_eq!(
+                kernel.stage(),
+                LifecycleStage::MainSequence as u32,
+                "the metals = {metals} run never reached the main sequence"
+            );
+            let masses: Vec<f64> = kernel
+                .bodies
+                .iter()
+                .filter(|b| b.kind.is_planetary())
+                .map(|b| b.mass)
+                .collect();
+            (masses.len(), masses.iter().sum())
+        };
+
+        let barren = sample(0.0);
+        let poor = sample(0.005);
+        let solar = sample(0.02);
+
+        assert_eq!(barren, (0, 0.0), "a metal-free disc built worlds");
+        assert!(poor.0 > 0, "a quarter-solar disc built nothing at all");
+        assert!(
+            poor.0 < solar.0,
+            "planet count did not grow with metallicity: {} vs {}",
+            poor.0,
+            solar.0
+        );
+        assert!(
+            solar.1 > poor.1 * 2.0,
+            "planet mass did not grow with metallicity: {} vs {}",
+            poor.1,
+            solar.1
         );
     }
 }

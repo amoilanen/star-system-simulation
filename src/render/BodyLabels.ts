@@ -17,6 +17,7 @@ import { i18n as sharedI18n, type I18n } from '../i18n/i18n';
 import { BODY_OFFSET, BODY_STRIDE, BodyType } from '../sim/PhysicsKernel';
 import {
   bodyLabelContent,
+  isLuminousBody,
   starLabelContent,
   starSurfaceTemperatureK,
   type LabelContent,
@@ -153,11 +154,13 @@ export class BodyLabels {
       const y = bodies[base + BODY_OFFSET.y] ?? 0;
       const z = bodies[base + BODY_OFFSET.z] ?? 0;
       const radius = bodies[base + BODY_OFFSET.radius] ?? 0.1;
+      const type = Math.round(bodies[base + BODY_OFFSET.type] ?? 0) as BodyType;
+      const mass = bodies[base + BODY_OFFSET.mass] ?? 0;
       const content = bodyLabelContent(
         {
           id: Math.round(bodies[base + BODY_OFFSET.id] ?? 0),
-          type: Math.round(bodies[base + BODY_OFFSET.type] ?? 0) as BodyType,
-          mass: bodies[base + BODY_OFFSET.mass] ?? 0,
+          type,
+          mass,
           radius,
           distanceScene: Math.hypot(x, y, z),
         },
@@ -166,7 +169,17 @@ export class BodyLabels {
         stage,
         remnant,
       );
-      index = this.place(index, [x, y + radius, z], content, camera, width, height, false);
+      // A companion star or brown dwarf is styled like the primary's label, not
+      // like a planet's: it is a star, and the overlay should say so at a glance.
+      index = this.place(
+        index,
+        [x, y + radius, z],
+        content,
+        camera,
+        width,
+        height,
+        isLuminousBody(type, mass),
+      );
     }
 
     // Hide any unused pooled nodes.

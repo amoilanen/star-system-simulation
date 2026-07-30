@@ -11,8 +11,8 @@ as brown dwarfs.
 
 The simulation runs **entirely in the browser**. The heavy numeric work (N-body gravity,
 stage progression, orbital integration) is done by a **Rust physics kernel compiled to
-WebAssembly**, with a pure-TypeScript fallback kernel when WASM is unavailable. Rendering
-is done with **Three.js** (custom GLSL shaders, additive particle fields, bloom
+WebAssembly** — the only physics implementation; the front end never duplicates the model.
+Rendering is done with **Three.js** (custom GLSL shaders, additive particle fields, bloom
 post-processing).
 
 ## Features
@@ -26,8 +26,19 @@ post-processing).
 - **Full lifecycle** — dust cloud → protostar → fusion ignition → main sequence → red giant
   → death → remnant, with the death path chosen from a centralized, mass/composition-based
   fate model.
+- **A death you can watch** — the envelope leaves as a wind over the late red giant and the
+  whole death, so the star is seen to shed it; its gravity weakens as it does, which is what
+  widens the surviving orbits. What is thrown off stays as a **planetary nebula / supernova
+  remnant** that expands and fades across the remnant stage instead of vanishing.
 - **Orbiting bodies** — proto-planets and planets spin and orbit; comets and deep-space
-  asteroids visit the system and are either captured or ejected.
+  asteroids visit the system and are either captured or ejected. Worlds condense out of the
+  cloud's **solids**, so metal-poor clouds form few planets and a metal-free one forms none
+  at all — it can still fragment into companion stars.
+- **Multiple stars** — a cloud holding more than one Jeans mass cannot collapse as a single
+  object: it fragments, and the pieces grow into companion stars (or brown dwarfs) with
+  gravity of their own, which perturbs the planets and can scatter the outer ones away.
+  Every body is classified by its own mass, so anything past the hydrogen-burning limit is a
+  star rather than an oversized planet.
 - **Camera controls** — zoom in/out and smoothly center/focus/follow any body or the star.
 - **Localization** — English and Finnish, selectable on the setup form; new languages are
   data-only additions.
@@ -76,8 +87,8 @@ cargo install wasm-pack
 
    Vite prints a local URL (default `http://localhost:5173`). Open it in a modern browser.
 
-   > If you skip the WASM build, the app still runs using the pure-TypeScript fallback
-   > kernel (`./src/sim/TsFallbackKernel.ts`) — expect lower performance.
+   > The WASM kernel is required: it is the only physics implementation, so skipping step 2
+   > leaves the app with nothing to simulate.
 
 ## npm scripts
 
@@ -129,7 +140,7 @@ src/
   config/              # SimulationConfig contract, presets, fate model
   i18n/                # i18n catalog (en.json, fi.json) + formatter
   sim/                 # Clock, event bus, stage FSM, PhysicsKernel interface,
-                       #   TS fallback + WASM kernel wrappers
+                       #   WASM kernel wrapper
   render/              # Three.js scene, star/remnant shaders, particles,
                        #   bodies, camera, post-processing
   ui/                  # Setup form, HUD, event annotations, info panels

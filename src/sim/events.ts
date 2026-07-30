@@ -23,6 +23,9 @@ export enum SimEventType {
   BodyCaptured, // comet/asteroid captured
   BodyEjected, // comet/asteroid ejected
   BodyConsumed, // a body spiralled into the star and was torn apart
+  // A cloud fragment crossed the hydrogen-burning limit: the system has a second
+  // star (spec §4.2). Payload: `{ bodyId, massSolar }`.
+  CompanionIgnited,
 }
 
 /**
@@ -56,6 +59,7 @@ export const EVENT_MESSAGE_IDS: Readonly<Record<SimEventType, string>> = {
   [SimEventType.BodyCaptured]: 'event.bodyCaptured',
   [SimEventType.BodyEjected]: 'event.bodyEjected',
   [SimEventType.BodyConsumed]: 'event.bodyConsumed',
+  [SimEventType.CompanionIgnited]: 'event.companionIgnited',
 } as const;
 
 /** Resolve the i18n message key for an event type. */

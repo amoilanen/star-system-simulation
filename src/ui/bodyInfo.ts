@@ -4,7 +4,8 @@
 // for a title + description (+ an optional note). Kept DOM-free so it is
 // unit-testable; the panel and wiring layers do the translation and rendering.
 
-import { LifecycleStage, RemnantType } from '../config/fateModel';
+import { FATE_THRESHOLDS, LifecycleStage, RemnantType } from '../config/fateModel';
+import { MIN_SOLID_FRACTION_FOR_ROCK, solidFraction } from '../render/planetLook';
 import { BodyType } from '../sim/PhysicsKernel';
 import { solarToEarthMasses } from '../sim/astro';
 
@@ -13,6 +14,13 @@ export interface StarPick {
   kind: 'star';
   stage: LifecycleStage;
   remnant: RemnantType | null;
+  /**
+   * Metal mass fraction of the birth cloud, when the caller knows it. A cloud
+   * with no metals has no condensable solids at all, so it forms no planets
+   * whatsoever (spec §4.3) — and the star's own card is the only place left to
+   * explain the empty system (reported bug 4).
+   */
+  discMetallicity?: number;
 }
 
 /** A celestial body (planet / comet / asteroid), described by type + size. */
@@ -50,10 +58,22 @@ export const ICE_GIANT_MIN_EARTH_MASSES = 8;
 export const GAS_GIANT_MIN_EARTH_MASSES = 50;
 
 /**
- * i18n title id for a planet of `massSolar`, by mass class. Pure; shared by the
+ * i18n title id for a body of `massSolar`, by mass class. Pure; shared by the
  * label overlay and the click-to-inspect panel so both agree.
+ *
+ * The mass classes are open-ended at the top, so the SELF-LUMINOUS masses have
+ * to be excluded first: 50 M⊕ makes a gas giant, but 26 600 M⊕ (0.08 M☉) makes a
+ * STAR, and the old unbounded `>= GAS_GIANT_MIN_EARTH_MASSES` test is exactly why
+ * a 2–3 M☉ companion was announced as a gas giant (reported bug 1). Above the
+ * deuterium-burning limit the object fuses, so it is named for what it is.
  */
 export function planetClassTitleId(massSolar: number): string {
+  if (massSolar >= FATE_THRESHOLDS.hydrogenBurningMinMass) {
+    return 'info.companionStar.title';
+  }
+  if (massSolar >= FATE_THRESHOLDS.deuteriumBurningMinMass) {
+    return 'info.brownDwarfCompanion.title';
+  }
   const earthMasses = solarToEarthMasses(massSolar);
   if (earthMasses >= GAS_GIANT_MIN_EARTH_MASSES) {
     return 'info.gasGiant.title';
@@ -76,6 +96,19 @@ export function bodyInfoMessages(target: PickTarget): BodyInfoMessages {
 }
 
 function starInfoMessages(star: StarPick): BodyInfoMessages {
+  const base = starStageMessages(star);
+  // Only ever ADDS a note, so a caller that does not know the composition (or a
+  // disc that does condense solids) sees exactly the card it always saw.
+  if (star.discMetallicity === undefined) {
+    return base;
+  }
+  if (solidFraction(star.discMetallicity) >= MIN_SOLID_FRACTION_FOR_ROCK) {
+    return base;
+  }
+  return { ...base, noteId: 'info.note.noPlanets' };
+}
+
+function starStageMessages(star: StarPick): BodyInfoMessages {
   switch (star.stage) {
     case LifecycleStage.DustCloud:
     case LifecycleStage.ProtostarCoalescence:
@@ -117,9 +150,19 @@ function celestialBodyInfoMessages(body: BodyPick): BodyInfoMessages {
       return { titleId: 'info.comet.title', descId: 'info.comet.desc', noteId: note };
     case BodyType.Asteroid:
       return { titleId: 'info.asteroid.title', descId: 'info.asteroid.desc', noteId: note };
+    case BodyType.Star:
+      return { titleId: 'info.companionStar.title', descId: 'info.companionStar.desc' };
+    case BodyType.BrownDwarf:
+      return {
+        titleId: 'info.brownDwarfCompanion.title',
+        descId: 'info.brownDwarfCompanion.desc',
+      };
     case BodyType.Planet:
     case BodyType.Protoplanet:
     default: {
+      // `planetClassTitleId` also covers the self-luminous masses, so a body
+      // whose type lane says "planet" but whose mass says "star" is still
+      // described as a star.
       const titleId = planetClassTitleId(body.mass ?? 0);
       const descId = `${titleId.slice(0, -'.title'.length)}.desc`;
       return { titleId, descId };

@@ -1,4 +1,4 @@
-// Planet / comet / asteroid renderer (spec §3.2, FR-6, FR-7).
+// Planet / comet / asteroid / companion-star renderer (spec §3.2, §4.7, FR-6, FR-7).
 //
 // Reads the kernel body buffer each frame and draws bodies as instanced meshes,
 // one instanced mesh per kind. Planets spin on their axis (accumulated per body
@@ -6,8 +6,15 @@
 // `planetLook` so no two look alike, and carry ring systems and moons. Comets
 // additionally get an additive tail billboard oriented radially away from the
 // star (bodyMath.tailDirectionAwayFromStar).
+//
+// SELF-LUMINOUS bodies — a companion star or a brown dwarf (spec §4.2) — are the
+// one kind that is NOT a world: they are drawn from `starVisual`'s blackbody ramp
+// as a small photosphere plus a bounded corona, and they never get a ring or a
+// moon. That is what makes the reported "planet with rings emerging from the
+// star" impossible for a stellar-mass body (reported bug 2).
 
 import * as THREE from 'three';
+import { isSelfLuminous } from '../config/fateModel';
 import { BODY_OFFSET, BODY_STRIDE, BodyType } from '../sim/PhysicsKernel';
 import type { Vec3 } from '../sim/PhysicsKernel';
 import {
@@ -16,9 +23,23 @@ import {
   tailDirectionAwayFromStar,
   tailLength,
 } from './bodyMath';
-import { MAX_MOONS_PER_PLANET, moonOffset, moonOrbit, planetLook } from './planetLook';
-import { apparentRadius } from './screenScale';
+import {
+  MAX_MOONS_PER_PLANET,
+  SOLAR_METALLICITY,
+  moonOffset,
+  moonOrbit,
+  planetLook,
+} from './planetLook';
+import { apparentRadius, cappedApparentRadius } from './screenScale';
 import { cometTailFragmentShader, cometTailVertexShader } from './shaders/cometTail';
+import { coronaFragmentShader, coronaVertexShader } from './shaders/corona';
+import {
+  companionAppearance,
+  coronaIntensity,
+  coronaRadius,
+  type CompanionAppearance,
+  type Rgb,
+} from './starVisual';
 
 const MAX_PLANETS = 32;
 const MAX_COMETS = 48;
@@ -48,6 +69,48 @@ const MIN_BODY_PIXELS = 7;
 
 /** Apparent-size floor for a moon; below its planet's so the hierarchy reads. */
 const MIN_MOON_PIXELS = 3;
+
+/**
+ * How many self-luminous companions can be drawn at once. The kernel's
+ * `MAX_ATTRACTORS` bounds how many companions GRAVITATE (Decision D6), but a
+ * brown dwarf shines without being an attractor, so this sits comfortably above
+ * that bound rather than exactly on it.
+ */
+const MAX_COMPANIONS = 6;
+
+/**
+ * Apparent-size floor for a companion's photosphere. Above `MIN_BODY_PIXELS`,
+ * because a companion star is the second most important object in the scene and
+ * has to be findable from a whole-system view — but nowhere near the primary's
+ * halo floor, which is what made zoomed-out planets sit inside the star's glow.
+ */
+const MIN_COMPANION_PIXELS = 9;
+
+/** Apparent-size floor for a companion's corona, so it feeds the bloom pass. */
+const MIN_COMPANION_CORONA_PIXELS = 16;
+
+/**
+ * Hard ceiling on the fraction of the VIEWPORT HEIGHT a companion's corona may
+ * span — the same treatment `StarRenderer` gives the primary's halo (reported
+ * bug 6), set tighter: a companion must never take over the frame the primary
+ * is in. Beyond it the excess feeds brightness/bloom, never area.
+ */
+const MAX_COMPANION_CORONA_HEIGHT_FRACTION = 0.25;
+
+/**
+ * One drawn self-luminous companion, published for the scene's secondary light
+ * (spec §4.7): planets in a multiple system are lit by BOTH stars.
+ */
+export interface DrawnCompanion {
+  /** World position in scene units. */
+  position: Vec3;
+  /** Blackbody colour of its photosphere. */
+  color: Rgb;
+  /** Corona/glow multiplier, on `StarAppearance.glow`'s scale. */
+  glow: number;
+  /** Mass in solar masses — the companion's brightness ordering. */
+  mass: number;
+}
 
 /** Ring-system inner/outer radius as a multiple of the planet's drawn radius. */
 const RING_INNER = 1.5;
@@ -83,6 +146,23 @@ export class BodyRenderer {
   private readonly rings: THREE.InstancedMesh;
   private readonly tails: THREE.InstancedMesh;
   private readonly tailMaterial: THREE.ShaderMaterial;
+  /**
+   * Companion photospheres. Unlit (`MeshBasicMaterial`): a star is a light
+   * SOURCE, so shading it from the primary would darken its far limb — the one
+   * thing that would make it read as a planet again.
+   */
+  private readonly companions: THREE.InstancedMesh;
+  /**
+   * Per-companion corona billboards. Not instanced, unlike every other kind
+   * here: the halo shader carries its colour and intensity in UNIFORMS, and each
+   * companion needs its own (a red dwarf beside a blue giant). There are at most
+   * {@link MAX_COMPANIONS} of them, so a small pool of meshes is cheaper than
+   * reworking the shader for per-instance attributes.
+   */
+  private readonly companionCoronas: THREE.Mesh[] = [];
+  private readonly companionCoronaMaterials: THREE.ShaderMaterial[] = [];
+  private readonly companionCoronaGeometry: THREE.PlaneGeometry;
+  private readonly companionGroup: THREE.Group;
   /** Pooled moon-orbit circles, shown with the orbit overlay. */
   private readonly moonOrbitGroup: THREE.Group;
   private readonly moonOrbitPool: THREE.LineLoop[] = [];
@@ -106,6 +186,20 @@ export class BodyRenderer {
    * Set by the scene from the system scale; a safe default keeps tails sensible.
    */
   private tailActivationDistance = 25;
+  /**
+   * Metal mass fraction of the disc the worlds grew in, which decides what they
+   * can be made of (spec §4.3). Defaults to solar — the composition every
+   * existing appearance rule was written against.
+   */
+  private discMetallicity = SOLAR_METALLICITY;
+  /**
+   * The most massive self-luminous companion drawn this frame, or null when the
+   * system has only one star. Read by `SceneManager` to place its secondary
+   * point light. Only the brightest is published: a second light is a real cost
+   * per lit fragment, and the mass–luminosity law is steep enough that the
+   * heaviest companion dominates the illumination anyway.
+   */
+  private companionLight: DrawnCompanion | null = null;
   /** Camera for this frame's apparent-size floor (null ⇒ draw at true size). */
   private camera: THREE.PerspectiveCamera | null = null;
   /** Viewport height in pixels for this frame's apparent-size floor. */
@@ -234,6 +328,42 @@ export class BodyRenderer {
     this.tails.count = 0;
     this.tails.frustumCulled = false;
     this.group.add(this.tails);
+
+    // Companion stars and brown dwarfs: a self-luminous photosphere (the
+    // per-instance colour IS the emission, so the material must not be shaded)
+    // plus one billboard halo each, pooled below.
+    this.companionGroup = new THREE.Group();
+    this.group.add(this.companionGroup);
+    const companionMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    this.companions = new THREE.InstancedMesh(
+      new THREE.SphereGeometry(1, 24, 24),
+      companionMat,
+      MAX_COMPANIONS,
+    );
+    this.companions.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.companions.count = 0;
+    this.companions.frustumCulled = false;
+    this.companionGroup.add(this.companions);
+    this.companionCoronaGeometry = new THREE.PlaneGeometry(1, 1);
+    for (let i = 0; i < MAX_COMPANIONS; i += 1) {
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          uColor: { value: new THREE.Color(1, 1, 1) },
+          uIntensity: { value: 0 },
+        },
+        vertexShader: coronaVertexShader,
+        fragmentShader: coronaFragmentShader,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(this.companionCoronaGeometry, material);
+      mesh.frustumCulled = false;
+      mesh.visible = false;
+      this.companionCoronaMaterials.push(material);
+      this.companionCoronas.push(mesh);
+      this.companionGroup.add(mesh);
+    }
   }
 
   /**
@@ -272,7 +402,9 @@ export class BodyRenderer {
     let ringIdx = 0;
     let tailIdx = 0;
     let orbitIdx = 0;
+    let companionIdx = 0;
     const seen = new Set<number>();
+    this.companionLight = null;
 
     for (let i = 0; i < count; i += 1) {
       const base = i * BODY_STRIDE;
@@ -305,10 +437,21 @@ export class BodyRenderer {
             MAX_ASTEROIDS,
           );
           break;
+        case BodyType.Star:
+        case BodyType.BrownDwarf:
+          companionIdx = this.writeCompanion(companionIdx, pos, mass);
+          break;
         case BodyType.Protoplanet:
         case BodyType.Planet:
         default: {
-          const look = planetLook(id, mass);
+          // Mass has the final say, not just the type lane: a body heavy enough
+          // to fuse is self-luminous whatever it is labelled, so a stale or
+          // corrupt type can never put a ring system around a star (bug 2).
+          if (isSelfLuminous(mass)) {
+            companionIdx = this.writeCompanion(companionIdx, pos, mass);
+            break;
+          }
+          const look = planetLook(id, mass, this.discMetallicity);
           const drawn = this.drawnRadius(pos, radius, MIN_BODY_PIXELS);
           planetIdx = this.writePlanet(planetIdx, pos, drawn, angle, look.axialTilt, look.color);
           if (look.hasRings) {
@@ -328,11 +471,19 @@ export class BodyRenderer {
     this.finalize(this.moons, moonIdx);
     this.finalize(this.rings, ringIdx);
     this.finalize(this.tails, tailIdx);
+    this.finalize(this.companions, companionIdx);
     if (this.planets.instanceColor !== null) {
       this.planets.instanceColor.needsUpdate = true;
     }
     if (this.rings.instanceColor !== null) {
       this.rings.instanceColor.needsUpdate = true;
+    }
+    if (this.companions.instanceColor !== null) {
+      this.companions.instanceColor.needsUpdate = true;
+    }
+    // Hide the halos of companions that are gone (engulfed, ejected, merged).
+    for (let i = companionIdx; i < this.companionCoronas.length; i += 1) {
+      this.companionCoronas[i]!.visible = false;
     }
     // Hide any pooled moon-orbit circles left over from a previous frame.
     for (let i = orbitIdx; i < this.moonOrbitPool.length; i += 1) {
@@ -350,6 +501,119 @@ export class BodyRenderer {
   /** Show or hide the moon-orbit circles (follows the orbit overlay toggle). */
   setMoonOrbitsVisible(visible: boolean): void {
     this.moonOrbitGroup.visible = visible;
+  }
+
+  /**
+   * The brightest self-luminous companion drawn on the last {@link update}, or
+   * null if the system has only its primary. `SceneManager` turns this into the
+   * scene's SECOND point light, so worlds in a multiple system are genuinely lit
+   * from both stars (spec §4.7).
+   */
+  get luminousCompanion(): DrawnCompanion | null {
+    return this.companionLight;
+  }
+
+  /**
+   * Draw one self-luminous companion: a blackbody photosphere at its true
+   * physical radius plus a bounded additive halo, with NO ring and NO moon.
+   *
+   * The halo is clamped from both sides in APPARENT size exactly as the
+   * primary's is (`StarRenderer`): floored so it stays a smooth multi-pixel
+   * source for the bloom pass, and capped at a fraction of the viewport height
+   * so a close fly-by can never fill the frame with glow (reported bug 6). What
+   * the cap takes away from the area is handed to brightness instead.
+   */
+  private writeCompanion(index: number, pos: Vec3, mass: number): number {
+    if (index >= MAX_COMPANIONS) {
+      return index;
+    }
+    const look: CompanionAppearance = companionAppearance(mass);
+    const drawn = this.drawnRadius(pos, look.radius, MIN_COMPANION_PIXELS);
+
+    this.dummy.position.set(pos[0], pos[1], pos[2]);
+    this.dummy.rotation.set(0, 0, 0);
+    this.dummy.scale.setScalar(drawn);
+    this.dummy.updateMatrix();
+    this.companions.setMatrixAt(index, this.dummy.matrix);
+    // `surfaceLum` keeps the disc off white so the blackbody hue survives the
+    // ACES tone-map — the same reason the primary's disc is dimmed.
+    this.color.setRGB(
+      look.color.r * look.surfaceLum,
+      look.color.g * look.surfaceLum,
+      look.color.b * look.surfaceLum,
+    );
+    this.companions.setColorAt(index, this.color);
+
+    this.writeCompanionCorona(index, pos, look, drawn);
+
+    // Only a hydrogen-fusing companion is published as a light source. A brown
+    // dwarf radiates ~1e-5 L☉ almost entirely in the infrared: it glows, but it
+    // lights nothing, and giving it a point light would flood the system with
+    // illumination no such object could produce.
+    if (look.star && (this.companionLight === null || mass > this.companionLight.mass)) {
+      this.companionLight = {
+        position: [pos[0], pos[1], pos[2]],
+        color: look.color,
+        glow: look.glow,
+        mass,
+      };
+    }
+    return index + 1;
+  }
+
+  /**
+   * Position, size and tint the pooled halo billboard of one companion.
+   * `drawnRadius` is the photosphere's already-floored radius, so the halo is
+   * always a fixed multiple of the disc it surrounds.
+   */
+  private writeCompanionCorona(
+    index: number,
+    pos: Vec3,
+    look: CompanionAppearance,
+    drawnRadius: number,
+  ): void {
+    const mesh = this.companionCoronas[index];
+    const material = this.companionCoronaMaterials[index];
+    if (mesh === undefined || material === undefined) {
+      return;
+    }
+    const camera = this.camera;
+    const wanted = coronaRadius(drawnRadius, look.glow);
+    let radius = wanted;
+    let overflow = 1;
+    if (camera !== null && this.viewportHeightPx > 0) {
+      const distance = Math.hypot(
+        pos[0] - camera.position.x,
+        pos[1] - camera.position.y,
+        pos[2] - camera.position.z,
+      );
+      const floored = apparentRadius(
+        wanted,
+        distance,
+        camera.fov,
+        this.viewportHeightPx,
+        MIN_COMPANION_CORONA_PIXELS,
+      );
+      radius = cappedApparentRadius(
+        floored,
+        distance,
+        camera.fov,
+        MAX_COMPANION_CORONA_HEIGHT_FRACTION,
+      );
+      overflow = radius > 0 ? floored / radius : 1;
+      // Billboard toward the viewer, so the quad is never seen edge-on.
+      mesh.quaternion.copy(camera.quaternion);
+    }
+    mesh.position.set(pos[0], pos[1], pos[2]);
+    // The quad is 1x1, so its scale is a DIAMETER — hence the 2x.
+    mesh.scale.setScalar(radius * 2);
+    mesh.visible = true;
+    (material.uniforms.uColor!.value as THREE.Color).setRGB(
+      look.color.r,
+      look.color.g,
+      look.color.b,
+    );
+    material.uniforms.uIntensity!.value = coronaIntensity(look.glow, overflow);
   }
 
   /**
@@ -523,6 +787,18 @@ export class BodyRenderer {
   }
 
   /**
+   * Set the metal mass fraction of the disc these worlds grew in (spec §4.3).
+   * It decides what they can be MADE of: with no metals nothing condenses, so a
+   * world is a colourless hydrogen envelope rather than a stone planet, and
+   * carries neither rings nor moons — both of which are debris.
+   */
+  setDiscMetallicity(metals: number): void {
+    if (Number.isFinite(metals) && metals >= 0) {
+      this.discMetallicity = metals;
+    }
+  }
+
+  /**
    * Write one comet-tail instance oriented away from the star — but ONLY when the
    * comet is close enough for solar heating to grow a tail. Far from the star the
    * comet has no tail at all; as it nears the inner system the tail appears and
@@ -566,6 +842,7 @@ export class BodyRenderer {
       this.moons,
       this.rings,
       this.tails,
+      this.companions,
     ]) {
       mesh.geometry.dispose();
       const mat = mesh.material;
@@ -581,6 +858,16 @@ export class BodyRenderer {
     this.moonOrbitPool.length = 0;
     this.moonOrbitGeometry.dispose();
     this.moonOrbitMaterial.dispose();
+    for (const mesh of this.companionCoronas) {
+      this.companionGroup.remove(mesh);
+    }
+    for (const material of this.companionCoronaMaterials) {
+      material.dispose();
+    }
+    this.companionCoronas.length = 0;
+    this.companionCoronaMaterials.length = 0;
+    this.companionCoronaGeometry.dispose();
+    this.companionLight = null;
     this.spinAngles.clear();
   }
 }

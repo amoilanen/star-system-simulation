@@ -27,6 +27,9 @@ export interface WasmKernelHandle {
   particle_len(): number;
   body_ptr(): number;
   body_len(): number;
+  attractor_ptr(): number;
+  attractor_len(): number;
+  attractor_count(): number;
   events_ptr(): number;
   event_stride(): number;
   stage(): number;
@@ -102,8 +105,17 @@ export class WasmKernel implements PhysicsKernel {
     return new Float32Array(this.buffer(), handle.body_ptr(), handle.body_len());
   }
 
+  getAttractorBuffer(): Float32Array {
+    const handle = this.requireHandle();
+    return new Float32Array(this.buffer(), handle.attractor_ptr(), handle.attractor_len());
+  }
+
   orbitalMu(): number {
     return this.requireHandle().orbital_mu();
+  }
+
+  attractorCount(): number {
+    return this.requireHandle().attractor_count();
   }
 
   dispose(): void {
@@ -165,6 +177,11 @@ function decodeEventData(
     case SimEventType.BodyEjected:
     case SimEventType.BodyConsumed:
       return { bodyId: dataA, bodyType: dataB as BodyType };
+    case SimEventType.CompanionIgnited:
+      // A companion carries its MASS rather than a body type: what the annotation
+      // needs to say is how heavy the new star is, and its kind is BodyType.Star
+      // by definition of the event.
+      return { bodyId: dataA, massSolar: dataB };
     default:
       return undefined;
   }

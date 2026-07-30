@@ -3,12 +3,14 @@ import {
   determineFate,
   effectiveFinalMass,
   remnantMass,
+  isSelfLuminous,
   isSubstellar,
   fateModel,
   FATE_THRESHOLDS,
   RemnantType,
 } from '../../src/config/fateModel';
 import type { CloudComposition } from '../../src/config/SimulationConfig';
+import { JUPITER_MASSES_PER_SOLAR } from '../../src/sim/astro';
 
 // Solar composition sits exactly at the reference metallicity, so it applies no
 // mass-loss modifier — effectiveFinalMass === mass. Boundary tests use it to
@@ -190,5 +192,45 @@ describe('substellar objects — a brown dwarf is not a dead star but a failed o
     for (const m of [0.02, 0.05, 0.079]) {
       expect(remnantMass(m, RemnantType.BrownDwarf)).toBe(m);
     }
+  });
+});
+
+describe('isSelfLuminous', () => {
+  it('mirrors the kernel deuterium-burning limit of ~13 Jupiter masses', () => {
+    // Host mirror of `DEUTERIUM_BURNING_MIN_MASS` in `wasm/src/stages.rs`. If the
+    // two drift, the renderer draws rings on something the kernel calls a brown
+    // dwarf (reported bug 2).
+    expect(FATE_THRESHOLDS.deuteriumBurningMinMass).toBe(0.013);
+    expect(FATE_THRESHOLDS.deuteriumBurningMinMass).toBeLessThan(
+      FATE_THRESHOLDS.hydrogenBurningMinMass,
+    );
+    // ≈13 M♃ — the same ±1 window the Rust constant's test asserts.
+    const jupiters = FATE_THRESHOLDS.deuteriumBurningMinMass * JUPITER_MASSES_PER_SOLAR;
+    expect(Math.abs(jupiters - 13)).toBeLessThan(1);
+  });
+
+  it('is true for everything that fuses and false for every world', () => {
+    for (const m of [FATE_THRESHOLDS.deuteriumBurningMinMass, 0.02, 0.08, 1, 3, 20]) {
+      expect(isSelfLuminous(m), `${m} M☉`).toBe(true);
+    }
+    // Jupiter (9.55e-4 M☉) and a super-Jupiter of 12 M♃ are still worlds.
+    for (const m of [0, 3e-6, 9.55e-4, 12 / JUPITER_MASSES_PER_SOLAR]) {
+      expect(isSelfLuminous(m), `${m} M☉`).toBe(false);
+    }
+  });
+
+  it('treats a non-finite mass as a world, the harmless default', () => {
+    for (const m of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(isSelfLuminous(m)).toBe(false);
+    }
+  });
+
+  it('brackets `isSubstellar`: a brown dwarf both shines and is substellar', () => {
+    const bd = 0.03;
+    expect(isSelfLuminous(bd)).toBe(true);
+    expect(isSubstellar(bd)).toBe(true);
+    // A star is self-luminous and NOT substellar.
+    expect(isSelfLuminous(1)).toBe(true);
+    expect(isSubstellar(1)).toBe(false);
   });
 });

@@ -14,6 +14,7 @@ import { SimEventType, type SimulationEvent } from '../sim/events';
 import { STAGE_ENTRY_EVENT } from '../sim/stages';
 import { i18n as sharedI18n, type I18n, type MessageParams } from '../i18n/i18n';
 import { STAGE_MESSAGE_IDS } from './Hud';
+import { formatMass } from './labelInfo';
 
 /**
  * Reverse of {@link STAGE_ENTRY_EVENT}: the lifecycle stage a given event marks
@@ -47,6 +48,8 @@ export const BODY_TYPE_MESSAGE_IDS: Readonly<Record<BodyType, string>> = {
   [BodyType.Planet]: 'body.planet',
   [BodyType.Comet]: 'body.comet',
   [BodyType.Asteroid]: 'body.asteroid',
+  [BodyType.BrownDwarf]: 'body.brownDwarf',
+  [BodyType.Star]: 'body.star',
 };
 
 /**
@@ -74,6 +77,12 @@ export function annotationParams(
   }
   if (typeof data.bodyId === 'number') {
     params.id = data.bodyId;
+  }
+  // A companion's ignition is announced by its MASS, which is what makes it a
+  // star rather than a planet (spec §4.2). Formatted with the same helper the
+  // labels use, so the units read identically wherever a mass is shown.
+  if (typeof data.massSolar === 'number') {
+    params.mass = formatMass(data.massSolar);
   }
   return params;
 }

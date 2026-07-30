@@ -10,7 +10,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { Vec3 } from '../sim/PhysicsKernel';
-import { followStep, frameDistance, nearPlaneFor } from './cameraMath';
+import {
+  MAX_CAMERA_DISTANCE,
+  followStep,
+  frameDistance,
+  nearPlaneFor,
+  pushOutOfKeepOut,
+} from './cameraMath';
 
 /** Supplies the live world position of a followed body, or null to stop. */
 export type FollowProvider = () => Vec3 | null;
@@ -35,6 +41,11 @@ export class CameraController {
   private lastFollowPos: Vec3 | null = null;
   /** The smoothed look-at target the camera orbits around. */
   private readonly smoothedTarget: Vec3 = [0, 0, 0];
+  /**
+   * Radius around the SCENE ORIGIN the camera is kept out of — the star's
+   * currently drawn radius, fed in every frame by `SceneManager`. 0 disables it.
+   */
+  private keepOutRadius = 0;
 
   constructor(camera: THREE.PerspectiveCamera, domElement: HTMLElement) {
     this.camera = camera;
@@ -44,7 +55,7 @@ export class CameraController {
     // Small enough to fly right up to a true-scale Earth-sized planet
     // (~4.26e-5 AU radius — see `bodyRadiusFromMass`).
     this.controls.minDistance = 5e-4;
-    this.controls.maxDistance = 5000;
+    this.controls.maxDistance = MAX_CAMERA_DISTANCE;
   }
 
   /**
@@ -71,6 +82,17 @@ export class CameraController {
     this.smoothedTarget[1] = position[1];
     this.smoothedTarget[2] = position[2];
     this.camera.position.copy(this.controls.target).addScaledVector(dir, dist);
+  }
+
+  /**
+   * Set the radius around the scene origin (where the star sits) that the camera
+   * must stay outside of — the star's current DRAWN radius. Called every frame,
+   * because the star swells by three orders of magnitude over its life and a
+   * camera parked next to the main-sequence star would otherwise end up inside
+   * the red giant. Non-finite or non-positive values disable the keep-out.
+   */
+  setKeepOutRadius(radius: number): void {
+    this.keepOutRadius = Number.isFinite(radius) && radius > 0 ? radius : 0;
   }
 
   /** Follow a moving body, keeping the current orbit offset (FR-8). */
@@ -148,7 +170,27 @@ export class CameraController {
       }
     }
     this.controls.update();
+    this.applyKeepOut();
     this.syncNearPlane();
+  }
+
+  /**
+   * Keep the camera outside the star's drawn photosphere (see
+   * {@link setKeepOutRadius}). Runs AFTER `controls.update()` — OrbitControls
+   * re-derives its spherical coordinates from the camera's actual position each
+   * frame, so writing the position here sticks, exactly as {@link dolly} relies
+   * on. Only ever moves the camera further from the star.
+   */
+  private applyKeepOut(): void {
+    if (this.keepOutRadius <= 0) {
+      return;
+    }
+    const pushed = pushOutOfKeepOut(
+      [this.camera.position.x, this.camera.position.y, this.camera.position.z],
+      [0, 0, 0],
+      this.keepOutRadius,
+    );
+    this.camera.position.set(pushed[0], pushed[1], pushed[2]);
   }
 
   /**

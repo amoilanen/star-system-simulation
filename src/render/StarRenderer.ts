@@ -13,8 +13,13 @@
 // from the simulation orchestrator.
 
 import * as THREE from 'three';
-import { apparentRadius } from './screenScale';
-import type { StarAppearance } from './starVisual';
+import {
+  apparentHeightFraction,
+  apparentRadius,
+  cappedApparentRadius,
+  overflowDimming,
+} from './screenScale';
+import { coronaIntensity, coronaRadius, type StarAppearance } from './starVisual';
 import { coronaFragmentShader, coronaVertexShader } from './shaders/corona';
 import { starFragmentShader, starVertexShader } from './shaders/star';
 import {
@@ -52,13 +57,37 @@ const PHOTON_RING_SCALE = 4.2;
 
 /**
  * Smallest apparent DIAMETER, in pixels, at which the star's disk and its glow
- * halo are drawn. The star is modelled at Solar-System proportions (~0.047 AU
+ * halo are drawn. The star is modelled at Solar-System proportions (~0.005 AU
  * against orbits of many AU), so from a whole-system view it would otherwise be
  * sub-pixel. The halo keeps a larger floor than the disk so the star always
  * reads as a bright point of light with a glow, the way a real star does.
+ *
+ * The halo floor used to be 44 px — a 22 px RADIUS, while `BodyRenderer` floors
+ * a planet to a 7 px diameter. Framing a 50 AU system in ~800 px puts 1 AU at
+ * ~13 px, so the innermost planets were drawn INSIDE the star's halo and read as
+ * hugging the star (reported bug 3). At 20 px the halo's radius is 10 px, so a
+ * 1 AU orbit clears it at any framing that shows the whole system, and the star
+ * still reads as a glowing point rather than a bare 7 px disk.
  */
 const MIN_STAR_PIXELS = 7;
-const MIN_CORONA_PIXELS = 44;
+const MIN_CORONA_PIXELS = 20;
+
+/**
+ * Largest apparent size of the glow halo, as a fraction of the VIEWPORT HEIGHT
+ * its diameter may span (see `apparentHeightFraction`). Beyond this the corona
+ * stops growing and its brightness rises instead — a supernova has to be
+ * blinding, not a full-frame white wash (reported bug 6).
+ */
+const MAX_CORONA_HEIGHT_FRACTION = 0.55;
+
+/**
+ * The same ceiling for the BLAST SHELL. The shell must keep its true world
+ * radius — it is the same expanding shell as the ejecta particles, so shrinking
+ * it would visibly desynchronise the two — so instead its brightness is dimmed
+ * by however far past the cap it reaches (`overflowDimming`), which keeps the
+ * light it adds to the frame bounded while the nebula stays physically large.
+ */
+const MAX_SHELL_HEIGHT_FRACTION = 1.1;
 
 /**
  * A compact remnant is drawn from a much larger apparent floor than a star: its
@@ -323,35 +352,47 @@ export class StarRenderer {
 
       // Corona: billboard toward the camera, scale with radius + glow, tint.
       // NB: the corona is a 1x1 plane, so its scale is a DIAMETER — hence the 2x.
-      // A generous minimum keeps the halo a smooth, multi-pixel source for the
-      // bloom pass; a sub-pixel-bright star fed only the coarsest bloom mips and
-      // produced a visibly blocky square of glow around it.
-      // Glow is capped in the halo's SIZE (not its brightness): a supernova's
-      // glow peaks around 14, and letting the halo grow in proportion turned the
-      // explosion into a full-screen white wash instead of a blazing star.
-      const coronaRadius = appearance.radius * (3.5 + Math.min(appearance.glow, 4));
-      const coronaScale =
-        perspective === null || viewportHeightPx <= 0
-          ? coronaRadius * 2
-          : 2 *
-            apparentRadius(
-              coronaRadius,
-              cameraDistance,
-              perspective.fov,
-              viewportHeightPx,
-              MIN_CORONA_PIXELS,
-            );
-      this.corona.scale.setScalar(coronaScale);
+      //
+      // The halo is bounded from BOTH sides in apparent size. A generous minimum
+      // keeps it a smooth, multi-pixel source for the bloom pass (a sub-pixel
+      // star fed only the coarsest bloom mips and produced a blocky square of
+      // glow). A MAXIMUM keeps it off the whole frame: with the star's glow
+      // peaking near 14 at shock breakout, the unbounded quad reached hundreds of
+      // AU across against a ~62 AU visible height and washed the screen white
+      // (reported bug 6). Past the cap the excess is spent on BRIGHTNESS instead
+      // of area, so the flash is blinding without being a wall of light.
+      const wantedRadius = coronaRadius(appearance.radius, appearance.glow);
+      let drawnCorona = wantedRadius;
+      let overflow = 1;
+      if (perspective !== null && viewportHeightPx > 0) {
+        const floored = apparentRadius(
+          wantedRadius,
+          cameraDistance,
+          perspective.fov,
+          viewportHeightPx,
+          MIN_CORONA_PIXELS,
+        );
+        drawnCorona = cappedApparentRadius(
+          floored,
+          cameraDistance,
+          perspective.fov,
+          MAX_CORONA_HEIGHT_FRACTION,
+        );
+        overflow = drawnCorona > 0 ? floored / drawnCorona : 1;
+      }
+      this.corona.scale.setScalar(drawnCorona * 2);
       this.corona.quaternion.copy(camera.quaternion);
       (this.coronaMaterial.uniforms.uColor!.value as THREE.Color).setRGB(
         appearance.color.r,
         appearance.color.g,
         appearance.color.b,
       );
-      this.coronaMaterial.uniforms.uIntensity!.value = Math.min(1, 0.35 + appearance.glow * 0.25);
+      // `overflow` is 1 whenever the halo fits, so an ordinary star's brightness
+      // is exactly what it always was; only a size-capped halo brightens.
+      this.coronaMaterial.uniforms.uIntensity!.value = coronaIntensity(appearance.glow, overflow);
     }
 
-    this.updateBlastShell(appearance);
+    this.updateBlastShell(appearance, cameraDistance, perspective);
     this.updateMagnetosphere(appearance, dt, drawn);
     this.updateBeams(appearance, dt, drawn, camera);
     this.updateBlackHole(appearance, drawn, camera);
@@ -359,17 +400,34 @@ export class StarRenderer {
 
   /**
    * Scale, tint and fade the expanding blast shell. Its radius comes straight
-   * from the appearance model, so the drawn shock front and the ejecta the
-   * kernel actually integrates expand together.
+   * from the appearance model — never capped — so the drawn shock front and the
+   * ejecta the kernel actually integrates always expand together.
+   *
+   * What IS bounded is the light it adds: once the shell is larger than
+   * {@link MAX_SHELL_HEIGHT_FRACTION} of the frame (which it must eventually be —
+   * it grows past the whole system, and the camera ends up inside it) its
+   * brightness is dimmed in the same proportion, so a nebula that fills the view
+   * stays a nebula instead of becoming an opaque wall of additive light.
    */
-  private updateBlastShell(appearance: StarAppearance): void {
+  private updateBlastShell(
+    appearance: StarAppearance,
+    cameraDistance: number,
+    perspective: THREE.PerspectiveCamera | null,
+  ): void {
     const visible = appearance.shockwave > 0.001 && appearance.shockwaveRadius > 0;
     this.blastShell.visible = visible;
     if (!visible) {
       return;
     }
     this.blastShell.scale.setScalar(appearance.shockwaveRadius);
-    this.blastShellMaterial.uniforms.uIntensity!.value = appearance.shockwave;
+    const dimming =
+      perspective === null
+        ? 1
+        : overflowDimming(
+            apparentHeightFraction(appearance.shockwaveRadius, cameraDistance, perspective.fov),
+            MAX_SHELL_HEIGHT_FRACTION,
+          );
+    this.blastShellMaterial.uniforms.uIntensity!.value = appearance.shockwave * dimming;
     this.blastShellMaterial.uniforms.uTime!.value = this.elapsed;
     (this.blastShellMaterial.uniforms.uColor!.value as THREE.Color).setRGB(
       appearance.shockwaveColor.r,

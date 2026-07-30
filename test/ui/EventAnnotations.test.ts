@@ -1,6 +1,11 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it } from 'vitest';
-import { annotationMessageId, EventAnnotations } from '../../src/ui/EventAnnotations';
+import {
+  annotationMessageId,
+  BODY_TYPE_MESSAGE_IDS,
+  EventAnnotations,
+} from '../../src/ui/EventAnnotations';
+import { formatMass } from '../../src/ui/labelInfo';
 import { createEvent, SimEventType } from '../../src/sim/events';
 import { RemnantType } from '../../src/config/fateModel';
 import { BodyType } from '../../src/sim/PhysicsKernel';
@@ -92,6 +97,47 @@ describe('EventAnnotations', () => {
     });
     expect(layer.resolve(event)).toBe(expected);
     expect(layer.resolve(event)).toContain('comet');
+  });
+
+  it('announces a companion ignition with the mass that made it a star', () => {
+    // Spec §4.2: the payload is `{ bodyId, massSolar }`, and the annotation must
+    // interpolate the mass — an unresolved `{mass}` placeholder would surface in
+    // the HUD verbatim.
+    const layer = new EventAnnotations({ container, locale: 'en', enabled: true });
+    const event = createEvent(SimEventType.CompanionIgnited, 12, {
+      bodyId: 3,
+      massSolar: 0.42,
+    });
+    const resolved = layer.resolve(event);
+    expect(resolved).toBe(
+      i18n.translate('en', 'event.companionIgnited', { mass: formatMass(0.42), id: 3 }),
+    );
+    expect(resolved).toContain('0.42 M☉');
+    expect(resolved).not.toContain('{mass}');
+  });
+
+  it('announces even the lightest possible companion in solar masses', () => {
+    // A companion ignites at 0.08 M☉ — just above the old Earth-mass/solar-mass
+    // switch-over in `formatMass`, which would have announced the birth of a star
+    // as "26 638 M⊕".
+    const layer = new EventAnnotations({ container, locale: 'en', enabled: true });
+    const resolved = layer.resolve(
+      createEvent(SimEventType.CompanionIgnited, 5, { bodyId: 2, massSolar: 0.08 }),
+    );
+    expect(resolved).toContain('0.08 M☉');
+    expect(resolved).not.toContain('M⊕');
+  });
+
+  it('names both self-luminous body kinds', () => {
+    // A companion star and a brown dwarf must have their own names: reusing
+    // 'body.planet' is exactly the confusion the mass-based typing removes.
+    for (const [type, expected] of [
+      [BodyType.Star, 'companion star'],
+      [BodyType.BrownDwarf, 'brown dwarf'],
+    ] as const) {
+      expect(i18n.translate('en', BODY_TYPE_MESSAGE_IDS[type])).toBe(expected);
+      expect(i18n.translate('fi', BODY_TYPE_MESSAGE_IDS[type])).not.toBe('');
+    }
   });
 
   it('labels stage-transition annotations with the stage the star enters', () => {

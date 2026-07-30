@@ -1,11 +1,14 @@
 import { describe, it, expect } from 'vitest';
+import type { Vec3 } from '../../src/sim/PhysicsKernel';
 import {
   damp,
   dampVec3,
   distanceSquared,
   followStep,
   frameDistance,
+  KEEP_OUT_MARGIN,
   nearPlaneFor,
+  pushOutOfKeepOut,
 } from '../../src/render/cameraMath';
 
 describe('frameDistance', () => {
@@ -181,5 +184,74 @@ describe('nearPlaneFor', () => {
     expect(nearPlaneFor(0)).toBe(0.02);
     expect(nearPlaneFor(-1)).toBe(0.02);
     expect(nearPlaneFor(Number.NaN)).toBe(0.02);
+  });
+});
+
+describe('pushOutOfKeepOut (bug 6 — the camera must never end up inside the star)', () => {
+  const ORIGIN: Vec3 = [0, 0, 0];
+
+  it('pushes a camera inside the keep-out sphere out to the margin', () => {
+    // Focused on a 1 M☉ main-sequence star the camera sits ~0.02 AU out; by the
+    // red giant the photosphere is 1.16 AU and it would be deep inside the star.
+    const out = pushOutOfKeepOut([0, 0, 0.02], ORIGIN, 1.16);
+    expect(Math.hypot(out[0], out[1], out[2])).toBeCloseTo(1.16 * KEEP_OUT_MARGIN, 10);
+    // Pushed RADIALLY: the viewing direction from the star is unchanged.
+    expect(out[0]).toBe(0);
+    expect(out[1]).toBe(0);
+    expect(out[2]).toBeGreaterThan(0);
+  });
+
+  it('never pulls a camera in — the user keeps any zoom they already have', () => {
+    for (const distance of [1e-3, 0.02, 1, 1.86, 5, 63, 5000]) {
+      for (const radius of [0, 4.3e-5, 0.00465, 1.16, 1.63, 17.5]) {
+        const before: Vec3 = [distance * 0.6, distance * 0.8, 0];
+        const after = pushOutOfKeepOut(before, ORIGIN, radius);
+        const d0 = Math.hypot(before[0], before[1], before[2]);
+        const d1 = Math.hypot(after[0], after[1], after[2]);
+        expect(d1, `d ${distance} r ${radius}`).toBeGreaterThanOrEqual(d0 - 1e-12);
+        // Either untouched, or exactly at the keep-out margin.
+        if (d1 > d0 + 1e-12) {
+          expect(d1).toBeCloseTo(radius * KEEP_OUT_MARGIN, 10);
+        } else {
+          expect(after).toBe(before);
+        }
+      }
+    }
+  });
+
+  it('always leaves the camera outside the drawn photosphere with headroom', () => {
+    for (const radius of [1e-5, 0.05, 1.16, 10, 17.5]) {
+      const out = pushOutOfKeepOut([0, 0, radius * 0.1], ORIGIN, radius);
+      expect(Math.hypot(out[0], out[1], out[2])).toBeGreaterThan(radius);
+    }
+    expect(KEEP_OUT_MARGIN).toBeGreaterThan(1);
+  });
+
+  it('handles a camera exactly at the star centre by picking a direction', () => {
+    const out = pushOutOfKeepOut([0, 0, 0], ORIGIN, 2);
+    expect(Math.hypot(out[0], out[1], out[2])).toBeCloseTo(2 * KEEP_OUT_MARGIN, 10);
+    expect(Number.isFinite(out[0] + out[1] + out[2])).toBe(true);
+  });
+
+  it('respects a keep-out sphere that is not at the origin', () => {
+    const center: Vec3 = [10, -4, 3];
+    const out = pushOutOfKeepOut([10.1, -4, 3], center, 1);
+    expect(Math.hypot(out[0] - center[0], out[1] - center[1], out[2] - center[2])).toBeCloseTo(
+      KEEP_OUT_MARGIN,
+      10,
+    );
+  });
+
+  it('disables itself for a non-positive or non-finite radius', () => {
+    const pos: Vec3 = [0, 0, 1e-4];
+    for (const radius of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(pushOutOfKeepOut(pos, ORIGIN, radius)).toBe(pos);
+    }
+  });
+
+  it('accepts a custom margin but never one below 1 (which would pull the camera in)', () => {
+    expect(Math.hypot(...pushOutOfKeepOut([0, 0, 0.1], ORIGIN, 1, 3))).toBeCloseTo(3, 10);
+    // A margin under 1 is clamped to 1: the camera is placed ON the surface, not inside it.
+    expect(Math.hypot(...pushOutOfKeepOut([0, 0, 0.1], ORIGIN, 1, 0.2))).toBeCloseTo(1, 10);
   });
 });

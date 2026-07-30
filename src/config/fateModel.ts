@@ -62,6 +62,18 @@ export const FATE_THRESHOLDS = {
    */
   hydrogenBurningMinMass: 0.08,
   /**
+   * Deuterium-burning minimum mass (M☉): ~0.013 M☉ (≈13 Jupiters) — the host
+   * mirror of `DEUTERIUM_BURNING_MIN_MASS` in `wasm/src/stages.rs`, which is
+   * where the kernel draws the line between a WORLD and a brown dwarf (spec
+   * §4.2).
+   *
+   * Between this and {@link FATE_THRESHOLDS.hydrogenBurningMinMass} the core is
+   * hot enough to fuse deuterium, so the object is SELF-LUMINOUS: it must be
+   * named, described and drawn as a brown dwarf, never as a gas giant with
+   * rings and moons.
+   */
+  deuteriumBurningMinMass: 0.013,
+  /**
    * Effective final STELLAR mass (M☉) at/above which the star ends in a core-
    * collapse supernova. Below this it quietly forms a white dwarf. This is the
    * real Chandrasekhar-driven boundary of ~8 M☉ of stellar (NOT cloud) mass —
@@ -125,6 +137,22 @@ export function effectiveFinalMass(mass: number, composition: CloudComposition):
  */
 export function isSubstellar(mass: number): boolean {
   return mass < FATE_THRESHOLDS.hydrogenBurningMinMass;
+}
+
+/**
+ * Whether an object of `mass` M☉ SHINES by its own fusion — i.e. it reached at
+ * least the deuterium-burning minimum, so it is a brown dwarf or a star and not
+ * a world (spec §4.2). The kernel types bodies by exactly this rule, and the
+ * renderer and the UI must agree with it: a self-luminous body is drawn as a
+ * small blackbody with a corona and NEVER with the rings and moons of a planet
+ * (reported bug 2).
+ *
+ * Guards against a non-finite mass by treating it as a world, which is the safe
+ * default: it can only ever cost a companion its halo, never put a ring around
+ * a star.
+ */
+export function isSelfLuminous(mass: number): boolean {
+  return Number.isFinite(mass) && mass >= FATE_THRESHOLDS.deuteriumBurningMinMass;
 }
 
 /**

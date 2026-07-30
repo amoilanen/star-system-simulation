@@ -19,6 +19,8 @@ const ALL_EVENT_TYPES = [
   SimEventType.RemnantFormed,
   SimEventType.BodyCaptured,
   SimEventType.BodyEjected,
+  SimEventType.BodyConsumed,
+  SimEventType.CompanionIgnited,
 ] as const;
 
 describe('event message ids', () => {

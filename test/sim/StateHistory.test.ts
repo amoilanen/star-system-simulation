@@ -10,6 +10,8 @@ function fakeState(marker: number): RenderState {
     particleCount: 0,
     bodies: new Float32Array(0),
     bodyCount: 0,
+    attractors: new Float32Array([0, 0, 0, 1]),
+    attractorCount: 1,
     stage: LifecycleStage.MainSequence,
     stageProgress: marker,
     cloudMass: 3.2,

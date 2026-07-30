@@ -6,7 +6,7 @@
 // i18n-free (it returns message ids + interpolation values) so the physics
 // formatting can be unit-tested directly; `BodyLabels` renders the result.
 
-import { LifecycleStage, RemnantType } from '../config/fateModel';
+import { isSelfLuminous, LifecycleStage, RemnantType } from '../config/fateModel';
 import { BodyType } from '../sim/PhysicsKernel';
 import {
   coreTemperatureK,
@@ -17,7 +17,7 @@ import {
   stellarRadiusForStageSolar,
 } from '../sim/astro';
 import { planetClassTitleId } from './bodyInfo';
-import { mainSequenceTemperature } from '../render/starVisual';
+import { companionAppearance, mainSequenceTemperature } from '../render/starVisual';
 
 /** One "label: value" statistic line rendered under a label's name. */
 export interface LabelStat {
@@ -51,13 +51,19 @@ export function formatTemperature(kelvin: number): string {
   return `${Math.round(kelvin)} K`;
 }
 
-/** Format a mass given in solar masses, choosing solar or Earth units. */
+/**
+ * Format a mass given in solar masses, choosing solar or Earth units.
+ *
+ * The switch-over is the DEUTERIUM-BURNING limit, not a round number: at and
+ * above it the object fuses and is a brown dwarf or a star (spec §4.2), and
+ * astronomers quote those in solar masses — "0.42 M☉", never "139 838 M⊕". Below
+ * it the object is a world, and Earth masses read far better.
+ */
 export function formatMass(solarMasses: number): string {
   if (!Number.isFinite(solarMasses) || solarMasses <= 0) {
     return '—';
   }
-  // Below ~0.05 M☉ the object is planet-like: Earth masses read far better.
-  if (solarMasses < 0.05) {
+  if (!isSelfLuminous(solarMasses)) {
     const earth = solarToEarthMasses(solarMasses);
     if (earth >= 1000) {
       return `${Math.round(earth).toLocaleString('en-US')} M⊕`;
@@ -197,6 +203,12 @@ export function bodyLabelContent(
   stage: LifecycleStage = LifecycleStage.MainSequence,
   remnant: RemnantType | null = null,
 ): LabelContent {
+  // A self-luminous companion is not heated BY the primary — it has its own
+  // effective temperature, from its own mass (spec §4.7). Reporting an
+  // equilibrium temperature for it would say a 2 M☉ star is 280 K.
+  if (isLuminousBody(body.type, body.mass)) {
+    return companionLabelContent(body, starMassSolar);
+  }
   const distanceAu = sceneToAu(body.distanceScene);
   // The star's CURRENT radius: a red giant swells to ~10² R☉ (planets heat
   // up), a compact remnant is tiny (survivors freeze).
@@ -216,6 +228,39 @@ export function bodyLabelContent(
   };
 }
 
+/**
+ * Whether a body in the kernel buffer SHINES: either the kernel typed it as a
+ * companion, or its mass alone is enough to fuse (spec §4.2). Mass is checked as
+ * well as the type lane so a body that outgrew its label is still treated as the
+ * star it is — the same rule `BodyRenderer` routes its drawing on, and the label
+ * overlay uses it to give a companion the star's visual weight.
+ */
+export function isLuminousBody(type: BodyType, mass: number): boolean {
+  return type === BodyType.Star || type === BodyType.BrownDwarf || isSelfLuminous(mass);
+}
+
+/**
+ * Label content for a self-luminous companion: its own mass in M☉ and its own
+ * EFFECTIVE temperature, plus the orbital speed and separation that say it is a
+ * companion rather than a second primary.
+ */
+function companionLabelContent(body: BodyLabelInput, starMassSolar: number): LabelContent {
+  const look = companionAppearance(body.mass);
+  const distanceAu = sceneToAu(body.distanceScene);
+  // Speed about the PRIMARY, which is what the separation is measured from.
+  const velocity = orbitalVelocityKms(starMassSolar, distanceAu);
+  return {
+    titleId: bodyTitleId(body),
+    titleValues: { id: body.id },
+    stats: [
+      { labelId: 'label.stat.mass', value: formatMass(body.mass) },
+      { labelId: 'label.stat.surfaceTemp', value: formatTemperature(look.temperatureK) },
+      { labelId: 'label.stat.velocity', value: formatVelocity(velocity) },
+      { labelId: 'label.stat.distance', value: formatDistance(body.distanceScene) },
+    ],
+  };
+}
+
 /** i18n id naming a celestial body by kind (and, for planets, by MASS class). */
 export function bodyTitleId(body: Pick<BodyLabelInput, 'type' | 'mass'>): string {
   switch (body.type) {
@@ -223,8 +268,14 @@ export function bodyTitleId(body: Pick<BodyLabelInput, 'type' | 'mass'>): string
       return 'info.comet.title';
     case BodyType.Asteroid:
       return 'info.asteroid.title';
+    case BodyType.Star:
+      return 'info.companionStar.title';
+    case BodyType.BrownDwarf:
+      return 'info.brownDwarfCompanion.title';
     case BodyType.Protoplanet:
-      return 'info.protoplanet.title';
+      // A protoplanet that grew past a burning limit is no longer a protoplanet,
+      // however the type lane still reads — `planetClassTitleId` decides.
+      return isSelfLuminous(body.mass) ? planetClassTitleId(body.mass) : 'info.protoplanet.title';
     case BodyType.Planet:
     default:
       return planetClassTitleId(body.mass);

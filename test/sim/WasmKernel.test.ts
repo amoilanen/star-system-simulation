@@ -10,7 +10,12 @@ import {
   type WasmKernelHandle,
   type WasmModule,
 } from '../../src/sim/WasmKernel';
-import { BodyType, PARTICLE_STRIDE } from '../../src/sim/PhysicsKernel';
+import {
+  ATTRACTOR_OFFSET,
+  ATTRACTOR_STRIDE,
+  BodyType,
+  PARTICLE_STRIDE,
+} from '../../src/sim/PhysicsKernel';
 import { SimEventType } from '../../src/sim/events';
 import { LifecycleStage, RemnantType } from '../../src/config/fateModel';
 import type { CloudComposition, SimulationConfig } from '../../src/config/SimulationConfig';
@@ -35,14 +40,21 @@ function makeConfig(overrides: Partial<SimulationConfig> = {}): SimulationConfig
 // exercises the exact zero-copy view construction and event-decoding it uses
 // against the Rust module.
 
-function makeFakeModule(): { mod: WasmModule; particle: number[]; body: number[] } {
+function makeFakeModule(): {
+  mod: WasmModule;
+  particle: number[];
+  body: number[];
+  attractor: number[];
+} {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const buffer = memory.buffer;
 
   // f32-exact values so `toEqual` comparisons are stable.
   const particle = [1, 2, 3, 0.5, 0.25, 0.75, 1];
   const body = [0, BodyType.Planet, 0.5, 1.5, 4, 0, 8, -0.5, 0, 0.25, 0.75, 1];
-  // Two packed events: [type, simTime, dataA, dataB].
+  // Two gravitating centres: the primary at the origin and a companion.
+  const attractor = [0, 0, 0, 42, 12, 0, -3, 8];
+  // Three packed events: [type, simTime, dataA, dataB].
   const events = [
     SimEventType.RemnantFormed,
     123,
@@ -52,22 +64,32 @@ function makeFakeModule(): { mod: WasmModule; particle: number[]; body: number[]
     456,
     7,
     BodyType.Comet,
+    // A companion ignition carries its MASS in the second lane, not a body type.
+    SimEventType.CompanionIgnited,
+    789,
+    3,
+    0.5,
   ];
 
   const PARTICLE_PTR = 0;
   const BODY_PTR = 64;
+  const ATTRACTOR_PTR = 256;
   const EVENT_PTR = 512; // 8-byte aligned for Float64Array
 
   new Float32Array(buffer, PARTICLE_PTR, particle.length).set(particle);
   new Float32Array(buffer, BODY_PTR, body.length).set(body);
+  new Float32Array(buffer, ATTRACTOR_PTR, attractor.length).set(attractor);
   new Float64Array(buffer, EVENT_PTR, events.length).set(events);
 
   const handle: WasmKernelHandle = {
-    step: () => 2,
+    step: () => 3,
     particle_ptr: () => PARTICLE_PTR,
     particle_len: () => particle.length,
     body_ptr: () => BODY_PTR,
     body_len: () => body.length,
+    attractor_ptr: () => ATTRACTOR_PTR,
+    attractor_len: () => attractor.length,
+    attractor_count: () => attractor.length / ATTRACTOR_STRIDE,
     events_ptr: () => EVENT_PTR,
     event_stride: () => 4,
     stage: () => LifecycleStage.MainSequence,
@@ -89,7 +111,7 @@ function makeFakeModule(): { mod: WasmModule; particle: number[]; body: number[]
     snow_line_au: () => 2.7,
     default: async () => undefined,
   };
-  return { mod, particle, body };
+  return { mod, particle, body, attractor };
 }
 
 describe('WasmKernel wrapper', () => {
@@ -103,6 +125,40 @@ describe('WasmKernel wrapper', () => {
     kernel.dispose();
   });
 
+  it('exposes the gravitating centres on the attractor lanes', () => {
+    // The multi-attractor field (Decision D1) reaches the host over its own
+    // buffer, laid out exactly like the particle/body ones. A wrong stride or a
+    // stale count would silently drop the companion's gravity on this side.
+    const { mod, attractor } = makeFakeModule();
+    const kernel = new WasmKernel(mod);
+    kernel.init({ config: makeConfig(), particleCount: 1 });
+
+    const buf = kernel.getAttractorBuffer();
+    expect(Array.from(buf)).toEqual(attractor);
+    expect(kernel.attractorCount()).toBe(2);
+    expect(buf.length).toBe(kernel.attractorCount() * ATTRACTOR_STRIDE);
+
+    // Lane 0 is the PRIMARY, at the scene origin (Decision D5), and its `mu` is
+    // what `orbitalMu()` reports — the orbit overlay's central conic.
+    expect(buf[ATTRACTOR_OFFSET.x]).toBe(0);
+    expect(buf[ATTRACTOR_OFFSET.y]).toBe(0);
+    expect(buf[ATTRACTOR_OFFSET.z]).toBe(0);
+    expect(buf[ATTRACTOR_OFFSET.mu]).toBe(kernel.orbitalMu());
+
+    // The companion carries its own position and a `mu` of its own.
+    expect(buf[ATTRACTOR_STRIDE + ATTRACTOR_OFFSET.x]).toBe(12);
+    expect(buf[ATTRACTOR_STRIDE + ATTRACTOR_OFFSET.z]).toBe(-3);
+    expect(buf[ATTRACTOR_STRIDE + ATTRACTOR_OFFSET.mu]).toBe(8);
+    kernel.dispose();
+  });
+
+  it('refuses to read the attractor buffer before init', () => {
+    const { mod } = makeFakeModule();
+    const kernel = new WasmKernel(mod);
+    expect(() => kernel.getAttractorBuffer()).toThrow(/before init/);
+    expect(() => kernel.attractorCount()).toThrow(/before init/);
+  });
+
   it('decodes packed events into localized SimulationEvents', () => {
     const { mod } = makeFakeModule();
     const kernel = new WasmKernel(mod);
@@ -110,9 +166,9 @@ describe('WasmKernel wrapper', () => {
 
     const result = kernel.step(1e14);
     expect(result.stage).toBe(LifecycleStage.MainSequence);
-    expect(result.events).toHaveLength(2);
+    expect(result.events).toHaveLength(3);
 
-    const [remnant, capture] = result.events;
+    const [remnant, capture, companion] = result.events;
     expect(remnant?.type).toBe(SimEventType.RemnantFormed);
     expect(remnant?.simTime).toBe(123);
     expect(remnant?.data).toEqual({ remnant: RemnantType.Pulsar, supernova: true });
@@ -122,6 +178,13 @@ describe('WasmKernel wrapper', () => {
     expect(capture?.simTime).toBe(456);
     expect(capture?.data).toEqual({ bodyId: 7, bodyType: BodyType.Comet });
     expect(capture?.messageId).toBe('event.bodyCaptured');
+
+    // A companion star's ignition (spec §4.2): the payload is the body and how
+    // heavy it became, which is what qualified it as a star in the first place.
+    expect(companion?.type).toBe(SimEventType.CompanionIgnited);
+    expect(companion?.simTime).toBe(789);
+    expect(companion?.data).toEqual({ bodyId: 3, massSolar: 0.5 });
+    expect(companion?.messageId).toBe('event.companionIgnited');
     kernel.dispose();
   });
 
@@ -224,6 +287,28 @@ describeWasm('WASM kernel behavioural invariants', () => {
     ]) {
       expect(types.has(stageEvent)).toBe(true);
     }
+    wasm.dispose();
+  });
+
+  it('reports the real kernel’s gravitating centres, primary first', async () => {
+    // Against the REAL module (not the fake): there is always at least the
+    // primary, it sits at the origin, and its `mu` is exactly `orbitalMu()` —
+    // the invariant the orbit overlay depends on.
+    const bytes = readFileSync(fileURLToPath(wasmBinUrl));
+    const mod = await loadWasmModule({ module_or_path: new Uint8Array(bytes) });
+
+    const wasm = new WasmKernel(mod);
+    wasm.init({ config: makeConfig({ mass: 1 }), particleCount: 64 });
+
+    const count = wasm.attractorCount();
+    expect(count).toBeGreaterThanOrEqual(1);
+    const buf = wasm.getAttractorBuffer();
+    expect(buf.length).toBe(count * ATTRACTOR_STRIDE);
+    expect(buf[ATTRACTOR_OFFSET.x]).toBe(0);
+    expect(buf[ATTRACTOR_OFFSET.y]).toBe(0);
+    expect(buf[ATTRACTOR_OFFSET.z]).toBe(0);
+    expect(buf[ATTRACTOR_OFFSET.mu]).toBeCloseTo(wasm.orbitalMu(), 3);
+    expect(buf[ATTRACTOR_OFFSET.mu]).toBeGreaterThan(0);
     wasm.dispose();
   });
 
