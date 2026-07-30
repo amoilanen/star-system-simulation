@@ -16,6 +16,33 @@ export class Kernel {
         wasm.__wbg_kernel_free(ptr, 0);
     }
     /**
+     * Number of gravitating centres present (primary + live companions), never
+     * more than `MAX_ATTRACTORS`.
+     * @returns {number}
+     */
+    attractor_count() {
+        const ret = wasm.kernel_attractor_count(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Length (in f32 lanes) of the attractor buffer.
+     * @returns {number}
+     */
+    attractor_len() {
+        const ret = wasm.kernel_attractor_len(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Pointer to the interleaved attractor buffer in linear memory: the
+     * gravitating centres this kernel is integrating against, `[x, y, z, mu]`
+     * per centre (mirror `ATTRACTOR_STRIDE` / `ATTRACTOR_OFFSET`).
+     * @returns {number}
+     */
+    attractor_ptr() {
+        const ret = wasm.kernel_attractor_ptr(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * Length (in f32 lanes) of the body buffer.
      * @returns {number}
      */
@@ -73,14 +100,18 @@ export class Kernel {
         return this;
     }
     /**
-     * The central gravitational parameter this kernel is actually integrating
-     * against.
+     * The PRIMARY star's gravitational parameter, as this kernel is actually
+     * integrating it right now.
      *
      * Exported so the renderer can reconstruct exactly the Kepler conics the
-     * bodies are following (the orbit-path overlay). The kernel is the single
-     * source of truth for it: the host used to recompute `mu` itself from
-     * duplicated `GRAVITY` / `ORBITAL_MASS_SCALE` constants, which was one more
-     * thing that had to be kept in sync by hand.
+     * bodies are following about the origin (the orbit-path overlay). The kernel
+     * is the single source of truth for it: the host used to recompute `mu`
+     * itself from duplicated `GRAVITY` / `ORBITAL_MASS_SCALE` constants, which
+     * was one more thing that had to be kept in sync by hand.
+     *
+     * This VARIES over a run: the dying star's gravity weakens as it sheds its
+     * envelope (Decision D4). Read it per frame; do not cache it. Companions'
+     * gravity is NOT included — see `attractor_ptr` for the full set.
      * @returns {number}
      */
     orbital_mu() {
