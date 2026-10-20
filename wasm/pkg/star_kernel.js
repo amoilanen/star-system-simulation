@@ -197,6 +197,18 @@ export function snow_line_au() {
 }
 
 /**
+ * The snow line (AU) of the disc around a star of `star_mass` M☉: the solar
+ * 2.7 AU scaled by √(L/L☉), because the disc's temperature at a given radius
+ * rises with the star's luminosity.
+ * @param {number} star_mass
+ * @returns {number}
+ */
+export function snow_line_for_star(star_mass) {
+    const ret = wasm.snow_line_for_star(star_mass);
+    return ret;
+}
+
+/**
  * The gravitational softening length the kernel integrates with, in scene
  * units (= AU).
  *
