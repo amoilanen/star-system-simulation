@@ -1,6 +1,15 @@
 // Simulation clock: pace mapping + pause (spec §3.4, FR-5, A6).
 //
-// The user controls a normalized `pace` in [0, 1]. The clock maps it to a
+// Two modes:
+//
+//   - ADAPTIVE (default): the rate is chosen per stage by the time warp
+//     (`timeWarp.ts`) so every stage of every star is watchable, and the pace
+//     is a speed multiplier on that. The owner (the runner) pushes the rate in
+//     with `setAdaptiveRate` each frame; the clock itself stays stage-agnostic.
+//   - FIXED: one constant rate for the whole run, chosen by the pace as below —
+//     the honest "feel how long a main sequence really is" mode.
+//
+// In fixed mode the user's normalized `pace` in [0, 1] maps to a
 // `simSecondsPerRealSecond` factor spanning two extremes:
 //   - pace = 0 → near-real astronomical time: the sim advances ~1 sim second per
 //     real second, so a full lifecycle would take astronomical wall-clock time.
@@ -12,8 +21,12 @@
 // Pause freezes the sim (`dt = 0`) WITHOUT stopping rendering: the render loop
 // keeps calling `advance`, it just returns 0 and does not move `simTime` (A6).
 
+import type { TimeMode } from './timeWarp';
+
 /** Tunable endpoints of the pace→rate mapping. All optional; sane defaults. */
 export interface ClockOptions {
+  /** How the rate is chosen. Default `'adaptive'`. */
+  mode?: TimeMode;
   /** Initial normalized pace in [0, 1]. Default 0.5. */
   pace?: number;
   /** sim seconds per real second at pace = 0 (near-real). Default 1. */
@@ -74,6 +87,11 @@ export class Clock {
   private paceValue: number;
   private pausedValue = false;
   private simTimeValue = 0;
+  private modeValue: TimeMode;
+  /** Latest stage-aware rate pushed in by the owner (adaptive mode). */
+  private adaptiveRateValue = 0;
+  /** One-off rate floor (e.g. "skip to next stage"); 0 when inactive. */
+  private boostRateValue = 0;
 
   private readonly nearRealRate: number;
   private readonly lifecycleSimSeconds: number;
@@ -84,6 +102,40 @@ export class Clock {
     this.lifecycleSimSeconds = options.lifecycleSimSeconds ?? DEFAULT_LIFECYCLE_SIM_SECONDS;
     this.fullCycleRealSeconds = options.fullCycleRealSeconds ?? DEFAULT_FULL_CYCLE_REAL_SECONDS;
     this.paceValue = clamp(options.pace ?? 0.5, 0, 1);
+    this.modeValue = options.mode ?? 'adaptive';
+  }
+
+  /** How the rate is chosen: per stage (`'adaptive'`) or constant (`'fixed'`). */
+  get mode(): TimeMode {
+    return this.modeValue;
+  }
+
+  /** Switch between the adaptive warp and a fixed rate. */
+  setMode(mode: TimeMode): void {
+    this.modeValue = mode;
+  }
+
+  /**
+   * Set the stage-aware rate (sim seconds per real second) used in adaptive
+   * mode. Non-finite or negative values are ignored.
+   */
+  setAdaptiveRate(rate: number): void {
+    if (Number.isFinite(rate) && rate >= 0) {
+      this.adaptiveRateValue = rate;
+    }
+  }
+
+  /**
+   * Set a temporary rate FLOOR on top of either mode (e.g. while skipping to
+   * the next stage); 0 clears it.
+   */
+  setBoostRate(rate: number): void {
+    this.boostRateValue = Number.isFinite(rate) && rate > 0 ? rate : 0;
+  }
+
+  /** Whether a boost (skip) is currently raising the rate. */
+  get boosting(): boolean {
+    return this.boostRateValue > this.baseRate();
   }
 
   /** Current normalized pace in [0, 1]. */
@@ -138,6 +190,14 @@ export class Clock {
    * simulation is momentarily paused.
    */
   currentRate(): number {
+    return Math.max(this.baseRate(), this.boostRateValue);
+  }
+
+  /** The mode's own rate, before any boost. */
+  private baseRate(): number {
+    if (this.modeValue === 'adaptive') {
+      return this.adaptiveRateValue;
+    }
     return paceToRate(
       this.paceValue,
       this.nearRealRate,

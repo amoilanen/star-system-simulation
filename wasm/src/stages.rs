@@ -77,12 +77,64 @@ const MYR_SECONDS: f64 = 1.0e6 * YEAR_SECONDS;
 
 const DUST_CLOUD_SECONDS: f64 = 1.0 * MYR_SECONDS;
 const PROTOSTAR_BASE_SECONDS: f64 = 0.5 * MYR_SECONDS;
-const FUSION_IGNITION_SECONDS: f64 = 0.1 * MYR_SECONDS;
-const MAIN_SEQUENCE_SOLAR_SECONDS: f64 = 10.0e9 * YEAR_SECONDS;
+/// Kelvin–Helmholtz contraction of a 1 M☉ star to the ZAMS (~40 Myr).
+const PRE_MAIN_SEQUENCE_SOLAR_SECONDS: f64 = 40.0 * MYR_SECONDS;
+const PRE_MAIN_SEQUENCE_HIGH_MASS_EXPONENT: f64 = 2.5;
+const PRE_MAIN_SEQUENCE_LOW_MASS_EXPONENT: f64 = 1.25;
+const PRE_MAIN_SEQUENCE_MIN_SECONDS: f64 = 0.05 * MYR_SECONDS;
+/// A brown dwarf's deuterium-burning phase (~10 Myr at 0.05 M☉, ∝ M^-1.5).
+const DEUTERIUM_BURNING_SECONDS: f64 = 10.0 * MYR_SECONDS;
+const DEUTERIUM_BURNING_REFERENCE_MASS: f64 = 0.05;
+const DEUTERIUM_BURNING_EXPONENT: f64 = 1.5;
+/// Hurley, Pols & Tout (2000) Z = 0.02 coefficients for t_BGB (Myr).
+const MAIN_SEQUENCE_FIT: [f64; 5] = [1593.89, 2706.708, 146.6143, 0.041_419_6, 0.342_634_9];
+const MAIN_SEQUENCE_FRACTION_OF_BGB: f64 = 0.95;
 const RED_GIANT_FRACTION_OF_MAIN: f64 = 0.1;
-const DEATH_SECONDS: f64 = 0.01 * MYR_SECONDS;
+/// Superwind + planetary-nebula ejection (~10^4 yr).
+const PLANETARY_NEBULA_SECONDS: f64 = 1.0e4 * YEAR_SECONDS;
+/// The drawn core-collapse sequence is a ~1-year event.
+const CORE_COLLAPSE_SECONDS: f64 = 1.0 * YEAR_SECONDS;
 const TIMING_SOLAR_METALLICITY: f64 = 0.02;
-const METALLICITY_LIFETIME_COEFFICIENT: f64 = 2.0;
+/// Metal-poor stars burn out sooner: t ∝ (Z/Z☉)^0.2, clamped.
+const METALLICITY_LIFETIME_EXPONENT: f64 = 0.2;
+const METALLICITY_LIFETIME_MIN: f64 = 0.45;
+const METALLICITY_LIFETIME_MAX: f64 = 1.35;
+
+/// Main-sequence lifetime in sim seconds (mirror of
+/// `mainSequenceLifetimeSeconds`): the Hurley–Pols–Tout fit, metallicity-scaled.
+#[must_use]
+pub fn main_sequence_lifetime_seconds(mass: f64, metals: f64) -> f64 {
+    let m = mass.max(1e-3);
+    let [a1, a2, a3, a4, a5] = MAIN_SEQUENCE_FIT;
+    let t_bgb_myr =
+        (a1 + a2 * m.powi(4) + a3 * m.powf(5.5) + m.powi(7)) / (a4 * m.powi(2) + a5 * m.powi(7));
+    let z = if metals.is_finite() {
+        metals.max(1e-6)
+    } else {
+        TIMING_SOLAR_METALLICITY
+    };
+    let metallicity_factor = (z / TIMING_SOLAR_METALLICITY)
+        .powf(METALLICITY_LIFETIME_EXPONENT)
+        .clamp(METALLICITY_LIFETIME_MIN, METALLICITY_LIFETIME_MAX);
+    MAIN_SEQUENCE_FRACTION_OF_BGB * t_bgb_myr * MYR_SECONDS * metallicity_factor
+}
+
+/// Pre-main-sequence contraction (star) or deuterium burning (brown dwarf), in
+/// sim seconds (mirror of `preMainSequenceSeconds`).
+#[must_use]
+pub fn pre_main_sequence_seconds(mass: f64) -> f64 {
+    let m = mass.max(1e-3);
+    if is_substellar(m) {
+        return DEUTERIUM_BURNING_SECONDS
+            * (DEUTERIUM_BURNING_REFERENCE_MASS / m).powf(DEUTERIUM_BURNING_EXPONENT);
+    }
+    let exponent = if m >= 1.0 {
+        PRE_MAIN_SEQUENCE_HIGH_MASS_EXPONENT
+    } else {
+        PRE_MAIN_SEQUENCE_LOW_MASS_EXPONENT
+    };
+    (PRE_MAIN_SEQUENCE_SOLAR_SECONDS * m.powf(-exponent)).max(PRE_MAIN_SEQUENCE_MIN_SECONDS)
+}
 
 // --- Fate thresholds (mirror FATE_THRESHOLDS in fateModel.ts) ---------------
 
@@ -263,16 +315,24 @@ pub fn determine_fate(mass: f64, metals: f64) -> FateOutcome {
 #[must_use]
 pub fn stage_durations(mass: f64, metals: f64) -> [f64; 7] {
     let m = mass.max(f64::EPSILON);
-    let metal_excess = metals - TIMING_SOLAR_METALLICITY;
-    let metallicity_factor = (1.0 - METALLICITY_LIFETIME_COEFFICIENT * metal_excess).max(0.1);
-    let main_sequence = MAIN_SEQUENCE_SOLAR_SECONDS * m.powf(-2.5) * metallicity_factor;
+    let main_sequence = main_sequence_lifetime_seconds(m, metals);
+    // A white dwarf's progenitor sheds a planetary nebula over millennia; every
+    // other star dies in a core collapse that is over within a year.
+    let quiet_death = matches!(
+        determine_fate(m, metals).remnant,
+        RemnantType::WhiteDwarf | RemnantType::BrownDwarf
+    );
     [
         DUST_CLOUD_SECONDS,                         // DustCloud
         PROTOSTAR_BASE_SECONDS * m.powf(-0.5),      // ProtostarCoalescence
-        FUSION_IGNITION_SECONDS,                    // FusionIgnition
+        pre_main_sequence_seconds(m),               // FusionIgnition (pre-MS)
         main_sequence,                              // MainSequence
         main_sequence * RED_GIANT_FRACTION_OF_MAIN, // RedGiant
-        DEATH_SECONDS,                              // Death
+        if quiet_death {
+            PLANETARY_NEBULA_SECONDS
+        } else {
+            CORE_COLLAPSE_SECONDS
+        }, // Death
         f64::INFINITY,                              // Remnant
     ]
 }
@@ -449,6 +509,44 @@ mod tests {
         assert!(
             solar[LifecycleStage::RedGiant as usize] < solar[LifecycleStage::MainSequence as usize]
         );
+    }
+
+    #[test]
+    fn main_sequence_lifetimes_match_stellar_models() {
+        // Reference: detailed solar-metallicity stellar models (Myr).
+        let myr = MYR_SECONDS;
+        for (m, reference) in [(1.0, 1.0e4), (3.0, 350.0), (20.0, 8.1), (60.0, 3.5)] {
+            let t = main_sequence_lifetime_seconds(m, 0.02) / myr;
+            assert!(
+                (t / reference - 1.0).abs() < 0.12,
+                "{m} M_sun lives {t} Myr, models say {reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_poor_stars_burn_out_sooner() {
+        let poor = main_sequence_lifetime_seconds(1.0, 0.001);
+        let solar = main_sequence_lifetime_seconds(1.0, 0.02);
+        let rich = main_sequence_lifetime_seconds(1.0, 0.06);
+        assert!(poor < solar && solar < rich);
+        assert!(main_sequence_lifetime_seconds(1.0, 0.0) > 0.0);
+    }
+
+    #[test]
+    fn a_supernova_is_brief_and_a_planetary_nebula_is_not() {
+        let sun = stage_durations(1.0, 0.02)[LifecycleStage::Death as usize];
+        let massive = stage_durations(20.0, 0.02)[LifecycleStage::Death as usize];
+        assert!(massive <= 2.0 * YEAR_SECONDS);
+        assert!(sun >= 1.0e3 * YEAR_SECONDS);
+    }
+
+    #[test]
+    fn the_sun_contracts_for_tens_of_millions_of_years_before_ignition() {
+        let pms = stage_durations(1.0, 0.02)[LifecycleStage::FusionIgnition as usize] / MYR_SECONDS;
+        assert!((20.0..60.0).contains(&pms), "pre-MS {pms} Myr");
+        // Massive stars arrive on the main sequence almost at once.
+        assert!(pre_main_sequence_seconds(30.0) < pre_main_sequence_seconds(1.0) / 100.0);
     }
 
     #[test]

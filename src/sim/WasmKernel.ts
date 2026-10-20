@@ -56,6 +56,8 @@ export interface WasmModule {
   softening(): number;
   /** The disc's snow line in AU, as the kernel defines it. */
   snow_line_au(): number;
+  /** The snow line (AU) around a star of the given mass: 2.7 AU × √(L/L☉). */
+  snow_line_for_star(starMass: number): number;
   default: (initInput?: unknown) => Promise<unknown>;
 }
 

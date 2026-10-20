@@ -204,6 +204,73 @@ pub fn accretion_efficiency(distance_au: f64, metals: f64) -> f64 {
     ((ROCKY_ACCRETION_EFFICIENCY + GIANT_ACCRETION_EFFICIENCY * rise * falloff) * solids).min(1.0)
 }
 
+/// Innermost radius (AU) at which refractory dust survives around a 1 L☉ star:
+/// silicates sublimate at ~1500 K, which in the same disc that puts the ice line
+/// at 2.7 AU (T ≈ 280 K (r/AU)^-1/2) lies at (280/1500)^2 ≈ 0.035 AU.
+pub const DUST_SUBLIMATION_AU: f64 = 0.035;
+
+/// Zero-age main-sequence luminosity (L☉) of a star of `mass` M☉: the standard
+/// piecewise mass–luminosity relation (L ∝ M^2.3 / M^4 / M^3.5 / M from red
+/// dwarfs to the Eddington-limited giants). Pure; NaN-safe.
+#[must_use]
+pub fn main_sequence_luminosity(mass: f64) -> f64 {
+    if !mass.is_finite() || mass <= 0.0 {
+        return 0.0;
+    }
+    if mass < 0.43 {
+        0.23 * mass.powf(2.3)
+    } else if mass < 2.0 {
+        mass.powi(4)
+    } else if mass < 55.0 {
+        1.4 * mass.powf(3.5)
+    } else {
+        32_000.0 * mass
+    }
+}
+
+/// How far out the disc's thermal structure sits around a star of `mass` M☉,
+/// relative to the Sun's: `sqrt(L / L☉)`.
+///
+/// A passively irradiated disc has T ∝ L^1/4 r^-1/2, so EVERY condensation front
+/// — the dust-sublimation radius, the snow line, and the giant-forming zone
+/// beyond it — moves out as √L. The ice line of a 0.5 M☉ red dwarf is at
+/// ~0.7 AU; that of a 22 M☉ O star at ~600 AU, far outside any disc it keeps,
+/// and nothing solid at all survives inside ~8 AU of it. A fixed 2.7 AU
+/// snow line grew 70 M⊕ "giants" at 0.5 AU around such a star. Exactly 1 for a
+/// 1 M☉ star, so the solar calibration is untouched.
+#[must_use]
+pub fn disc_thermal_scale(mass: f64) -> f64 {
+    let scale = main_sequence_luminosity(mass).sqrt();
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+/// Snow line (AU) of the disc around a star of `mass` M☉.
+#[must_use]
+pub fn snow_line_for_star_au(mass: f64) -> f64 {
+    SNOW_LINE_AU * disc_thermal_scale(mass)
+}
+
+/// [`accretion_efficiency`] in a disc whose thermal structure is scaled by
+/// `thermal_scale` (see [`disc_thermal_scale`]): the retention curve is the
+/// solar one with every distance measured in units of THIS star's ice line, and
+/// nothing is retained inside the dust-sublimation radius.
+#[must_use]
+pub fn accretion_efficiency_around(distance_au: f64, metals: f64, thermal_scale: f64) -> f64 {
+    let scale = if thermal_scale.is_finite() && thermal_scale > 0.0 {
+        thermal_scale
+    } else {
+        1.0
+    };
+    if distance_au.is_nan() || distance_au < DUST_SUBLIMATION_AU * scale {
+        return 0.0;
+    }
+    accretion_efficiency(distance_au / scale, metals)
+}
+
 /// Compress the (astronomically scaled) stellar sim-time increment into a
 /// bounded, always-visible amount of orbital time. Mirrors `orbitalStep`.
 #[must_use]
@@ -1120,6 +1187,56 @@ mod tests {
         );
         // Compile-time: the visual radius bounds must be consistently ordered.
         const { assert!(MIN_BODY_RADIUS < MAX_BODY_RADIUS) };
+    }
+
+    // ---- luminosity-scaled disc ----------------------------------------------
+
+    #[test]
+    fn the_solar_disc_is_exactly_the_calibrated_one() {
+        assert!((disc_thermal_scale(1.0) - 1.0).abs() < 1e-12);
+        for au in [0.5, 2.0, 3.0, 6.0, 20.0] {
+            assert_eq!(
+                accretion_efficiency_around(au, SOLAR_METALLICITY, 1.0),
+                accretion_efficiency(au, SOLAR_METALLICITY)
+            );
+        }
+    }
+
+    #[test]
+    fn the_snow_line_moves_out_with_stellar_luminosity() {
+        let red_dwarf = snow_line_for_star_au(0.5);
+        let sun = snow_line_for_star_au(1.0);
+        let o_star = snow_line_for_star_au(22.0);
+        assert!(red_dwarf < 1.0, "M dwarf ice line {red_dwarf}");
+        assert!((sun - SNOW_LINE_AU).abs() < 1e-9);
+        assert!(o_star > 300.0, "O star ice line {o_star}");
+        // Luminosity is monotone in mass across every branch of the relation.
+        let mut previous = 0.0;
+        for m in [0.05, 0.2, 0.43, 0.8, 1.9, 2.0, 10.0, 54.9, 55.0, 120.0] {
+            let l = main_sequence_luminosity(m);
+            assert!(l > previous, "luminosity not monotone at {m}");
+            previous = l;
+        }
+    }
+
+    #[test]
+    fn no_solid_survives_inside_the_sublimation_radius() {
+        // Around a 22 M_sun star even rock evaporates out to ~8 AU.
+        let scale = disc_thermal_scale(22.0);
+        assert_eq!(
+            accretion_efficiency_around(1.0, SOLAR_METALLICITY, scale),
+            0.0
+        );
+        assert_eq!(
+            accretion_efficiency_around(5.0, SOLAR_METALLICITY, scale),
+            0.0
+        );
+        assert!(accretion_efficiency_around(20.0, SOLAR_METALLICITY, scale) > 0.0);
+        // And a giant-forming jump never happens inside such a star's cloud.
+        assert!(
+            accretion_efficiency_around(100.0, SOLAR_METALLICITY, scale)
+                < accretion_efficiency(3.0, SOLAR_METALLICITY)
+        );
     }
 
     // ---- orbital_step -------------------------------------------------------

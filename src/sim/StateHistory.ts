@@ -18,6 +18,11 @@ export interface HistoryFrame {
   state: RenderState;
   /** Physically meaningful elapsed sim seconds at capture (for the HUD). */
   elapsed: number;
+  /**
+   * A keyframe (e.g. the first frame of a lifecycle stage) that thinning never
+   * removes, so "jump back to the start of this phase" always has a target.
+   */
+  pinned?: boolean;
 }
 
 /** Clamp a value into the inclusive `[min, max]` range. */
@@ -58,14 +63,38 @@ export class StateHistory {
 
   /**
    * Append a new frontier frame (during live play) and snap the cursor to it.
-   * Drops the oldest frame when over capacity, shifting the cursor to match.
+   *
+   * When over capacity the history THINS itself — it keeps every other frame
+   * (always the oldest, the newest and every pinned keyframe) — instead of
+   * forgetting the past, so it always spans the WHOLE run, at a resolution
+   * that coarsens as the run grows. Returns whether it thinned, so the owner
+   * can halve its recording rate to keep the spacing even.
    */
-  record(frame: HistoryFrame): void {
+  record(frame: HistoryFrame): boolean {
     this.frames.push(frame);
+    let thinned = false;
     if (this.frames.length > this.capacity) {
-      this.frames.shift();
+      const last = this.frames.length - 1;
+      this.frames = this.frames.filter(
+        (f, i) => i === 0 || i === last || i % 2 === 0 || f.pinned === true,
+      );
+      thinned = true;
     }
     this.cursorValue = this.frames.length - 1;
+    return thinned;
+  }
+
+  /**
+   * Move the cursor to the FIRST retained frame matching `predicate` and return
+   * it, or null (cursor unchanged) when none matches.
+   */
+  seekToFirst(predicate: (frame: HistoryFrame) => boolean): HistoryFrame | null {
+    const index = this.frames.findIndex(predicate);
+    if (index < 0) {
+      return null;
+    }
+    this.cursorValue = index;
+    return this.frames[index] ?? null;
   }
 
   /**

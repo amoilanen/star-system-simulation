@@ -15,6 +15,7 @@ import { STAGE_ENTRY_EVENT } from '../sim/stages';
 import { i18n as sharedI18n, type I18n, type MessageParams } from '../i18n/i18n';
 import { STAGE_MESSAGE_IDS } from './Hud';
 import { formatMass } from './labelInfo';
+import { formatYears } from '../sim/timeFormat';
 
 /**
  * Reverse of {@link STAGE_ENTRY_EVENT}: the lifecycle stage a given event marks
@@ -161,8 +162,9 @@ export class EventAnnotations {
   /**
    * Render an annotation for an event when enabled; a no-op returning `null`
    * when disabled. Trims the oldest entries beyond {@link maxVisible}.
+   * `ageYears` (the system's age when it happened) is shown on milestones.
    */
-  show(event: SimulationEvent): HTMLElement | null {
+  show(event: SimulationEvent, ageYears?: number): HTMLElement | null {
     const text = this.resolve(event);
     if (text === null) {
       return null;
@@ -182,6 +184,16 @@ export class EventAnnotations {
       body.className = 'event-annotation__text';
       body.textContent = text;
       entry.append(badge, body);
+      // Milestones also say WHEN they happened, so the timeline reads as a
+      // story with real dates: ignition at ~40 Myr, red giant at ~11 Gyr, …
+      if (ageYears !== undefined && Number.isFinite(ageYears) && ageYears > 0) {
+        const age = document.createElement('span');
+        age.className = 'event-annotation__age';
+        age.textContent = this.i18n.translate(this.locale, 'event.age', {
+          time: formatYears(ageYears, this.i18n, this.locale),
+        });
+        entry.appendChild(age);
+      }
     } else {
       entry.textContent = text;
     }

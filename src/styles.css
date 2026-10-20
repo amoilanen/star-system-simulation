@@ -241,6 +241,132 @@ body::after {
   white-space: nowrap;
 }
 
+/*
+ * Life-of-the-system timeline: a full-width strip of stage segments (sized by
+ * their share of the run as shown), the current one filling with progress.
+ */
+.hud-timeline {
+  position: relative;
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hud-timeline__strip {
+  display: flex;
+  gap: 3px;
+  /* Taller hit area than the drawn bar, so the legend is easy to hover. */
+  height: 16px;
+  padding: 4px 0;
+  box-sizing: border-box;
+}
+
+.hud-timeline__seg {
+  position: relative;
+  flex: 1 1 0;
+  overflow: hidden;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.hud-timeline__seg[hidden] {
+  display: none;
+}
+
+.hud-timeline__fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: var(--accent);
+  opacity: 0.55;
+}
+
+.hud-timeline__seg[data-state='current'] {
+  box-shadow: 0 0 0 1px var(--accent-strong, #ffb05a);
+}
+
+.hud-timeline__seg[data-state='current'] .hud-timeline__fill {
+  background: var(--accent-strong, #ffb05a);
+  opacity: 0.9;
+}
+
+.hud-timeline__seg {
+  cursor: help;
+  outline: none;
+  transition: transform 0.12s ease;
+}
+
+.hud-timeline__seg:hover,
+.hud-timeline__seg:focus-visible {
+  transform: scaleY(1.6);
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.hud-timeline__seg--seekable {
+  cursor: pointer;
+}
+
+/* Hover legend for one phase: name, real duration, status, explanation. */
+.hud-legend {
+  position: absolute;
+  top: 22px;
+  left: 0;
+  z-index: 5;
+  width: min(340px, 80vw);
+  padding: 10px 12px;
+  background: rgba(8, 12, 24, 0.94);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.hud-legend[hidden] {
+  display: none;
+}
+
+.hud-legend__title {
+  font-weight: 650;
+  color: var(--accent-strong, #ffb05a);
+}
+
+.hud-legend__meta {
+  margin: 2px 0 6px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-legend__desc {
+  color: var(--text);
+}
+
+.hud-legend__hint {
+  margin-top: 6px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--accent);
+}
+
+.hud-timeline__caption {
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-timeline__note {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-style: italic;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .hud-field {
   display: inline-flex;
   align-items: center;
@@ -310,6 +436,44 @@ button.hud-button--active {
 
 .hud-paused[hidden] {
   display: none;
+}
+
+.hud-paused[data-mode='rewinding'],
+.hud-paused[data-mode='replay'] {
+  border-color: var(--accent);
+  color: var(--accent);
+  animation: none;
+}
+
+/* Transparent, map-style +/− zoom buttons floating over the scene. */
+.zoom-controls {
+  position: absolute;
+  top: 50%;
+  right: 16px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transform: translateY(-50%);
+}
+
+.zoom-controls__button {
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 24px;
+  line-height: 1;
+  backdrop-filter: blur(3px);
+}
+
+.zoom-controls__button:hover,
+.zoom-controls__button:focus-visible {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.6);
 }
 
 @keyframes hud-paused-pulse {
@@ -435,6 +599,14 @@ input[type='checkbox'] {
   text-transform: uppercase;
   letter-spacing: 1.1px;
   color: var(--accent-strong);
+}
+
+.event-annotation__age {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
 }
 
 .event-annotation__text {
@@ -645,4 +817,9 @@ input[type='checkbox'] {
 
 .hud-toggle .hud-field__label {
   cursor: pointer;
+}
+
+button:disabled:hover {
+  background: rgba(110, 168, 255, 0.14);
+  border-color: var(--border);
 }

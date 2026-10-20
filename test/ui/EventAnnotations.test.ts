@@ -185,4 +185,17 @@ describe('EventAnnotations', () => {
     }
     expect(layer.element.childElementCount).toBe(2);
   });
+
+  it('dates a milestone with the system age, but not a passing visitor', () => {
+    const layer = new EventAnnotations({ container, locale: 'en', enabled: true });
+    const milestone = layer.show(createEvent(SimEventType.FusionIgnition, 0), 4.2e7)!;
+    expect(milestone.querySelector('.event-annotation__age')!.textContent).toBe(
+      i18n.translate('en', 'event.age', { time: '42 million years' }),
+    );
+    const visitor = layer.show(
+      createEvent(SimEventType.BodyCaptured, 0, { bodyId: 3, bodyType: BodyType.Comet }),
+      4.2e7,
+    )!;
+    expect(visitor.querySelector('.event-annotation__age')).toBeNull();
+  });
 });

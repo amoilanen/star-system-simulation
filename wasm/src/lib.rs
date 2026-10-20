@@ -24,12 +24,13 @@ use bodies::{
     VisitorClassification,
 };
 use nbody::{
-    accretion_efficiency, accretion_radius, attractor_accel, body_radius_from_mass, circular_speed,
-    integrate_orbit_attractors, is_bound, magnitude, merge_radius, merged_velocity, orbital_step,
-    periapsis_distance, solid_fraction, stable_substep, total_specific_energy_attractors,
-    Attractor, AttractorSet, Vec3, BODY_DAMP_FRACTION, DISK_SETTLE, GAS_DRAG, GRAVITY, INTERNAL_DT,
-    MAX_ATTRACTORS, MAX_PARTICLES, MAX_SUBSTEPS, ORBITAL_MASS_SCALE, ORBITAL_MAX, SNOW_LINE_AU,
-    SOFTENING, VERTICAL_DAMP,
+    accretion_efficiency_around, accretion_radius, attractor_accel, body_radius_from_mass,
+    circular_speed, disc_thermal_scale, integrate_orbit_attractors, is_bound, magnitude,
+    merge_radius, merged_velocity, orbital_step, periapsis_distance, snow_line_for_star_au,
+    solid_fraction, stable_substep, total_specific_energy_attractors, Attractor, AttractorSet,
+    Vec3, BODY_DAMP_FRACTION, DISK_SETTLE, GAS_DRAG, GRAVITY, INTERNAL_DT, MAX_ATTRACTORS,
+    MAX_PARTICLES, MAX_SUBSTEPS, ORBITAL_MASS_SCALE, ORBITAL_MAX, SNOW_LINE_AU, SOFTENING,
+    VERTICAL_DAMP,
 };
 #[cfg(test)]
 use stages::cloud_mass_for_star;
@@ -74,8 +75,13 @@ fn seeded_planetesimal_count(metals: f64) -> usize {
     let count = embryos as usize;
     count.min(PLANETESIMAL_COUNT)
 }
-/// Sim seconds between visiting comet/asteroid spawns (mirror).
-const VISITOR_SPAWN_INTERVAL: f64 = 8.0e15;
+/// ORBITAL time between visiting comet/asteroid spawns (~1 s on screen).
+///
+/// Visitors arrive on the same visual clock their orbits are integrated on, not
+/// on the stellar clock: that one is warped by up to ~10^11 yr/s, so a spawn
+/// rate keyed to it gave a massive star's whole life (or the formation phase)
+/// no visitors at all and a red dwarf a permanent swarm.
+const VISITOR_SPAWN_INTERVAL: f64 = 10.0;
 /// Cap on simultaneously present visiting bodies so captured ones cannot
 /// accumulate without bound (mirror of the TS fallback's `MAX_VISITORS`).
 const MAX_VISITORS: usize = 10;
@@ -94,6 +100,19 @@ const EARTH_MASSES_PER_SOLAR: f64 = 332_946.0;
 /// worlds were born as ice giants and a 67 M_earth planet sat at 0.5 AU —
 /// inside the snow line, where only rock condenses and nothing of the sort can
 /// grow. From a true embryo the whole architecture is EMERGENT.
+/// Planet/star mass ratio at which a growing giant opens a deep GAP in the gas
+/// disc and starves its own feeding zone, ending runaway gas accretion.
+///
+/// Observed giant planets cluster below q ~ 10^-3 and become rare above a few
+/// ×10^-3 — the "brown-dwarf desert" — which is why red dwarfs rarely host
+/// super-Jupiters. Without a limit, a metal-rich disc around a 0.5 M☉ star grew
+/// a "planet" past 13 Jupiter masses that lit up as a brown dwarf inside the
+/// disc and flung its neighbour out of the system.
+const GAP_OPENING_MASS_RATIO: f64 = 0.003;
+/// Absolute ceiling (M☉) on what core accretion can build: 10 Jupiter masses,
+/// safely below the 13 M♃ deuterium-burning limit, so a WORLD stays a world.
+const MAX_PLANET_MASS: f64 = 10.0 / 1047.35;
+
 const PLANETESIMAL_SEED_MASS: f64 = 0.01 / EARTH_MASSES_PER_SOLAR;
 
 /// Radial extent of the birth dust cloud, as fractions of the cloud extent.
@@ -459,6 +478,15 @@ pub fn snow_line_au() -> f64 {
     SNOW_LINE_AU
 }
 
+/// The snow line (AU) of the disc around a star of `star_mass` M☉: the solar
+/// 2.7 AU scaled by √(L/L☉), because the disc's temperature at a given radius
+/// rises with the star's luminosity.
+#[wasm_bindgen]
+#[must_use]
+pub fn snow_line_for_star(star_mass: f64) -> f64 {
+    snow_line_for_star_au(star_mass)
+}
+
 /// What a particle physically IS (mirror of the fallback's `ParticleKind`). The
 /// three populations behave differently and, crucially, die differently —
 /// conflating them is what left glowing fragments orbiting the white dwarf.
@@ -517,6 +545,9 @@ pub struct Kernel {
     eject_radius: f64,
     composition: [f64; 3],
     rng: Mulberry32,
+    /// Separate stream for interstellar visitors, so how often comets happen to
+    /// arrive can never reshuffle the disc, the planets or the companions.
+    visitor_rng: Mulberry32,
 
     // Formation/stellar evolution controller state.
     stage: LifecycleStage,
@@ -621,6 +652,7 @@ impl Kernel {
             eject_radius: cloud_extent * 1.5,
             composition: [h, he, metals],
             rng: Mulberry32::new(seed),
+            visitor_rng: Mulberry32::new(seed ^ 0x9e37_79b9),
             stage: LifecycleStage::DustCloud,
             stellar_elapsed: 0.0,
             // Stellar timing and the death path follow the STAR's mass, not the
@@ -754,7 +786,7 @@ impl Kernel {
             self.disc_dissipated = true;
         }
 
-        self.spawn_visitors(dt_sim_seconds);
+        self.spawn_visitors(orbital_advanced);
         self.resolve_visitors(&mut events);
         self.eject_escaping_worlds(&mut events);
         self.cull_particles();
@@ -1212,6 +1244,16 @@ impl Kernel {
     /// MainSequence) is driven by the accreted core-mass fraction; the STELLAR
     /// stages are driven by sim-time. Emits one entry event per transition.
     fn advance_stages(&mut self, sim_dt: f64, core_frac: f64, out: &mut Vec<PackedEvent>) {
+        // The remnant (or the cooling brown dwarf) is terminal, but time does not
+        // stop there: the nebula expands and the compact object cools, so the
+        // system keeps ageing on the stellar clock. Checked first so the step
+        // that FORMS the remnant does not also age it.
+        if self.stage == LifecycleStage::Remnant {
+            if sim_dt.is_finite() && sim_dt > 0.0 {
+                self.stellar_elapsed += sim_dt;
+            }
+            return;
+        }
         // Formation — sequential ifs so a big accretion jump can cascade.
         if self.stage == LifecycleStage::DustCloud && core_frac >= PROTOSTAR_CORE_FRACTION {
             self.stage = LifecycleStage::ProtostarCoalescence;
@@ -1719,6 +1761,9 @@ impl Kernel {
         // Retention depends on the disc's condensable-solid budget as well as on
         // where the body orbits (spec §4.3): no metals, no grains, no growth.
         let metals = self.composition[2];
+        // Where the disc's condensation fronts sit, set by the star it feeds.
+        let disc_scale = disc_thermal_scale(self.star_mass);
+        let planet_mass_cap = (GAP_OPENING_MASS_RATIO * self.star_mass).min(MAX_PLANET_MASS);
         let capture_radius = self.capture_radius_for(substep);
         let core_r2 = capture_radius * capture_radius;
 
@@ -1815,8 +1860,14 @@ impl Kernel {
                     // Retention depends on WHERE the body orbits — rock only
                     // inside the snow line, ices + gas beyond it — and on how much
                     // of either the cloud contains at all.
+                    // A giant that has opened its gap keeps intercepting dust but
+                    // no longer holds on to it: it flows past, toward the star.
                     let orbit_radius = magnitude(b.pos);
-                    let retained = p.mass * accretion_efficiency(orbit_radius, metals);
+                    let retained = if b.mass >= planet_mass_cap {
+                        0.0
+                    } else {
+                        p.mass * accretion_efficiency_around(orbit_radius, metals, disc_scale)
+                    };
                     b.mass += retained;
                     b.radius = body_radius_from_mass(b.mass, cloud_mass);
                     // The remainder is NOT teleported to the star: it flows into
@@ -2260,8 +2311,8 @@ impl Kernel {
 
     // --- Visiting bodies (FR-7) ---------------------------------------------
 
-    fn spawn_visitors(&mut self, dt_sim_seconds: f64) {
-        self.spawn_accumulator += dt_sim_seconds;
+    fn spawn_visitors(&mut self, orbital_dt: f64) {
+        self.spawn_accumulator += orbital_dt;
         let mut guard = 0;
         while self.spawn_accumulator >= VISITOR_SPAWN_INTERVAL && guard < MAX_SUBSTEPS {
             self.spawn_accumulator -= VISITOR_SPAWN_INTERVAL;
@@ -2271,7 +2322,12 @@ impl Kernel {
                 // Arrival speed is set by escape from the SYSTEM, so a heavier
                 // (multiple) system genuinely accelerates its visitors more.
                 let mu = self.total_mu();
-                let visitor = make_visitor(&mut self.rng, mu, self.eject_radius, self.next_body_id);
+                let visitor = make_visitor(
+                    &mut self.visitor_rng,
+                    mu,
+                    self.eject_radius,
+                    self.next_body_id,
+                );
                 self.next_body_id += 1.0;
                 self.bodies.push(visitor);
             }
@@ -2843,11 +2899,25 @@ mod tests {
         }
         assert_eq!(kernel.stage(), LifecycleStage::MainSequence as u32);
 
+        // Judge each world by its SEMI-MAJOR AXIS — where it orbits — not by the
+        // instantaneous distance, which for an eccentric giant caught near
+        // periapsis can dip just inside the snow line it formed beyond.
+        let mu = kernel.mu();
         let planets: Vec<(f64, f64)> = kernel
             .bodies
             .iter()
             .filter(|b| matches!(b.kind, BodyType::Planet | BodyType::Protoplanet))
-            .map(|b| (magnitude(b.pos), b.mass))
+            .map(|b| {
+                let r = magnitude(b.pos);
+                let v2 = b.vel.iter().map(|v| v * v).sum::<f64>();
+                let energy = 0.5 * v2 - mu / (r * r + SOFTENING * SOFTENING).sqrt();
+                let a = if energy < 0.0 {
+                    -mu / (2.0 * energy)
+                } else {
+                    r
+                };
+                (a, b.mass)
+            })
             .collect();
         assert!(planets.len() > 4, "too few planets formed");
 
@@ -2958,6 +3028,72 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn a_planet_stops_growing_once_it_opens_a_gap() {
+        // A metal-rich disc around a red dwarf: the giant zone is close in and
+        // well fed, which used to grow a body into a brown dwarf in the disc.
+        let metals = 0.12;
+        let cloud = cloud_mass_for_star(0.5, metals);
+        let mut kernel = Kernel::new(cloud, 50.0, 1.0, 0.66, 0.22, metals, 900);
+        for _ in 0..LIFECYCLE_STEPS {
+            kernel.step(1.0e17);
+            if kernel.stage() >= LifecycleStage::RedGiant as u32 {
+                break;
+            }
+        }
+        // q = 0.003 of the star (the gap-opening ratio, as a literal).
+        let cap = 0.003 * kernel.star_mass;
+        for b in kernel.bodies.iter().filter(|b| b.kind.is_planetary()) {
+            // Merging two capped giants is the only way past the cap.
+            assert!(
+                b.mass <= 2.0 * cap,
+                "planet of {} M_sun around a 0.5 M_sun star",
+                b.mass
+            );
+        }
+        assert!(
+            kernel
+                .bodies
+                .iter()
+                .all(|b| !matches!(b.kind, BodyType::BrownDwarf | BodyType::Star)),
+            "a world grew into a self-luminous body inside the disc"
+        );
+    }
+
+    #[test]
+    fn the_clock_keeps_running_after_the_remnant_forms() {
+        // The nebula expands and the white dwarf cools: the system's age must not
+        // freeze at the moment of death.
+        let mut kernel = solar_kernel(1.0, 300);
+        assert!(drive_to_remnant(&mut kernel));
+        let at_death = kernel.elapsed_sim_seconds();
+        for _ in 0..10 {
+            kernel.step(1.0e12);
+        }
+        let aged = kernel.elapsed_sim_seconds() - at_death;
+        assert!(
+            (aged - 1.0e13).abs() < 1.0e9,
+            "remnant aged {aged} s, expected 1e13"
+        );
+    }
+
+    #[test]
+    fn visitors_arrive_on_the_orbital_clock_not_the_stellar_one() {
+        // A few hundred frames at a modest warp (~100 yr per step) advance the
+        // stellar clock by almost nothing, but the orbital clock is saturated:
+        // visitors must arrive at their usual on-screen cadence regardless.
+        let mut kernel = solar_kernel(1.0, 200);
+        let mut seen = false;
+        for _ in 0..300 {
+            kernel.step(3.0e9);
+            seen |= kernel
+                .bodies
+                .iter()
+                .any(|b| matches!(b.kind, BodyType::Comet | BodyType::Asteroid));
+        }
+        assert!(seen, "no visitor arrived in 300 saturated orbital steps");
     }
 
     #[test]

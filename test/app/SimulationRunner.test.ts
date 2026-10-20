@@ -211,7 +211,11 @@ describeKernel('SimulationRunner (headless orchestration)', () => {
     expect(order(rewound.state.stage)).toBeLessThanOrEqual(order(liveStage));
 
     // Play forward from the past: still replaying recorded history for a while.
+    // (Rewinding all the way back to the first frame pauses there.)
     runner.setRewinding(false);
+    if (runner.paused) {
+      runner.togglePause();
+    }
     const forward = runner.tick(1);
     expect(forward.elapsed).toBeGreaterThanOrEqual(rewound.elapsed);
 
@@ -275,5 +279,59 @@ describeKernel('SimulationRunner (headless orchestration)', () => {
     expect(rewound.fromHistory).toBe(true);
     // simDt not set in cloned history states → undefined.
     expect(rewound.state.simDt).toBeUndefined();
+  });
+
+  it('reaches back to the very start of the run, and pauses there', () => {
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
+    // Far longer than the old 48 s ring could hold.
+    for (let i = 0; i < 3000; i += 1) {
+      runner.tick(1 / 10);
+    }
+    expect(runner.currentStage).not.toBe(LifecycleStage.DustCloud);
+    runner.setRewinding(true);
+    for (let i = 0; i < 400 && runner.isRewinding; i += 1) {
+      runner.tick(1 / 10);
+    }
+    expect(runner.isRewinding).toBe(false);
+    expect(runner.paused).toBe(true);
+    expect(runner.currentStage).toBe(LifecycleStage.DustCloud);
+  });
+
+  it('holds the replayed frame while paused, and resumes forward when played', () => {
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
+    for (let i = 0; i < 200; i += 1) {
+      runner.tick(1 / 10);
+    }
+    runner.setRewinding(true);
+    for (let i = 0; i < 20; i += 1) {
+      runner.tick(1 / 10);
+    }
+    runner.setRewinding(false);
+    runner.togglePause();
+    const held = runner.tick(1 / 10).elapsed;
+    for (let i = 0; i < 20; i += 1) {
+      expect(runner.tick(1 / 10).elapsed).toBe(held);
+    }
+    expect(runner.isReplaying).toBe(true);
+    runner.togglePause();
+    expect(runner.tick(1).elapsed).toBeGreaterThan(held);
+  });
+
+  it('jumps back to the start of a phase it has already been through', () => {
+    const runner = new SimulationRunner(makeConfig(), makeKernel(), {
+      particleCount: WIRING_PARTICLES,
+    });
+    while (runner.currentStage < LifecycleStage.MainSequence) {
+      runner.tick(1 / 10);
+    }
+    expect(runner.seekToStage(LifecycleStage.ProtostarCoalescence)).toBe(true);
+    expect(runner.currentStage).toBe(LifecycleStage.ProtostarCoalescence);
+    expect(runner.isReplaying).toBe(true);
+    // A phase that has not happened yet has nothing to jump to.
+    expect(runner.seekToStage(LifecycleStage.Remnant)).toBe(false);
   });
 });

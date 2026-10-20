@@ -13,13 +13,13 @@
 // A sub-stellar object short-circuits this order entirely — a brown dwarf never
 // ignites, so it goes straight from FusionIgnition to Remnant.
 //
-// Stage durations are illustrative, not simulation-grade (PRD A1): they use the
-// real qualitative ordering (massive stars live fast and die young) rather than
-// solving stellar structure. All timing knobs live in one place so they are
-// auditable and adjustable.
+// Stage durations are the real astrophysical timescales, from published fits
+// rather than solved stellar structure (PRD A1). All timing knobs live in one
+// place so they are auditable and adjustable; the time warp decides how they
+// are compressed on screen.
 
 import type { CloudComposition } from '../config/SimulationConfig';
-import { LifecycleStage } from '../config/fateModel';
+import { LifecycleStage, RemnantType, determineFate, isSubstellar } from '../config/fateModel';
 import { SimEventType } from './events';
 
 /** One Julian year in seconds; the base unit for the illustrative durations. */
@@ -56,31 +56,130 @@ export const STAGE_ENTRY_EVENT: Readonly<Partial<Record<LifecycleStage, SimEvent
 } as const;
 
 /**
- * Centralized, auditable timing constants for the illustrative lifecycle. Sim
- * seconds. Main-sequence lifetime dominates and scales steeply with mass
- * (t ∝ M^-2.5), reproducing the real qualitative ordering.
+ * Centralized, auditable timing constants for the lifecycle. Sim seconds.
+ *
+ * These are the REAL astrophysical timescales (to within the accuracy of the
+ * fits quoted below); how they are presented on screen — compressed into a
+ * watchable span per stage — is the time warp's job (`timeWarp.ts`), not
+ * theirs. Mirror in Rust (`wasm/src/stages.rs`).
  */
 export const STAGE_TIMING = {
-  /** Cloud drift before gravitational collapse sets in. */
+  /** Pre-stellar core: a few free-fall times before the collapse runs away. */
   dustCloudSeconds: 1 * MYR_SECONDS,
-  /** Protostellar coalescence; more massive clouds collapse faster (M^-0.5). */
+  /**
+   * Embedded (Class 0/I) protostar accreting its envelope, ~0.5 Myr; more
+   * massive cores accrete faster (M^-0.5).
+   */
   protostarBaseSeconds: 0.5 * MYR_SECONDS,
-  /** Brief pre-main-sequence ignition window. */
-  fusionIgnitionSeconds: 0.1 * MYR_SECONDS,
-  /** Solar main-sequence lifetime (~10 Gyr) at the M^-2.5 reference mass of 1. */
-  mainSequenceSolarSeconds: 10e9 * YEAR_SECONDS,
-  /** Red-giant phase as a fraction of the main-sequence lifetime. */
+  /**
+   * Pre-main-sequence (T Tauri / Kelvin–Helmholtz) contraction of a 1 M☉ star
+   * to the zero-age main sequence: ~40 Myr. The Sun really did take this long
+   * to start burning hydrogen in equilibrium, and the planets formed in this
+   * window — it was 0.1 Myr, 400× too short.
+   */
+  preMainSequenceSolarSeconds: 40 * MYR_SECONDS,
+  /** KH time ∝ M^-2.5 above 1 M☉ (Iben 1965: 15 M☉ contracts in ~0.06 Myr)… */
+  preMainSequenceHighMassExponent: 2.5,
+  /** …and flattens to ∝ M^-1.25 below it (0.1 M☉ takes ~0.7 Gyr). */
+  preMainSequenceLowMassExponent: 1.25,
+  /**
+   * Floor: a massive star reaches the main sequence while still accreting, so
+   * its contraction can never be shorter than the accretion itself.
+   */
+  preMainSequenceMinSeconds: 0.05 * MYR_SECONDS,
+  /**
+   * A brown dwarf never reaches the main sequence; this stage is its
+   * deuterium-burning phase instead, ~10 Myr at 0.05 M☉ and longer for lighter
+   * objects (∝ M^-1.5), after which it only cools.
+   */
+  deuteriumBurningSeconds: 10 * MYR_SECONDS,
+  deuteriumBurningReferenceMass: 0.05,
+  deuteriumBurningExponent: 1.5,
+  /**
+   * Hurley, Pols & Tout (2000, eq. 4) fit for the time to the base of the
+   * giant branch at Z = 0.02, in Myr:
+   *
+   *   t_BGB = (a1 + a2 M^4 + a3 M^5.5 + M^7) / (a4 M^2 + a5 M^7)
+   *
+   * and t_MS ≈ 0.95 t_BGB. Within ~5 % of detailed stellar models from 0.5 to
+   * 120 M☉ (1 M☉ → 11 Gyr, 20 M☉ → 8.3 Myr, 60 M☉ → 3.7 Myr), and it has the
+   * correct ~3 Myr floor for the most massive stars, where a pure power law
+   * (the old M^-2.5) under-estimated a 60 M☉ star's life tenfold.
+   */
+  mainSequenceFit: [1593.89, 2706.708, 146.6143, 0.0414196, 0.3426349],
+  mainSequenceFractionOfBgb: 0.95,
+  /** Post-main-sequence (giant branch + core helium burning) ≈ 10 % of the MS. */
   redGiantFractionOfMain: 0.1,
-  /** Brief death window (supernova flash / envelope shedding). */
-  deathSeconds: 0.01 * MYR_SECONDS,
-  /** Reference (solar) metallicity used to modulate main-sequence lifetime. */
+  /**
+   * Superwind + planetary-nebula ejection of a low/intermediate-mass star:
+   * ~10^4 yr.
+   */
+  planetaryNebulaSeconds: 1e4 * YEAR_SECONDS,
+  /**
+   * The drawn core-collapse sequence — implosion, shock breakout, fireball,
+   * fade — is a ~1-year event (a supernova's light curve), not 10^4 years.
+   * Also used for a direct collapse, where the star simply winks out.
+   */
+  coreCollapseSeconds: 1 * YEAR_SECONDS,
+  /** Reference (solar) metallicity of the lifetime fit. */
   solarMetallicity: 0.02,
   /**
-   * How strongly excess metallicity shortens the main-sequence lifetime
-   * (higher opacity/luminosity). Illustrative, dimensionless.
+   * Metal-POOR stars burn out SOONER: lower opacity makes them hotter and more
+   * luminous at the same mass (a 0.8 M☉ globular-cluster star at Z ≈ 5e-4
+   * leaves the main sequence at ~12 Gyr; at solar Z it would take ~25 Gyr).
+   * The lifetime scales ≈ (Z/Z☉)^0.2, clamped to the range the fit supports.
+   * (It used to scale the other way round.)
    */
-  metallicityLifetimeCoefficient: 2,
+  metallicityLifetimeExponent: 0.2,
+  metallicityLifetimeMin: 0.45,
+  metallicityLifetimeMax: 1.35,
 } as const;
+
+/** The current age of the universe (yr) — the yardstick for "longer than ever". */
+export const UNIVERSE_AGE_YEARS = 13.8e9;
+
+/**
+ * Main-sequence lifetime (sim seconds) of a star of `mass` M☉ and metal mass
+ * fraction `metals`: the Hurley–Pols–Tout fit, scaled for metallicity. Pure.
+ */
+export function mainSequenceLifetimeSeconds(mass: number, metals: number): number {
+  const m = Math.max(mass, 1e-3);
+  const [a1, a2, a3, a4, a5] = STAGE_TIMING.mainSequenceFit;
+  const tBgbMyr = (a1 + a2 * m ** 4 + a3 * m ** 5.5 + m ** 7) / (a4 * m ** 2 + a5 * m ** 7);
+  const {
+    solarMetallicity,
+    metallicityLifetimeExponent,
+    metallicityLifetimeMin,
+    metallicityLifetimeMax,
+  } = STAGE_TIMING;
+  const z = Number.isFinite(metals) ? Math.max(metals, 1e-6) : solarMetallicity;
+  const metallicityFactor = Math.min(
+    metallicityLifetimeMax,
+    Math.max(metallicityLifetimeMin, Math.pow(z / solarMetallicity, metallicityLifetimeExponent)),
+  );
+  return STAGE_TIMING.mainSequenceFractionOfBgb * tBgbMyr * MYR_SECONDS * metallicityFactor;
+}
+
+/**
+ * Duration (sim seconds) of the stage between the protostar and the main
+ * sequence: Kelvin–Helmholtz contraction for a star, deuterium burning for a
+ * brown dwarf. Pure.
+ */
+export function preMainSequenceSeconds(mass: number): number {
+  const m = Math.max(mass, 1e-3);
+  const t = STAGE_TIMING;
+  if (isSubstellar(m)) {
+    return (
+      t.deuteriumBurningSeconds *
+      Math.pow(t.deuteriumBurningReferenceMass / m, t.deuteriumBurningExponent)
+    );
+  }
+  const exponent = m >= 1 ? t.preMainSequenceHighMassExponent : t.preMainSequenceLowMassExponent;
+  return Math.max(
+    t.preMainSequenceMinSeconds,
+    t.preMainSequenceSolarSeconds * Math.pow(m, -exponent),
+  );
+}
 
 /**
  * Internal structure of the DEATH stage, as fractions of its duration.
@@ -148,41 +247,32 @@ export const NEBULA_PHASES = {
 } as const;
 
 /**
- * Illustrative duration (sim seconds) the star spends IN each stage before
- * advancing to the next, keyed on `mass` (M☉) and `composition`. The terminal
+ * Duration (sim seconds) the star spends IN each stage before advancing to the
+ * next, keyed on its `mass` (M☉) and `composition`. The terminal
  * {@link LifecycleStage.Remnant} lasts forever (`Infinity`). Pure; exported for
- * unit testing and for callers that want to preview the timeline.
+ * unit testing and for the HUD timeline.
  */
 export function stageDurations(
   mass: number,
   composition: CloudComposition,
 ): Readonly<Record<LifecycleStage, number>> {
   const m = Math.max(mass, Number.EPSILON);
-  const {
-    dustCloudSeconds,
-    protostarBaseSeconds,
-    fusionIgnitionSeconds,
-    mainSequenceSolarSeconds,
-    redGiantFractionOfMain,
-    deathSeconds,
-    solarMetallicity,
-    metallicityLifetimeCoefficient,
-  } = STAGE_TIMING;
-
-  // Higher-than-solar metallicity shortens the main-sequence lifetime; clamp to
-  // a small positive factor so extreme compositions never zero/negate time.
-  const metalExcess = composition.metals - solarMetallicity;
-  const metallicityFactor = Math.max(0.1, 1 - metallicityLifetimeCoefficient * metalExcess);
-
-  const mainSequence = mainSequenceSolarSeconds * Math.pow(m, -2.5) * metallicityFactor;
+  const { dustCloudSeconds, protostarBaseSeconds, redGiantFractionOfMain } = STAGE_TIMING;
+  const mainSequence = mainSequenceLifetimeSeconds(m, composition.metals);
+  // A white dwarf's progenitor sheds a planetary nebula over millennia; every
+  // other star dies in a core collapse that is over within a year.
+  const { remnant } = determineFate(m, composition);
+  const quietDeath = remnant === RemnantType.WhiteDwarf || remnant === RemnantType.BrownDwarf;
 
   return {
     [LifecycleStage.DustCloud]: dustCloudSeconds,
     [LifecycleStage.ProtostarCoalescence]: protostarBaseSeconds * Math.pow(m, -0.5),
-    [LifecycleStage.FusionIgnition]: fusionIgnitionSeconds,
+    [LifecycleStage.FusionIgnition]: preMainSequenceSeconds(m),
     [LifecycleStage.MainSequence]: mainSequence,
     [LifecycleStage.RedGiant]: mainSequence * redGiantFractionOfMain,
-    [LifecycleStage.Death]: deathSeconds,
+    [LifecycleStage.Death]: quietDeath
+      ? STAGE_TIMING.planetaryNebulaSeconds
+      : STAGE_TIMING.coreCollapseSeconds,
     [LifecycleStage.Remnant]: Infinity,
   };
 }

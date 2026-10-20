@@ -109,6 +109,7 @@ function makeFakeModule(): {
     wasm_memory: () => memory,
     softening: () => 0.35,
     snow_line_au: () => 2.7,
+    snow_line_for_star: () => 2.7,
     default: async () => undefined,
   };
   return { mod, particle, body, attractor };

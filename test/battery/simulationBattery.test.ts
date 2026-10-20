@@ -254,6 +254,8 @@ interface RunReport {
   finalStage: LifecycleStage;
   finalStarMass: number;
   finalElapsed: number;
+  /** Elapsed time on the step the remnant formed (the star's whole life). */
+  remnantOnsetElapsed: number;
   ticks: number;
   /** Planet orbits sampled while the star is on the main sequence. */
   architecture: { mass: number; aAu: number; apoapsisAu: number }[];
@@ -563,6 +565,7 @@ function runBattery(
     finalStage: LifecycleStage.DustCloud,
     finalStarMass: 0,
     finalElapsed: 0,
+    remnantOnsetElapsed: NaN,
     ticks: 0,
     architecture: [],
     sawWorld: false,
@@ -818,6 +821,9 @@ function runBattery(
     }
 
     if (res.stage === LifecycleStage.Remnant) {
+      if (remnantTicks === 0) {
+        report.remnantOnsetElapsed = res.elapsedSimSeconds;
+      }
       remnantTicks += 1;
       // The nebula's decay curve, sampled every tick of the watch: it must thin
       // and dim, not be deleted (reported bug 7).
@@ -968,12 +974,17 @@ function finishChecks(
       durations[LifecycleStage.MainSequence] +
       durations[LifecycleStage.RedGiant] +
       durations[LifecycleStage.Death];
-  const ratio = report.finalElapsed / expectedTotal;
+  // Judged on the step the remnant FORMED: afterwards the system keeps ageing
+  // (the nebula expands, the remnant cools), which the next check covers.
+  const ratio = report.remnantOnsetElapsed / expectedTotal;
   if (!(ratio > 0.9 && ratio < 1.15)) {
     issue(
-      `elapsed at remnant ${report.finalElapsed.toExponential(2)}s is ${ratio.toFixed(2)}× ` +
+      `elapsed at remnant ${report.remnantOnsetElapsed.toExponential(2)}s is ${ratio.toFixed(2)}× ` +
         `the theoretical lifetime ${expectedTotal.toExponential(2)}s`,
     );
+  }
+  if (!(report.finalElapsed > report.remnantOnsetElapsed)) {
+    issue('the clock stopped once the remnant formed — the system no longer ages');
   }
 
   // Post-mortem particle-KIND checks (a brown dwarf throws no ejecta; a real
@@ -1112,7 +1123,11 @@ describeWasm(`simulation battery (${RUNS} runs)`, () => {
         // Read the model constants the checks depend on from the kernel itself.
         const report = runBattery(kernel, config, {
           softening: mod.softening(),
-          snowLineAu: mod.snow_line_au(),
+          // The disc's condensation fronts move out with the star's luminosity,
+          // so every system is judged against ITS OWN snow line.
+          snowLineAu: mod.snow_line_for_star(
+            stellarMassFromCloud(config.mass, config.composition.metals),
+          ),
         });
         kernel.dispose();
         expect(report.issues, report.issues.join('\n')).toEqual([]);

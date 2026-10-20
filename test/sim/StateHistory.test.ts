@@ -73,15 +73,28 @@ describe('StateHistory (DVR playback)', () => {
     expect(h.currentFrame()?.elapsed).toBe(0);
   });
 
-  it('drops the oldest frame past capacity (bounded ring)', () => {
-    const h = new StateHistory(3);
-    for (let i = 0; i < 6; i += 1) {
+  it('thins itself past capacity instead of forgetting the beginning', () => {
+    const h = new StateHistory(4);
+    let thinned = false;
+    for (let i = 0; i < 5; i += 1) {
+      thinned = h.record(frame(i, i * 100));
+    }
+    expect(thinned).toBe(true);
+    expect(h.size).toBeLessThanOrEqual(4);
+    // The very first moment of the run is still there, and so is the newest.
+    expect(h.seek(-100)?.elapsed).toBe(0);
+    expect(h.seek(100)?.elapsed).toBe(400);
+  });
+
+  it('never thins away a pinned keyframe', () => {
+    const h = new StateHistory(4);
+    h.record(frame(0, 0));
+    h.record({ ...frame(1, 100), pinned: true });
+    for (let i = 2; i < 12; i += 1) {
       h.record(frame(i, i * 100));
     }
-    expect(h.size).toBe(3);
-    // Only the three newest survive (300, 400, 500).
-    const oldest = h.seek(-100);
-    expect(oldest?.elapsed).toBe(300);
+    expect(h.seekToFirst((f) => f.elapsed === 100)?.elapsed).toBe(100);
+    expect(h.seekToFirst((f) => f.elapsed === 12345)).toBeNull();
   });
 
   it('clear() empties the history and resets to live', () => {

@@ -1,8 +1,12 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { FOCUS_NONE, FOCUS_STAR, Hud } from '../../src/ui/Hud';
+import { FOCUS_NONE, FOCUS_STAR, Hud, STAGE_LEGEND_IDS } from '../../src/ui/Hud';
 import { LifecycleStage } from '../../src/config/fateModel';
 import { i18n } from '../../src/i18n/i18n';
+import { stageDurations } from '../../src/sim/stages';
+import { timelineView } from '../../src/ui/timeline';
+
+const SOLAR = { hydrogen: 0.74, helium: 0.24, metals: 0.02 };
 
 function makeHud(
   container: HTMLElement,
@@ -211,5 +215,149 @@ describe('Hud visibility toggles', () => {
     hud.setLocale('fi');
     expect(container.textContent).toContain(i18n.translate('fi', 'hud.orbits'));
     expect(container.textContent).toContain(i18n.translate('fi', 'hud.labels'));
+  });
+});
+
+describe('Hud timeline and time controls', () => {
+  let container: HTMLElement;
+
+  beforeEach(() => {
+    document.body.replaceChildren();
+    container = document.createElement('div');
+    document.body.appendChild(container);
+  });
+
+  it('captions the current stage with its TRUE duration and the universe-age note', () => {
+    const { hud } = makeHud(container);
+    hud.setTimeline(
+      timelineView(LifecycleStage.MainSequence, 0.5, stageDurations(0.2, SOLAR), false),
+    );
+    const caption = container.querySelector('.hud-timeline__caption')!.textContent ?? '';
+    expect(caption).toContain(i18n.translate('en', 'stage.mainSequence'));
+    expect(caption).toContain('billion years');
+    expect(caption).toContain('13.8 billion years');
+    const current = container.querySelector(
+      '.hud-timeline__seg[data-state="current"] .hud-timeline__fill',
+    ) as HTMLElement;
+    expect(parseFloat(current.style.width)).toBeCloseTo(50, 5);
+    // The honest note about the orbital clock is always there.
+    expect(container.textContent).toContain(i18n.translate('en', 'hud.orbitNote'));
+  });
+
+  it('wires the skip button and auto-warp toggle', () => {
+    const onSkipStage = vi.fn();
+    const onToggleAutoWarp = vi.fn();
+    const { hud } = makeHud(container, { onSkipStage, onToggleAutoWarp });
+    const skip = container.querySelector('.hud-skip') as HTMLButtonElement;
+    expect(skip.disabled).toBe(true);
+    hud.setSkip(true, false);
+    expect(skip.disabled).toBe(false);
+    skip.click();
+    expect(onSkipStage).toHaveBeenCalledTimes(1);
+    hud.setSkip(true, true);
+    expect(skip.disabled).toBe(true);
+
+    expect(hud.autoWarpChecked).toBe(true);
+    const toggle = [...container.querySelectorAll('input[type="checkbox"]')].find((el) =>
+      el.parentElement?.textContent?.includes(i18n.translate('en', 'hud.autoWarp')),
+    ) as HTMLInputElement;
+    toggle.click();
+    expect(onToggleAutoWarp).toHaveBeenCalledWith(false);
+  });
+
+  it('re-translates the timeline caption on a locale change', () => {
+    const { hud } = makeHud(container);
+    hud.setTimeline(timelineView(LifecycleStage.RedGiant, 0.1, stageDurations(1, SOLAR), false));
+    hud.setLocale('fi');
+    const caption = container.querySelector('.hud-timeline__caption')!.textContent ?? '';
+    expect(caption).toContain(i18n.translate('fi', 'stage.redGiant'));
+  });
+});
+
+describe('Hud phase legend, seeking, zoom and playback badge', () => {
+  let container: HTMLElement;
+
+  beforeEach(() => {
+    document.body.replaceChildren();
+    container = document.createElement('div');
+    document.body.appendChild(container);
+  });
+
+  function segments(): HTMLElement[] {
+    return [...container.querySelectorAll<HTMLElement>('.hud-timeline__seg')];
+  }
+
+  it('reveals a phase legend on hover and hides it on leave', () => {
+    const { hud } = makeHud(container);
+    hud.setTimeline(
+      timelineView(LifecycleStage.MainSequence, 0.3, stageDurations(1, SOLAR), false),
+    );
+    const legend = container.querySelector('.hud-legend') as HTMLElement;
+    expect(legend.hidden).toBe(true);
+    const redGiant = segments()[LifecycleStage.RedGiant]!;
+    redGiant.dispatchEvent(new MouseEvent('mouseenter'));
+    expect(legend.hidden).toBe(false);
+    expect(legend.textContent).toContain(i18n.translate('en', 'stage.redGiant'));
+    expect(legend.textContent).toContain(i18n.translate('en', 'stage.legend.redGiant'));
+    expect(legend.textContent).toContain(i18n.translate('en', 'hud.legend.future'));
+    redGiant.dispatchEvent(new MouseEvent('mouseleave'));
+    expect(legend.hidden).toBe(true);
+    // Keyboard users get it too.
+    segments()[LifecycleStage.MainSequence]!.dispatchEvent(new FocusEvent('focus'));
+    expect(legend.textContent).toContain('30%');
+  });
+
+  it('has a legend for every stage in every locale', () => {
+    for (const locale of ['en', 'fi'] as const) {
+      for (const id of Object.values(STAGE_LEGEND_IDS)) {
+        expect(i18n.translate(locale, id)).not.toBe(id);
+      }
+    }
+  });
+
+  it('seeks only to phases the run has already reached', () => {
+    const onSeekStage = vi.fn();
+    const { hud } = makeHud(container, { onSeekStage });
+    hud.setTimeline(
+      timelineView(LifecycleStage.MainSequence, 0.3, stageDurations(1, SOLAR), false),
+    );
+    segments()[LifecycleStage.ProtostarCoalescence]!.click();
+    expect(onSeekStage).toHaveBeenCalledWith(LifecycleStage.ProtostarCoalescence);
+    segments()[LifecycleStage.RedGiant]!.click();
+    expect(onSeekStage).toHaveBeenCalledTimes(1);
+    // Viewing the past: phases the live run already reached are reachable again.
+    hud.setReachedStage(LifecycleStage.RedGiant);
+    hud.setTimeline(timelineView(LifecycleStage.DustCloud, 0.5, stageDurations(1, SOLAR), false));
+    segments()[LifecycleStage.RedGiant]!.click();
+    expect(onSeekStage).toHaveBeenLastCalledWith(LifecycleStage.RedGiant);
+    segments()[LifecycleStage.Death]!.click();
+    expect(onSeekStage).toHaveBeenCalledTimes(2);
+  });
+
+  it('offers transparent +/− zoom buttons over the scene', () => {
+    const { callbacks } = makeHud(container);
+    const buttons = [...container.querySelectorAll<HTMLButtonElement>('.zoom-controls__button')];
+    expect(buttons.map((b) => b.textContent)).toEqual(['+', '−']);
+    expect(buttons[0]!.getAttribute('aria-label')).toBe(i18n.translate('en', 'hud.zoomIn'));
+    buttons[0]!.click();
+    buttons[1]!.click();
+    expect(callbacks.onZoomIn).toHaveBeenCalledTimes(1);
+    expect(callbacks.onZoomOut).toHaveBeenCalledTimes(1);
+  });
+
+  it('labels the badge paused / rewinding / replay', () => {
+    const { hud } = makeHud(container);
+    const badge = container.querySelector('.hud-paused') as HTMLElement;
+    hud.setRewinding(true);
+    expect(badge.textContent).toBe(i18n.translate('en', 'hud.rewinding'));
+    hud.setRewinding(false);
+    hud.setReplaying(true);
+    expect(badge.textContent).toBe(i18n.translate('en', 'hud.replaying'));
+    hud.setPaused(true);
+    expect(badge.textContent).toBe(i18n.translate('en', 'hud.pausedPast'));
+    hud.setReplaying(false);
+    expect(badge.textContent).toBe(i18n.translate('en', 'hud.paused'));
+    hud.setPaused(false);
+    expect(badge.hidden).toBe(true);
   });
 });

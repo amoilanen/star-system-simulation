@@ -5,6 +5,8 @@ import {
   DEATH_PHASES,
   NEBULA_PHASES,
   stageDurations,
+  mainSequenceLifetimeSeconds,
+  preMainSequenceSeconds,
 } from '../../src/sim/stages';
 import { EVENT_MESSAGE_IDS, SimEventType } from '../../src/sim/events';
 import { LifecycleStage } from '../../src/config/fateModel';
@@ -22,6 +24,9 @@ import type { CloudComposition } from '../../src/config/SimulationConfig';
 // `TsFallbackKernel.test.ts`, `WasmKernel.test.ts` and the simulation battery.
 
 const SOLAR_COMPOSITION: CloudComposition = { hydrogen: 0.74, helium: 0.24, metals: 0.02 };
+const YEAR = 365.25 * 24 * 3600;
+const MYR = 1e6 * YEAR;
+const GYR = 1e9 * YEAR;
 
 describe('STAGE_ORDER', () => {
   it('walks the full lifecycle in the spec order', () => {
@@ -95,7 +100,7 @@ describe('stageDurations', () => {
     expect(d[LifecycleStage.Remnant]).toBe(Infinity);
   });
 
-  it('makes massive stars live much shorter than low-mass ones (M^-2.5)', () => {
+  it('makes massive stars live much shorter than low-mass ones', () => {
     const low = stageDurations(0.5, SOLAR_COMPOSITION)[LifecycleStage.MainSequence];
     const sun = stageDurations(1, SOLAR_COMPOSITION)[LifecycleStage.MainSequence];
     const high = stageDurations(20, SOLAR_COMPOSITION)[LifecycleStage.MainSequence];
@@ -107,17 +112,62 @@ describe('stageDurations', () => {
 
   it('puts a solar main sequence at ~10 Gyr', () => {
     const sun = stageDurations(1, SOLAR_COMPOSITION)[LifecycleStage.MainSequence];
-    const gyr = 1e9 * 365.25 * 24 * 3600;
-    expect(sun / gyr).toBeGreaterThan(8);
-    expect(sun / gyr).toBeLessThan(12);
+    expect(sun / GYR).toBeGreaterThan(9);
+    expect(sun / GYR).toBeLessThan(12);
   });
 
-  it('shortens the main sequence as metallicity rises (higher opacity)', () => {
+  it('matches detailed stellar models across the mass range (within 12 %)', () => {
+    // Solar-metallicity model lifetimes (Myr), Schaller 1992 / Ekström 2012.
+    const models: Array<[number, number]> = [
+      [0.8, 2.5e4],
+      [1, 1e4],
+      [2, 1.1e3],
+      [5, 100],
+      [9, 28],
+      [15, 11.5],
+      [20, 8.1],
+      [40, 4.3],
+      [60, 3.5],
+      [120, 2.8],
+    ];
+    for (const [mass, reference] of models) {
+      const myr = mainSequenceLifetimeSeconds(mass, 0.02) / MYR;
+      expect(Math.abs(myr / reference - 1), `${mass} M☉: ${myr} Myr`).toBeLessThan(0.12);
+    }
+  });
+
+  it('never lets even the most massive star live less than ~3 Myr', () => {
+    expect(mainSequenceLifetimeSeconds(250, 0.02) / MYR).toBeGreaterThan(2.5);
+  });
+
+  it('lets metal-poor stars burn out sooner (lower opacity, more luminous)', () => {
     const poor = stageDurations(1, { hydrogen: 0.79, helium: 0.209, metals: 0.001 });
     const rich = stageDurations(1, { hydrogen: 0.68, helium: 0.22, metals: 0.1 });
-    expect(rich[LifecycleStage.MainSequence]).toBeLessThan(poor[LifecycleStage.MainSequence]);
+    expect(poor[LifecycleStage.MainSequence]).toBeLessThan(rich[LifecycleStage.MainSequence]);
     // Never zero or negative, however extreme the composition.
-    expect(rich[LifecycleStage.MainSequence]).toBeGreaterThan(0);
+    expect(mainSequenceLifetimeSeconds(1, 0)).toBeGreaterThan(0);
+  });
+
+  it('contracts the Sun for tens of Myr before ignition, a massive star almost not at all', () => {
+    const sun = stageDurations(1, SOLAR_COMPOSITION)[LifecycleStage.FusionIgnition] / MYR;
+    expect(sun).toBeGreaterThan(20);
+    expect(sun).toBeLessThan(60);
+    expect(preMainSequenceSeconds(30)).toBeLessThan(preMainSequenceSeconds(1) / 100);
+    // A red dwarf takes far longer still.
+    expect(preMainSequenceSeconds(0.1)).toBeGreaterThan(preMainSequenceSeconds(1) * 10);
+  });
+
+  it('gives a brown dwarf a deuterium-burning phase of ~10–100 Myr', () => {
+    const bd = preMainSequenceSeconds(0.04) / MYR;
+    expect(bd).toBeGreaterThan(5);
+    expect(bd).toBeLessThan(100);
+  });
+
+  it('makes a supernova a ~1-year event and a planetary nebula a millennia-long one', () => {
+    const sun = stageDurations(1, SOLAR_COMPOSITION)[LifecycleStage.Death];
+    const massive = stageDurations(20, SOLAR_COMPOSITION)[LifecycleStage.Death];
+    expect(massive / YEAR).toBeLessThanOrEqual(2);
+    expect(sun / YEAR).toBeGreaterThan(1e3);
   });
 });
 

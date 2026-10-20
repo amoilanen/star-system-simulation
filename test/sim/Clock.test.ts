@@ -37,12 +37,12 @@ describe('paceToRate', () => {
 
 describe('Clock pace endpoints', () => {
   it('pace=0 yields the near-real rate with defaults', () => {
-    const clock = new Clock({ pace: 0 });
+    const clock = new Clock({ mode: 'fixed', pace: 0 });
     expect(clock.simSecondsPerRealSecond()).toBeCloseTo(DEFAULT_NEAR_REAL_RATE, 6);
   });
 
   it('pace=1 compresses a full lifecycle into ~1 minute', () => {
-    const clock = new Clock({ pace: 1 });
+    const clock = new Clock({ mode: 'fixed', pace: 1 });
     const expectedRate = DEFAULT_LIFECYCLE_SIM_SECONDS / DEFAULT_FULL_CYCLE_REAL_SECONDS;
     expect(clock.simSecondsPerRealSecond()).toBeCloseTo(expectedRate, 0);
 
@@ -54,7 +54,7 @@ describe('Clock pace endpoints', () => {
 
 describe('Clock pause', () => {
   it('yields dt=0 and a frozen rate while paused, without losing sim time', () => {
-    const clock = new Clock({ pace: 1 });
+    const clock = new Clock({ mode: 'fixed', pace: 1 });
     clock.advance(1); // accumulate some sim time
     const before = clock.simTime;
     expect(before).toBeGreaterThan(0);
@@ -74,7 +74,7 @@ describe('Clock pause', () => {
 
 describe('Clock live pace change', () => {
   it('applies a new pace immediately', () => {
-    const clock = new Clock({ pace: 0 });
+    const clock = new Clock({ mode: 'fixed', pace: 0 });
     const slowDt = clock.advance(1);
 
     clock.setPace(1);
@@ -85,7 +85,7 @@ describe('Clock live pace change', () => {
   });
 
   it('clamps pace assignments to [0, 1]', () => {
-    const clock = new Clock();
+    const clock = new Clock({ mode: 'fixed' });
     clock.setPace(5);
     expect(clock.pace).toBe(1);
     clock.setPace(-3);
@@ -95,7 +95,7 @@ describe('Clock live pace change', () => {
 
 describe('Clock advance guards', () => {
   it('ignores non-positive and non-finite real dt', () => {
-    const clock = new Clock({ pace: 1 });
+    const clock = new Clock({ mode: 'fixed', pace: 1 });
     expect(clock.advance(0)).toBe(0);
     expect(clock.advance(-5)).toBe(0);
     expect(clock.advance(Number.NaN)).toBe(0);
@@ -104,11 +104,55 @@ describe('Clock advance guards', () => {
   });
 
   it('reset returns sim time to 0 but preserves pace', () => {
-    const clock = new Clock({ pace: 1 });
+    const clock = new Clock({ mode: 'fixed', pace: 1 });
     clock.advance(1);
     expect(clock.simTime).toBeGreaterThan(0);
     clock.reset();
     expect(clock.simTime).toBe(0);
     expect(clock.pace).toBe(1);
+  });
+});
+
+describe('Clock adaptive mode', () => {
+  it('defaults to adaptive and runs at the rate its owner pushes in', () => {
+    const clock = new Clock({ pace: 0 });
+    expect(clock.mode).toBe('adaptive');
+    clock.setAdaptiveRate(1e12);
+    expect(clock.advance(2)).toBeCloseTo(2e12, 0);
+    // Invalid rates are ignored rather than corrupting the clock.
+    clock.setAdaptiveRate(Number.NaN);
+    clock.setAdaptiveRate(-1);
+    expect(clock.currentRate()).toBe(1e12);
+  });
+
+  it('switches to the fixed pace mapping on demand', () => {
+    const clock = new Clock({ pace: 1 });
+    clock.setAdaptiveRate(5);
+    clock.setMode('fixed');
+    expect(clock.currentRate()).toBeCloseTo(
+      DEFAULT_LIFECYCLE_SIM_SECONDS / DEFAULT_FULL_CYCLE_REAL_SECONDS,
+      0,
+    );
+  });
+
+  it('lets a boost raise — never lower — the rate, and clears it with 0', () => {
+    const clock = new Clock();
+    clock.setAdaptiveRate(100);
+    clock.setBoostRate(1e6);
+    expect(clock.boosting).toBe(true);
+    expect(clock.currentRate()).toBe(1e6);
+    clock.setBoostRate(10);
+    expect(clock.currentRate()).toBe(100);
+    expect(clock.boosting).toBe(false);
+    clock.setBoostRate(0);
+    expect(clock.currentRate()).toBe(100);
+  });
+
+  it('still freezes completely while paused', () => {
+    const clock = new Clock();
+    clock.setAdaptiveRate(1e9);
+    clock.pause();
+    expect(clock.advance(1)).toBe(0);
+    expect(clock.simSecondsPerRealSecond()).toBe(0);
   });
 });

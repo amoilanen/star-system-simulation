@@ -23,6 +23,7 @@ import { SceneManager, type RenderState } from '../render/SceneManager';
 import { EventAnnotations, BODY_TYPE_MESSAGE_IDS } from '../ui/EventAnnotations';
 import { FOCUS_NONE, FOCUS_STAR, Hud, type FocusOption } from '../ui/Hud';
 import { BodyInfoPanel } from '../ui/BodyInfoPanel';
+import { timelineView } from '../ui/timeline';
 import { bodyInfoMessages, type PickTarget } from '../ui/bodyInfo';
 import { ContextMenu } from '../ui/ContextMenu';
 import { DEFAULT_PARTICLE_COUNT, SimulationRunner } from './SimulationRunner';
@@ -147,7 +148,7 @@ export class RunScreen {
       initialPace: this.config.pace,
       onPaceChange: (pace) => this.runner?.setPace(pace),
       onTogglePause: () => this.handleTogglePause(),
-      onToggleRewind: (rewinding) => this.runner?.setRewinding(rewinding),
+      onToggleRewind: (rewinding) => this.handleSetRewinding(rewinding),
       onReset: () => this.onExit(),
       onZoomIn: () => this.scene?.cameraController.zoomIn(),
       onZoomOut: () => this.scene?.cameraController.zoomOut(),
@@ -158,6 +159,12 @@ export class RunScreen {
       // the user turns them on from the HUD when they want to identify bodies.
       initialLabels: false,
       initialOrbits: false,
+      // Time: the adaptive warp is on by default; skip fast-forwards a long stage.
+      onSkipStage: () => this.handleSkipStage(),
+      onToggleAutoWarp: (enabled) => this.runner?.setTimeMode(enabled ? 'adaptive' : 'fixed'),
+      initialAutoWarp: this.runner.timeMode === 'adaptive',
+      // Clicking a phase already lived through jumps back to its start.
+      onSeekStage: (stage) => this.runner?.seekToStage(stage),
     });
     // The scene's overlays default to "on"; sync them to the HUD's initial
     // checkbox state so the two never disagree on the first frame.
@@ -234,7 +241,7 @@ export class RunScreen {
     const annotations = this.annotations;
     if (annotations !== null) {
       for (const event of events) {
-        annotations.show(event);
+        annotations.show(event, simSecondsToYears(elapsed));
       }
     }
 
@@ -247,6 +254,25 @@ export class RunScreen {
       // NOT the raw pace-scaled clock.
       hud.setElapsedYears(simSecondsToYears(elapsed));
       hud.setSpeedYearsPerSecond(simSecondsToYears(runner.clock.currentRate()));
+      hud.setReachedStage(runner.reachedStage);
+      hud.setTimeline(
+        timelineView(
+          state.stage,
+          state.stageProgress,
+          runner.stageDurations,
+          runner.finalRemnant === RemnantType.BrownDwarf,
+        ),
+      );
+      hud.setSkip(runner.canSkipStage, runner.isSkipping);
+      // The runner can change the transport on its own (rewinding into the
+      // first recorded frame stops there, paused), so mirror it every frame.
+      if (hud.isPaused !== runner.paused) {
+        hud.setPaused(runner.paused);
+      }
+      if (hud.isRewinding !== runner.isRewinding) {
+        hud.setRewinding(runner.isRewinding);
+      }
+      hud.setReplaying(runner.isReplaying);
       this.syncFocusOptions(state);
     }
 
@@ -325,6 +351,31 @@ export class RunScreen {
     this.handleFocusChange(value);
   }
 
+  /** Start/stop rewinding (HUD button / R key). */
+  private handleSetRewinding(rewinding: boolean): void {
+    const runner = this.runner;
+    if (runner === null) {
+      return;
+    }
+    runner.setRewinding(rewinding);
+    // Asking to rewind while paused means "go back": start moving.
+    if (rewinding && runner.paused) {
+      runner.togglePause();
+    }
+    this.hud?.setRewinding(runner.isRewinding);
+    this.hud?.setPaused(runner.paused);
+  }
+
+  /** Fast-forward through the rest of the current stage (HUD button / N key). */
+  private handleSkipStage(): void {
+    const runner = this.runner;
+    if (runner === null) {
+      return;
+    }
+    runner.skipStage();
+    this.hud?.setSkip(runner.canSkipStage, runner.isSkipping);
+  }
+
   /** Pause/resume the clock and reflect the state in the HUD. */
   private handleTogglePause(): void {
     const paused = this.runner?.togglePause() ?? false;
@@ -332,8 +383,9 @@ export class RunScreen {
   }
 
   /**
-   * Keyboard transport. Space (or K, the video-player convention) toggles pause;
-   * ignored while the user is typing into a form control so it never hijacks
+   * Keyboard transport. Space (or K, the video-player convention) toggles pause,
+   * R rewinds, N skips to the next stage and +/− zoom; all are
+   * ignored while the user is typing into a form control so they never hijack
    * text entry.
    */
   private handleKeyDown(e: KeyboardEvent): void {
@@ -354,6 +406,19 @@ export class RunScreen {
       // Space would otherwise scroll the page / re-trigger the focused button.
       e.preventDefault();
       this.handleTogglePause();
+    } else if (e.key === 'r' || e.key === 'R') {
+      e.preventDefault();
+      this.handleSetRewinding(!(this.runner?.isRewinding ?? false));
+    } else if (e.key === '+' || e.key === '=') {
+      e.preventDefault();
+      this.scene?.cameraController.zoomIn();
+    } else if (e.key === '-' || e.key === '_') {
+      e.preventDefault();
+      this.scene?.cameraController.zoomOut();
+    } else if (e.key === 'n' || e.key === 'N') {
+      // N = "next stage", the same as the HUD's skip button.
+      e.preventDefault();
+      this.handleSkipStage();
     }
   }
 

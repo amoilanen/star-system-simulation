@@ -21,8 +21,18 @@ post-processing).
   extent, and simulation pace, plus a preset for every outcome the model can
   produce (`brown-dwarf`, `low-mass`, `sun-like`, `neutron-star`, `high-mass`,
   `pulsar`, `black-hole`, `direct-collapse`).
-- **Adjustable time scale** — from near-real time up to a full birth→death cycle in about a
-  minute; pause/resume live.
+- **Realistic timescales, watchable on screen** — stage durations come from published
+  stellar-evolution fits (a 1 M☉ star contracts for ~40 Myr and burns hydrogen for ~11 Gyr; a
+  60 M☉ star lives ~3.7 Myr; metal-poor stars burn out sooner). An **adaptive time warp**
+  compresses each stage to a watchable length (a main sequence takes ~45 s whether it lasts
+  3 million or 3 trillion years), the slider speeds that up or slows it down (÷8…×8), and
+  **Skip to next stage** (or `N`) fast-forwards a long stage. A HUD timeline shows where the
+  system is in its life and how long the current stage _really_ lasts; milestones are dated
+  with the system's age; hover a phase on the timeline for its legend. Untick _Auto
+  time-warp_ for one fixed rate for the whole run.
+- **Pause & rewind** — pause with `Space`; rewind (`R`) runs back through the whole run to
+  the dust cloud and stops there; click any phase already reached on the timeline to jump to
+  its start. Zoom with the transparent +/− buttons (or `+`/`-`).
 - **Full lifecycle** — dust cloud → protostar → fusion ignition → main sequence → red giant
   → death → remnant, with the death path chosen from a centralized, mass/composition-based
   fate model.
@@ -33,7 +43,9 @@ post-processing).
 - **Orbiting bodies** — proto-planets and planets spin and orbit; comets and deep-space
   asteroids visit the system and are either captured or ejected. Worlds condense out of the
   cloud's **solids**, so metal-poor clouds form few planets and a metal-free one forms none
-  at all — it can still fragment into companion stars.
+  at all — it can still fragment into companion stars. The disc's snow line moves out with the star's
+  luminosity (√L), so giants form close in around red dwarfs and not at all inside a massive
+  star's cloud, and a giant stops growing once it opens a gap in the gas disc.
 - **Multiple stars** — a cloud holding more than one Jeans mass cannot collapse as a single
   object: it fragments, and the pieces grow into companion stars (or brown dwarfs) with
   gravity of their own, which perturbs the planets and can scatter the outer ones away.
