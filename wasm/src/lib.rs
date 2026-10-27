@@ -294,6 +294,20 @@ const PROTOSTAR_CORE_FRACTION: f64 = 0.2;
 const FUSION_CORE_FRACTION: f64 = 0.55;
 const IGNITION_CORE_FRACTION: f64 = 0.9;
 
+/// How far the stellar clock may run ahead of formation, as a fraction of the
+/// current formation stage's real duration.
+///
+/// Formation is accretion-driven on the bounded orbital clock, which barely
+/// depends on the stellar clock rate (`orbital_step` is log-compressed). So on
+/// its own, formation took the same few seconds at 3 yr/s as at 10^5 yr/s — the
+/// time-scale slider was ignored and the elapsed clock ran thousands of times
+/// faster than the rate shown. Formation and the clock are now locked together
+/// (see `formation_throttle`): the dynamics slow whenever the core is ahead of
+/// the time that has passed, and the clock may lead the core by at most this
+/// window. At a fast warp nothing changes; at a slow one the whole disc
+/// evolves in slow motion, exactly as fast as time passes.
+const FORMATION_LEAD_WINDOW: f64 = 0.01;
+
 /// Radiation-pressure-to-gravity ratio (β) felt by leftover dust once the star
 /// has ignited (mirror of `IGNITED_RADIATION_BETA`). β > 1 means the young star
 /// pushes harder than it pulls, so the residual cloud is driven back out instead
@@ -591,6 +605,11 @@ pub struct Kernel {
     /// ejecta's `ttl` runs on, so the drawn shell and the particles fade
     /// together.
     remnant_elapsed: f64,
+    /// Stellar-clock time (sim s) spent forming, i.e. before the main sequence
+    /// (or, for a brown dwarf, before it starts to cool).
+    formation_elapsed: f64,
+    /// Core-mass fraction the seed core starts from (the schedule's origin).
+    initial_core_fraction: f64,
 
     particle_buf: Vec<f32>,
     body_buf: Vec<f32>,
@@ -669,6 +688,8 @@ impl Kernel {
             shed_mass: 0.0,
             ejecta_launched: 0,
             remnant_elapsed: 0.0,
+            formation_elapsed: 0.0,
+            initial_core_fraction: core_mass / star_mass,
             particle_buf: Vec::new(),
             body_buf: Vec::new(),
             attractor_buf: Vec::new(),
@@ -714,7 +735,26 @@ impl Kernel {
 
         // Emergent dynamics on the bounded, watchable orbital clock. This grows
         // the accreted core mass, which in turn drives the formation stages.
-        let orbital = orbital_step(dt_sim_seconds);
+        //
+        // While FORMING, the dynamics may not outrun the stellar clock: they are
+        // slowed whenever the core is ahead of the schedule its real formation
+        // timescales allow (exactly 1 — unchanged — at any warp fast enough).
+        let forming_now = (self.stage as u32) <= LifecycleStage::FusionIgnition as u32;
+        if forming_now {
+            // Time and accretion are locked together in BOTH directions: the
+            // clock may not run more than the margin ahead of the core either.
+            // Otherwise a fast warp banked schedule the core had not used yet,
+            // and after slowing down formation surged on to spend it.
+            let ceiling =
+                self.formation_time_for(self.core_fraction) + self.formation_lead_window();
+            self.formation_elapsed = (self.formation_elapsed + dt_sim_seconds).min(ceiling);
+        }
+        let orbital = orbital_step(dt_sim_seconds)
+            * if forming_now {
+                self.formation_throttle()
+            } else {
+                1.0
+            };
         // Orbital time this step actually advanced; also the clock the nebula
         // ages on once the remnant has formed.
         let mut orbital_advanced = 0.0;
@@ -922,6 +962,67 @@ impl Kernel {
             return true;
         }
         self.stage == LifecycleStage::Death && self.compute_stage_progress() >= DEATH_SHOCK_BREAKOUT
+    }
+
+    /// The formation time (sim s) a core fraction `f` corresponds to: the
+    /// formation thresholds (dust cloud → protostar → contraction to ignition)
+    /// laid out over the real stage durations, linearly within each. 0 at or
+    /// below the seed core, the whole formation time once `f` reaches ignition.
+    fn formation_time_for(&self, f: f64) -> f64 {
+        let d = &self.durations;
+        let segments = [
+            (
+                d[LifecycleStage::DustCloud as usize],
+                self.initial_core_fraction.min(PROTOSTAR_CORE_FRACTION),
+                PROTOSTAR_CORE_FRACTION,
+            ),
+            (
+                d[LifecycleStage::ProtostarCoalescence as usize],
+                PROTOSTAR_CORE_FRACTION,
+                FUSION_CORE_FRACTION,
+            ),
+            (
+                d[LifecycleStage::FusionIgnition as usize],
+                FUSION_CORE_FRACTION,
+                IGNITION_CORE_FRACTION,
+            ),
+        ];
+        let mut start = 0.0;
+        for (duration, from, to) in segments {
+            if !duration.is_finite() || duration <= 0.0 {
+                continue;
+            }
+            if f < to {
+                let along = ((f - from) / (to - from).max(f64::EPSILON)).clamp(0.0, 1.0);
+                return start + duration * along;
+            }
+            start += duration;
+        }
+        start
+    }
+
+    /// How far (sim s) the clock may lead the core: a small share of the
+    /// current formation stage's real duration.
+    fn formation_lead_window(&self) -> f64 {
+        let duration = self.durations[self.stage as usize];
+        if duration.is_finite() && duration > 0.0 {
+            FORMATION_LEAD_WINDOW * duration
+        } else {
+            0.0
+        }
+    }
+
+    /// Fraction (0..1) of this step's orbital time formation may use: 1 while
+    /// the clock leads the core by at least half the lead window, falling to 0
+    /// as the core catches up with the time that has actually passed — so
+    /// formation never runs ahead of the stellar clock.
+    fn formation_throttle(&self) -> f64 {
+        let lead = self.formation_elapsed - self.formation_time_for(self.core_fraction);
+        let half_window = 0.5 * self.formation_lead_window();
+        if half_window <= 0.0 {
+            return 1.0;
+        }
+        (lead / half_window).clamp(0.0, 1.0)
     }
 
     /// How much sim time one step may advance the DEATH stage: at most a
@@ -1410,7 +1511,16 @@ impl Kernel {
     fn compute_stage_progress(&self) -> f64 {
         let clamp01 = |v: f64| v.clamp(0.0, 1.0);
         match self.stage {
-            LifecycleStage::DustCloud => clamp01(self.core_fraction / PROTOSTAR_CORE_FRACTION),
+            // Measured from the SEED core the run starts with, not from zero:
+            // otherwise every run began more than half-way through the cloud's
+            // life (~650,000 years on the clock at the very first frame).
+            LifecycleStage::DustCloud => {
+                let origin = self.initial_core_fraction.min(PROTOSTAR_CORE_FRACTION);
+                clamp01(
+                    (self.core_fraction - origin)
+                        / (PROTOSTAR_CORE_FRACTION - origin).max(f64::EPSILON),
+                )
+            }
             LifecycleStage::ProtostarCoalescence => clamp01(
                 (self.core_fraction - PROTOSTAR_CORE_FRACTION)
                     / (FUSION_CORE_FRACTION - PROTOSTAR_CORE_FRACTION),
@@ -2952,7 +3062,7 @@ mod tests {
 
         let mut peak: f64 = 0.0;
         for _ in 0..LIFECYCLE_STEPS {
-            kernel.step(1.0e9);
+            kernel.step(1.0e14);
             peak = peak.max(kernel.star_mass_solar());
             if kernel.stage() >= LifecycleStage::MainSequence as u32 {
                 break;
@@ -2963,7 +3073,7 @@ mod tests {
 
         // However long it runs, the star can never grow past its budget.
         for _ in 0..60 {
-            kernel.step(1.0e9);
+            kernel.step(1.0e14);
             assert!(kernel.star_mass_solar() <= expected + 1e-9);
         }
     }
@@ -3084,7 +3194,14 @@ mod tests {
         // A few hundred frames at a modest warp (~100 yr per step) advance the
         // stellar clock by almost nothing, but the orbital clock is saturated:
         // visitors must arrive at their usual on-screen cadence regardless.
+        // Sampled on the main sequence: formation itself is held to the clock.
         let mut kernel = solar_kernel(1.0, 200);
+        while kernel.stage() < LifecycleStage::MainSequence as u32 {
+            kernel.step(1.0e17);
+        }
+        kernel
+            .bodies
+            .retain(|b| !matches!(b.kind, BodyType::Comet | BodyType::Asteroid));
         let mut seen = false;
         for _ in 0..300 {
             kernel.step(3.0e9);
@@ -3094,6 +3211,89 @@ mod tests {
                 .any(|b| matches!(b.kind, BodyType::Comet | BodyType::Asteroid));
         }
         assert!(seen, "no visitor arrived in 300 saturated orbital steps");
+    }
+
+    #[test]
+    fn formation_never_runs_ahead_of_the_stellar_clock() {
+        // At ~3 yr per frame (the fixed-rate slider's midpoint) 2000 frames are
+        // ~6,000 years: a cloud that really takes a million years to collapse
+        // must have barely begun, and the elapsed clock may not have run ahead
+        // of the time that actually passed.
+        let mut kernel = solar_kernel(1.0, 400);
+        let dt = 3.0 * 365.25 * 86_400.0 / 60.0 * 60.0;
+        for _ in 0..2000 {
+            kernel.step(dt);
+        }
+        assert_eq!(kernel.stage(), LifecycleStage::DustCloud as u32);
+        let passed = 2000.0 * dt;
+        assert!(
+            kernel.elapsed_sim_seconds() <= passed * 1.05 + 1.0,
+            "elapsed {} s after {} s of stellar time",
+            kernel.elapsed_sim_seconds(),
+            passed
+        );
+    }
+
+    #[test]
+    fn formation_is_untouched_at_a_fast_warp() {
+        // Far ahead of schedule, the throttle is exactly 1: the formation the
+        // rest of the suite calibrates on is bit-for-bit what it was.
+        let mut kernel = solar_kernel(1.0, 400);
+        kernel.step(1.0e17);
+        assert_eq!(kernel.formation_throttle(), 1.0);
+        let mut frames = 0;
+        while kernel.stage() < LifecycleStage::MainSequence as u32 && frames < 5000 {
+            kernel.step(1.0e17);
+            frames += 1;
+        }
+        assert!(
+            frames < 2000,
+            "formation took {frames} frames at a fast warp"
+        );
+    }
+
+    #[test]
+    fn slowing_down_mid_formation_does_not_surge_ahead() {
+        // Run fast for a while, then drop to a crawl: the clock may not have
+        // banked formation time the core never used, so the elapsed clock must
+        // follow the NEW rate straight away.
+        let year = 365.25 * 86_400.0;
+        let mut kernel = solar_kernel(1.0, 400);
+        for _ in 0..40 {
+            kernel.step(5_000.0 * year);
+        }
+        let before = kernel.elapsed_sim_seconds();
+        for _ in 0..120 {
+            kernel.step(0.05 * year);
+        }
+        let gained = kernel.elapsed_sim_seconds() - before;
+        assert!(
+            gained <= 120.0 * 0.05 * year * 1.5 + 0.02 * 1.0e6 * year,
+            "elapsed jumped {} yr after slowing to 6 yr of clock time",
+            gained / year
+        );
+    }
+
+    #[test]
+    fn a_slow_clock_slows_formation_in_proportion() {
+        // Formation's real duration fits ~N frames at a given rate; a 10x slower
+        // clock must take roughly 10x as many frames, not the same number.
+        fn frames_to_protostar(dt: f64) -> usize {
+            let mut kernel = solar_kernel(1.0, 400);
+            let mut frames = 0;
+            while kernel.stage() < LifecycleStage::ProtostarCoalescence as u32 && frames < 100_000 {
+                kernel.step(dt);
+                frames += 1;
+            }
+            frames
+        }
+        let year = 365.25 * 86_400.0;
+        let fast = frames_to_protostar(2_000.0 * year);
+        let slow = frames_to_protostar(200.0 * year);
+        assert!(
+            slow as f64 > fast as f64 * 6.0,
+            "10x slower clock: {fast} -> {slow} frames"
+        );
     }
 
     #[test]

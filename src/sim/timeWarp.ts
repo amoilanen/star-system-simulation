@@ -16,8 +16,9 @@
 // Three kinds of stage are paced differently:
 //
 //   - FORMATION is driven by accretion on the kernel's bounded orbital clock,
-//     not by the stellar clock, so it takes the same few seconds whatever the
-//     rate — the rate only has to be high enough to keep that clock saturated.
+//     which the kernel holds to the stellar clock: it never runs ahead of the
+//     real formation timescales, so a stage takes its budget or its natural
+//     accretion time, whichever is longer — and a slow fixed rate really is slow.
 //   - The DEATH is paced by the kernel itself (`DEATH_PHASES.minSteps`) so the
 //     collapse → flash → fireball sequence is always watchable and the ejecta
 //     shell stays in step with the drawn one; the warp only has to be fast
@@ -45,8 +46,13 @@ export const TIME_WARP = {
   deathSeconds: 2,
   /** Wall-clock seconds over which the remnant's nebula span plays at 1×. */
   remnantSeconds: 30,
-  /** Wall-clock budget of each formation stage (accretion-paced; see above). */
-  formationSeconds: 10,
+  /**
+   * Wall-clock budget of each formation stage. The kernel never lets formation
+   * run ahead of the stellar clock, so this is the SHORTEST a formation stage
+   * can take; a stage whose accretion is naturally slower (the protostar, the
+   * contraction to ignition: ~6 s each) takes its natural time instead.
+   */
+  formationSeconds: 3,
   /**
    * Real time a remnant's surroundings take to evolve visibly, in years: a
    * planetary nebula disperses in ~3·10^4 yr, a supernova remnant merges into
@@ -62,8 +68,9 @@ export const TIME_WARP = {
   },
   /**
    * Floor on the warp (yr per real second). Well above the rate at which the
-   * kernel's orbital clock saturates (~30 yr/s at 60 fps), so formation and the
-   * nebula always run at full visual speed even at the slowest setting.
+   * kernel's orbital clock saturates (~30 yr/s at 60 fps), so the orbits, the
+   * death's ejecta and the nebula always run at full visual speed in adaptive
+   * mode, even at the slowest setting.
    */
   minYearsPerSecond: 1000,
   /** Speed setting range: pace 0 → ÷8, pace 0.5 → 1×, pace 1 → ×8. */

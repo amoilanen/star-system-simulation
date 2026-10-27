@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { formatYears, SECONDS_PER_YEAR, simSecondsToYears } from '../../src/sim/timeFormat';
+import {
+  formatWallTime,
+  formatYears,
+  SECONDS_PER_YEAR,
+  simSecondsToYears,
+} from '../../src/sim/timeFormat';
 import { i18n } from '../../src/i18n/i18n';
 
 const en = (years: number): string => formatYears(years, i18n, 'en');
@@ -44,5 +49,17 @@ describe('formatYears (fi)', () => {
     expect(fi(1_200_000_000)).toContain('miljardia');
     expect(fi(1_200_000_000)).toContain('vuotta');
     expect(fi(2_000_000)).toContain('miljoonaa');
+  });
+});
+
+describe('formatWallTime', () => {
+  it('picks a natural wall-clock unit', () => {
+    expect(formatWallTime(40, i18n, 'en')).toBe('40 seconds');
+    expect(formatWallTime(1, i18n, 'en')).toBe('1 second');
+    expect(formatWallTime(150, i18n, 'en')).toBe('3 minutes');
+    expect(formatWallTime(5 * 3600, i18n, 'en')).toBe('5 hours');
+    expect(formatWallTime(4 * 86_400, i18n, 'en')).toBe('4 days');
+    expect(formatWallTime(3 * 365.25 * 86_400, i18n, 'en')).toBe('3 years');
+    expect(formatWallTime(4 * 86_400, i18n, 'fi')).toBe('4 päivää');
   });
 });

@@ -79,6 +79,26 @@ export function paceToRate(
 }
 
 /**
+ * Inverse of {@link paceToRate}: the pace (clamped to [0, 1]) whose fixed rate
+ * is `rate`. Pure; exported for unit testing.
+ */
+export function rateToPace(
+  rate: number,
+  nearRealRate: number,
+  lifecycleSimSeconds: number,
+  fullCycleRealSeconds: number,
+): number {
+  const fastRate = lifecycleSimSeconds / fullCycleRealSeconds;
+  if (!(rate > 0) || !Number.isFinite(rate)) {
+    return 0;
+  }
+  if (nearRealRate <= 0) {
+    return clamp(rate / fastRate, 0, 1);
+  }
+  return clamp(Math.log(rate / nearRealRate) / Math.log(fastRate / nearRealRate), 0, 1);
+}
+
+/**
  * The simulation clock. Owns the current pace, pause state, and accumulated
  * simulation time. The render loop calls {@link advance} with real elapsed
  * seconds each frame and applies the returned sim `dt` to the physics kernel.
@@ -113,6 +133,11 @@ export class Clock {
   /** Switch between the adaptive warp and a fixed rate. */
   setMode(mode: TimeMode): void {
     this.modeValue = mode;
+  }
+
+  /** The pace whose FIXED rate is `rate` (inverse of the fixed mapping). */
+  paceForFixedRate(rate: number): number {
+    return rateToPace(rate, this.nearRealRate, this.lifecycleSimSeconds, this.fullCycleRealSeconds);
   }
 
   /**

@@ -64,6 +64,9 @@ export const HISTORY_CAPACITY = 240;
  */
 export const REWIND_FRAMES_PER_SECOND = 4 / HISTORY_SNAPSHOT_INTERVAL;
 
+/** Smoothing time constant (real s) of the measured ageing rate. */
+const RATE_SMOOTHING_SECONDS = 0.5;
+
 /** Options for constructing a {@link SimulationRunner}. */
 export interface SimulationRunnerOptions {
   /** Pre-built clock (primarily for deterministic tests). */
@@ -111,6 +114,10 @@ export class SimulationRunner {
   private readonly stellarMass: number;
   /** Real duration (sim seconds) of every stage of this star's life. */
   private readonly durations: Readonly<Record<LifecycleStage, number>>;
+  /** Speed-multiplier pace to restore when the adaptive warp is turned back on. */
+  private adaptivePace: number;
+  /** Smoothed measured ageing rate (see {@link effectiveRate}). */
+  private measuredRate = 0;
   /** The stage "skip to next stage" is fast-forwarding through, if any. */
   private skipping: LifecycleStage | null = null;
   /**
@@ -164,6 +171,7 @@ export class SimulationRunner {
     this.supernova = fate.supernova;
     this.starMass = this.stellarMass;
     this.durations = stageDurations(this.stellarMass, config.composition);
+    this.adaptivePace = this.clock.pace;
 
     this.kernel.init({ config, particleCount: this.particleCount });
   }
@@ -217,6 +225,12 @@ export class SimulationRunner {
     const simDt = this.clock.advance(realDtSeconds);
     const { events, stage, stageProgress, elapsedSimSeconds, starMassSolar } =
       this.kernel.step(simDt);
+    if (dt > 0 && simDt > 0) {
+      const instant = Math.max(0, elapsedSimSeconds - this.elapsed) / dt;
+      const alpha = 1 - Math.exp(-dt / RATE_SMOOTHING_SECONDS);
+      this.measuredRate =
+        this.measuredRate > 0 ? this.measuredRate + alpha * (instant - this.measuredRate) : instant;
+    }
     this.stage = stage;
     this.liveStage = stage;
     this.progress = stageProgress;
@@ -333,7 +347,36 @@ export class SimulationRunner {
 
   /** Switch between the adaptive warp and a fixed rate (HUD toggle). */
   setTimeMode(mode: TimeMode): void {
-    this.clock.setMode(mode);
+    if (mode === this.clock.mode) {
+      return;
+    }
+    if (mode === 'fixed') {
+      // Turning the warp OFF freezes it at the rate it is running at right
+      // now (it stops adapting between stages) instead of jumping to whatever
+      // the slider position happens to mean on the fixed scale.
+      this.adaptivePace = this.clock.pace;
+      const rate = this.clock.currentRate();
+      this.clock.setMode('fixed');
+      this.clock.setPace(this.clock.paceForFixedRate(rate));
+    } else {
+      // Back on: the slider is a speed multiplier again, where the user left it.
+      this.clock.setMode('adaptive');
+      this.clock.setPace(this.adaptivePace);
+      this.updateWarp();
+    }
+  }
+
+  /**
+   * The rate the system is ACTUALLY ageing at (sim s per real s), measured
+   * from the elapsed clock and smoothed over ~½ s. It can differ from the
+   * clock's nominal rate — formation and the death are paced by the kernel —
+   * so this, not the nominal rate, is the honest speed readout.
+   */
+  get effectiveRate(): number {
+    // Never above the rate the clock is set to: the system cannot age faster
+    // than time passes, and this makes the readout follow a slow-down at once
+    // instead of decaying through the smoothing.
+    return Math.min(this.measuredRate, this.clock.currentRate());
   }
 
   /** Whether the current stage can be fast-forwarded right now. */
@@ -411,6 +454,7 @@ export class SimulationRunner {
     this.liveStage = LifecycleStage.DustCloud;
     this.progress = 0;
     this.elapsed = 0;
+    this.measuredRate = 0;
     this.starMass = 0;
     this.history.clear();
     this.rewinding = false;

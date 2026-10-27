@@ -12,7 +12,11 @@
 // This module is DOM/Three.js-heavy and validated visually via `npm run dev`;
 // the loop orchestration it wires is unit-tested through {@link SimulationRunner}.
 
-import { RemnantType, type LifecycleStage } from '../config/fateModel';
+import {
+  LifecycleStage as LifecycleStageEnum,
+  RemnantType,
+  type LifecycleStage,
+} from '../config/fateModel';
 import type { Locale, SimulationConfig } from '../config/SimulationConfig';
 import { i18n as sharedI18n, type I18n } from '../i18n/i18n';
 import { BODY_OFFSET, BODY_STRIDE, BodyType } from '../sim/PhysicsKernel';
@@ -161,7 +165,7 @@ export class RunScreen {
       initialOrbits: false,
       // Time: the adaptive warp is on by default; skip fast-forwards a long stage.
       onSkipStage: () => this.handleSkipStage(),
-      onToggleAutoWarp: (enabled) => this.runner?.setTimeMode(enabled ? 'adaptive' : 'fixed'),
+      onToggleAutoWarp: (enabled) => this.handleToggleAutoWarp(enabled),
       initialAutoWarp: this.runner.timeMode === 'adaptive',
       // Clicking a phase already lived through jumps back to its start.
       onSeekStage: (stage) => this.runner?.seekToStage(stage),
@@ -253,7 +257,15 @@ export class RunScreen {
       // real formation timescales, and the rewound timestamp while scrubbing),
       // NOT the raw pace-scaled clock.
       hud.setElapsedYears(simSecondsToYears(elapsed));
-      hud.setSpeedYearsPerSecond(simSecondsToYears(runner.clock.currentRate()));
+      // The speed shown is the rate the system is ACTUALLY ageing at while it
+      // runs live (formation and the death are paced by the kernel, so it can
+      // differ from the clock's nominal rate); paused or replaying, it is the
+      // rate the clock is set to.
+      const live = !runner.isReplaying && !runner.paused;
+      const rate =
+        live && runner.effectiveRate > 0 ? runner.effectiveRate : runner.clock.currentRate();
+      hud.setSpeedYearsPerSecond(simSecondsToYears(rate));
+      hud.setStageEta(this.stageEta(runner, state));
       hud.setReachedStage(runner.reachedStage);
       hud.setTimeline(
         timelineView(
@@ -349,6 +361,36 @@ export class RunScreen {
   private applyFocus(value: string): void {
     this.hud?.setFocusValue(value);
     this.handleFocusChange(value);
+  }
+
+  /** Turn the adaptive warp on/off; the slider follows the re-mapped pace. */
+  private handleToggleAutoWarp(enabled: boolean): void {
+    const runner = this.runner;
+    if (runner === null) {
+      return;
+    }
+    runner.setTimeMode(enabled ? 'adaptive' : 'fixed');
+    this.hud?.setPace(runner.clock.pace);
+  }
+
+  /**
+   * In fixed mode, how long (real seconds) the current stage will still take
+   * at this rate; null in adaptive mode (every stage then has its budget), in
+   * the kernel-paced death, while replaying, or for the endless remnant.
+   */
+  private stageEta(runner: SimulationRunner, state: RenderState): number | null {
+    if (runner.timeMode !== 'fixed' || runner.isReplaying) {
+      return null;
+    }
+    if (state.stage === LifecycleStageEnum.Death) {
+      return null;
+    }
+    const duration = runner.stageDurations[state.stage];
+    const rate = runner.clock.currentRate();
+    if (!Number.isFinite(duration) || !(rate > 0)) {
+      return null;
+    }
+    return (duration * (1 - Math.min(1, Math.max(0, state.stageProgress)))) / rate;
   }
 
   /** Start/stop rewinding (HUD button / R key). */

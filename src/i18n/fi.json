@@ -131,7 +131,7 @@
   "info.brownDwarfCompanion.desc": "Seuralainen, joka syntyi liian kevyenä fuusioimaan vetyä. Se polttaa deuteriumia, hehkuu tummanpunaisena infrapunassa ja vain jäähtyy järjestelmän loppuun asti — tähti, joka ei koskaan käynnistynyt.",
   "info.note.noPlanets": "Tässä pilvessä ei ole raskaampia alkuaineita, joten kiekosta ei tiivisty mitään kiinteää: ei kiveä, ei jäätä eikä siis lainkaan planeettoja.",
   "hud.autoWarp": "Automaattinen aikakiihdytys",
-  "hud.autoWarpHint": "Jokainen vaihe tiivistetään seurattavan mittaiseksi — pääsarja kestää noin 45 s, kesti se todellisuudessa 3 miljoonaa tai 3 biljoonaa vuotta. Aikaskaalan liukusäädin nopeuttaa tai hidastaa tätä. Poista valinta, niin koko ajo etenee yhdellä kiinteällä nopeudella.",
+  "hud.autoWarpHint": "Päällä: jokainen vaihe tiivistetään seurattavan mittaiseksi — pääsarja kestää noin 45 s, kesti se todellisuudessa 3 miljoonaa tai 3 biljoonaa vuotta — ja nopeussäädin nopeuttaa tai hidastaa tätä. Pois: nykyinen nopeus jäädytetään ja säädin asettaa yhden kiinteän nopeuden lopuksi ajoa.",
   "hud.skip": "Siirry seuraavaan vaiheeseen",
   "hud.skipHint": "Kelaa tämän vaiheen loppuun (N)",
   "hud.orbitNote": "Rataliike näytetään havainnollistavalla nopeudella, ei yllä olevassa aikaskaalassa.",
@@ -157,5 +157,10 @@
   "hud.replaying": "▶ Toisto — kurotaan kiinni",
   "hud.rewindHint": "Kelaa taaksepäin koko ajon läpi (R). Voit myös napsauttaa aikajanan vaihetta hypätäksesi siihen.",
   "hud.group.playback": "Toisto",
-  "hud.group.view": "Näkymä"
+  "hud.group.view": "Näkymä",
+  "hud.timeline.eta": "— tällä nopeudella noin {time}",
+  "wall.seconds": "{count, plural, one {# sekunti} other {# sekuntia}}",
+  "wall.minutes": "{count, plural, one {# minuutti} other {# minuuttia}}",
+  "wall.hours": "{count, plural, one {# tunti} other {# tuntia}}",
+  "wall.days": "{count, plural, one {# päivä} other {# päivää}}"
 }

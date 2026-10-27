@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   Clock,
   paceToRate,
+  rateToPace,
   DEFAULT_NEAR_REAL_RATE,
   DEFAULT_LIFECYCLE_SIM_SECONDS,
   DEFAULT_FULL_CYCLE_REAL_SECONDS,
@@ -154,5 +155,25 @@ describe('Clock adaptive mode', () => {
     clock.pause();
     expect(clock.advance(1)).toBe(0);
     expect(clock.simSecondsPerRealSecond()).toBe(0);
+  });
+});
+
+describe('rateToPace', () => {
+  it('inverts the fixed pace mapping', () => {
+    const fast = DEFAULT_LIFECYCLE_SIM_SECONDS / DEFAULT_FULL_CYCLE_REAL_SECONDS;
+    for (const pace of [0, 0.2, 0.5, 0.83, 1]) {
+      const rate = paceToRate(
+        pace,
+        1,
+        DEFAULT_LIFECYCLE_SIM_SECONDS,
+        DEFAULT_FULL_CYCLE_REAL_SECONDS,
+      );
+      expect(
+        rateToPace(rate, 1, DEFAULT_LIFECYCLE_SIM_SECONDS, DEFAULT_FULL_CYCLE_REAL_SECONDS),
+      ).toBeCloseTo(pace, 9);
+    }
+    // Out-of-range rates clamp to the slider's ends.
+    expect(rateToPace(fast * 100, 1, DEFAULT_LIFECYCLE_SIM_SECONDS, 60)).toBe(1);
+    expect(rateToPace(0, 1, DEFAULT_LIFECYCLE_SIM_SECONDS, 60)).toBe(0);
   });
 });

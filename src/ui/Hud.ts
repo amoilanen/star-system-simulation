@@ -14,7 +14,7 @@
 import { LifecycleStage } from '../config/fateModel';
 import type { Locale } from '../config/SimulationConfig';
 import { i18n as sharedI18n, type I18n, type MessageParams } from '../i18n/i18n';
-import { formatYears } from '../sim/timeFormat';
+import { formatWallTime, formatYears } from '../sim/timeFormat';
 import { UNIVERSE_AGE_YEARS } from '../sim/stages';
 import type { TimelineView } from './timeline';
 
@@ -143,6 +143,8 @@ export class Hud {
   private skipButton: HTMLButtonElement | null = null;
   private autoWarpInput: HTMLInputElement | null = null;
   private timeline: TimelineView | null = null;
+  /** Wall-clock seconds the current stage will still take (fixed mode), if known. */
+  private stageEta: number | null = null;
   /** Hover/focus legend describing one timeline segment. */
   private readonly legend: HTMLDivElement;
   /** The stage the legend is currently describing, if it is open. */
@@ -483,6 +485,20 @@ export class Hud {
   }
 
   /** Update the current speed readout (sim years per real second). */
+  /** Move the speed slider (e.g. when the warp mode re-maps it), silently. */
+  setPace(pace: number): void {
+    this.paceInput.value = String(Math.min(1, Math.max(0, pace)));
+  }
+
+  /**
+   * How long (real seconds) the current stage will still take at the current
+   * fixed rate, or null to hide it. Shown in the timeline caption, so a slow
+   * fixed rate is never mistaken for a stalled simulation.
+   */
+  setStageEta(seconds: number | null): void {
+    this.stageEta = seconds !== null && Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+  }
+
   setSpeedYearsPerSecond(yearsPerSecond: number): void {
     this.speedYearsPerSecond = yearsPerSecond;
     this.speedLabel.textContent = this.t('hud.speed', {
@@ -637,13 +653,18 @@ export class Hud {
     if (current === undefined) {
       return '';
     }
-    const text = this.segmentTitle(current.stage, view.currentYears);
-    if (!view.beyondUniverseAge) {
-      return text;
+    let text = this.segmentTitle(current.stage, view.currentYears);
+    if (view.beyondUniverseAge) {
+      text += ` ${this.t('hud.timeline.beyondUniverse', {
+        age: formatYears(UNIVERSE_AGE_YEARS, this.i18n, this.locale),
+      })}`;
     }
-    return `${text} ${this.t('hud.timeline.beyondUniverse', {
-      age: formatYears(UNIVERSE_AGE_YEARS, this.i18n, this.locale),
-    })}`;
+    if (this.stageEta !== null) {
+      text += ` ${this.t('hud.timeline.eta', {
+        time: formatWallTime(this.stageEta, this.i18n, this.locale),
+      })}`;
+    }
+    return text;
   }
 
   /** Replace the body-focus options (star + free camera are always kept). */

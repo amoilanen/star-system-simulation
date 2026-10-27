@@ -69,3 +69,25 @@ export function formatYears(years: number, i18n: I18n, locale: Locale): string {
     unit: i18n.translate(locale, 'time.year', { count: rounded }),
   });
 }
+
+/** Wall-clock unit breakpoints (seconds), largest first, with their i18n ids. */
+const WALL_UNITS: ReadonlyArray<{ seconds: number; id: string }> = [
+  { seconds: 86_400, id: 'wall.days' },
+  { seconds: 3_600, id: 'wall.hours' },
+  { seconds: 60, id: 'wall.minutes' },
+  { seconds: 1, id: 'wall.seconds' },
+];
+
+/**
+ * Format a REAL (wall-clock) duration — how long something will take to watch —
+ * as e.g. "40 seconds", "3 hours", "12 days", or in years beyond a year.
+ */
+export function formatWallTime(seconds: number, i18n: I18n, locale: Locale): string {
+  const s = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+  if (s >= 365.25 * 86_400) {
+    return formatYears(s / SECONDS_PER_YEAR, i18n, locale);
+  }
+  const unit = WALL_UNITS.find((u) => s >= u.seconds) ?? WALL_UNITS[WALL_UNITS.length - 1]!;
+  const count = Math.max(1, Math.round(s / unit.seconds));
+  return i18n.translate(locale, unit.id, { count });
+}

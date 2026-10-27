@@ -29,7 +29,8 @@ post-processing).
   **Skip to next stage** (or `N`) fast-forwards a long stage. A HUD timeline shows where the
   system is in its life and how long the current stage _really_ lasts; milestones are dated
   with the system's age; hover a phase on the timeline for its legend. Untick _Auto
-  time-warp_ for one fixed rate for the whole run.
+  time-warp_ to freeze the current rate; the slider then sets one fixed rate, which every phase
+  — formation included — honours (the caption says how long the phase will take at it).
 - **Pause & rewind** — pause with `Space`; rewind (`R`) runs back through the whole run to
   the dust cloud and stops there; click any phase already reached on the timeline to jump to
   its start. Zoom with the transparent +/− buttons (or `+`/`-`).

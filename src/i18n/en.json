@@ -131,7 +131,7 @@
   "info.brownDwarfCompanion.desc": "A companion that formed too light to ever fuse hydrogen. It burns deuterium, glows a dull infrared red, and will simply cool for the rest of the system's life — a star that never quite started.",
   "info.note.noPlanets": "This cloud contains no heavier elements, so nothing solid can condense out of the disk: no rock, no ice, and therefore no planets at all.",
   "hud.autoWarp": "Auto time-warp",
-  "hud.autoWarpHint": "Each stage is compressed to a watchable length — a main sequence takes about 45 s whether it really lasts 3 million or 3 trillion years. The time-scale slider speeds that up or slows it down. Untick for one fixed rate for the whole run.",
+  "hud.autoWarpHint": "On: each stage is compressed to a watchable length — a main sequence takes about 45 s whether it really lasts 3 million or 3 trillion years — and the speed slider speeds that up or slows it down. Off: the current rate is frozen and the slider sets one fixed rate for the rest of the run.",
   "hud.skip": "Skip to next stage",
   "hud.skipHint": "Fast-forward through the rest of this stage (N)",
   "hud.orbitNote": "Orbital motion is shown at an illustrative speed, not on the time scale above.",
@@ -157,5 +157,10 @@
   "hud.replaying": "▶ Replay — catching up",
   "hud.rewindHint": "Rewind through the whole run (R). You can also click a phase on the timeline to jump to it.",
   "hud.group.playback": "Playback",
-  "hud.group.view": "View"
+  "hud.group.view": "View",
+  "hud.timeline.eta": "— about {time} at this speed",
+  "wall.seconds": "{count, plural, one {# second} other {# seconds}}",
+  "wall.minutes": "{count, plural, one {# minute} other {# minutes}}",
+  "wall.hours": "{count, plural, one {# hour} other {# hours}}",
+  "wall.days": "{count, plural, one {# day} other {# days}}"
 }

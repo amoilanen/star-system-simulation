@@ -406,4 +406,22 @@ describe('Hud control grouping', () => {
     hud.setPaused(false);
     expect(play.dataset.icon).not.toBe(pausedIcon);
   });
+
+  it('moves the speed slider silently and shows the fixed-rate time to finish', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const { hud, callbacks } = makeHud(container);
+    hud.setPace(0.8);
+    const slider = container.querySelector('input[type="range"]') as HTMLInputElement;
+    expect(Number(slider.value)).toBeCloseTo(0.8, 9);
+    expect(callbacks.onPaceChange).not.toHaveBeenCalled();
+    hud.setStageEta(4 * 86_400);
+    hud.setTimeline(timelineView(LifecycleStage.DustCloud, 0.1, stageDurations(1, SOLAR), false));
+    expect(container.querySelector('.hud-timeline__caption')!.textContent).toContain(
+      i18n.translate('en', 'hud.timeline.eta', { time: '4 days' }),
+    );
+    hud.setStageEta(null);
+    hud.setTimeline(timelineView(LifecycleStage.DustCloud, 0.1, stageDurations(1, SOLAR), false));
+    expect(container.querySelector('.hud-timeline__caption')!.textContent).not.toContain('4 days');
+  });
 });

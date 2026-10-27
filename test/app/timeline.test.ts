@@ -101,4 +101,43 @@ describeWasm('adaptive timeline (WASM kernel)', () => {
     expect(runner.clock.currentRate()).toBe(before);
     runner.dispose();
   }, 60000);
+
+  it('turning the warp off freezes the CURRENT rate instead of jumping', async () => {
+    const mod = await loadModule();
+    const runner = new SimulationRunner(configFromPreset('sun-like'), new WasmKernel(mod), {
+      particleCount: 300,
+    });
+    for (let i = 0; i < 30; i += 1) {
+      runner.tick(1 / FPS);
+    }
+    const adaptive = runner.clock.currentRate();
+    runner.setTimeMode('fixed');
+    expect(runner.clock.currentRate() / adaptive).toBeCloseTo(1, 6);
+    // …and back on, the slider is the speed multiplier where it was left.
+    runner.setTimeMode('adaptive');
+    expect(runner.clock.pace).toBe(configFromPreset('sun-like').pace);
+    runner.dispose();
+  }, 60000);
+
+  it('a slow fixed rate really slows formation, and the clock reads true', async () => {
+    const mod = await loadModule();
+    const runner = new SimulationRunner(configFromPreset('sun-like'), new WasmKernel(mod), {
+      particleCount: 300,
+    });
+    runner.setTimeMode('fixed');
+    runner.setPace(0.5); // ~3 years per second
+    const rate = runner.clock.currentRate();
+    for (let i = 0; i < 20 * FPS; i += 1) {
+      runner.tick(1 / FPS);
+    }
+    // 20 s at ~3 yr/s is ~60 years: a million-year dust cloud has barely begun.
+    expect(runner.currentStage).toBe(LifecycleStage.DustCloud);
+    // (Allowing ~1,000 yr for the kernel's lock granularity; before the fix this
+    // read hundreds of thousands of years.)
+    const year = 365.25 * 86_400;
+    expect(runner.elapsedSimSeconds).toBeLessThanOrEqual(rate * 20 * 1.1 + 1_000 * year);
+    // The readout is the measured ageing rate, which cannot exceed the clock.
+    expect(runner.effectiveRate).toBeLessThanOrEqual(rate * 1.1);
+    runner.dispose();
+  }, 60000);
 });
