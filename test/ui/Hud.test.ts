@@ -361,3 +361,49 @@ describe('Hud phase legend, seeking, zoom and playback badge', () => {
     expect(badge.hidden).toBe(true);
   });
 });
+
+describe('Hud control grouping', () => {
+  beforeEach(() => {
+    document.body.replaceChildren();
+  });
+
+  it('keeps every time control in one Playback group, and New system out of it', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    makeHud(container, {
+      onToggleRewind: vi.fn(),
+      onSkipStage: vi.fn(),
+      onToggleAutoWarp: vi.fn(),
+      onToggleOrbits: vi.fn(),
+    });
+    const groups = [...container.querySelectorAll<HTMLElement>('.hud-group')];
+    const playback = groups.find((g) =>
+      g.textContent?.startsWith(i18n.translate('en', 'hud.group.playback')),
+    )!;
+    expect(playback).toBeTruthy();
+    const labels = [...playback.querySelectorAll('button')].map((b) => b.textContent);
+    // Media-player order: rewind · play/pause · skip.
+    expect(labels).toEqual([
+      i18n.translate('en', 'hud.rewind'),
+      i18n.translate('en', 'hud.pause'),
+      i18n.translate('en', 'hud.skip'),
+    ]);
+    expect(playback.querySelector('input[type="range"]')).not.toBeNull();
+    expect(playback.textContent).toContain(i18n.translate('en', 'hud.autoWarp'));
+    expect(playback.textContent).not.toContain(i18n.translate('en', 'hud.reset'));
+    // The view toggles have their own group.
+    const view = groups.find((g) => g !== playback)!;
+    expect(view.textContent).toContain(i18n.translate('en', 'hud.orbits'));
+    expect(view.querySelector('.hud-focus')).not.toBeNull();
+  });
+
+  it('swaps the play/pause glyph with the state', () => {
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const { hud } = makeHud(container);
+    const play = container.querySelector('.hud-play') as HTMLButtonElement;
+    const pausedIcon = (hud.setPaused(true), play.dataset.icon);
+    hud.setPaused(false);
+    expect(play.dataset.icon).not.toBe(pausedIcon);
+  });
+});

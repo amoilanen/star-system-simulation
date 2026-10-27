@@ -25,8 +25,8 @@
   "hud.resume": "Jatka",
   "hud.rewind": "Kelaa taaksepäin",
   "hud.rewindStop": "Lopeta kelaus",
-  "hud.reset": "Nollaa",
-  "hud.timeScale": "Aikaskaala",
+  "hud.reset": "Uusi järjestelmä",
+  "hud.timeScale": "Nopeus",
   "hud.zoomIn": "Lähennä",
   "hud.zoomOut": "Loitonna",
   "hud.focus": "Kohdista",
@@ -114,7 +114,7 @@
   "info.blackHole.title": "Musta aukko",
   "info.blackHole.desc": "Hyvin massiivisen tähden luhistunut ydin, niin tiheä ettei edes valo pääse pakoon. Näkyvissä on tapahtumahorisonttia kiertävä hehkuva kertymäkiekko, ei itse kohde.",
   "hud.paused": "PYSÄYTETTY",
-  "hud.pauseHint": "Välilyönti",
+  "hud.pauseHint": "Keskeytä tai jatka (välilyönti)",
   "event.supernova": "Ydin luhistuu ja tähti repii itsensä kappaleiksi supernovassa — hetken ajan kirkkaampana kuin koko galaksi.",
   "event.planetaryNebula": "Tähti työntää ulkokerroksensa hitaasti hehkuvaksi planetaariseksi sumuksi ja paljastaa polttavan ytimensä.",
   "remnant.brownDwarf": "ruskea kääpiö",
@@ -133,7 +133,7 @@
   "hud.autoWarp": "Automaattinen aikakiihdytys",
   "hud.autoWarpHint": "Jokainen vaihe tiivistetään seurattavan mittaiseksi — pääsarja kestää noin 45 s, kesti se todellisuudessa 3 miljoonaa tai 3 biljoonaa vuotta. Aikaskaalan liukusäädin nopeuttaa tai hidastaa tätä. Poista valinta, niin koko ajo etenee yhdellä kiinteällä nopeudella.",
   "hud.skip": "Siirry seuraavaan vaiheeseen",
-  "hud.skipHint": "N",
+  "hud.skipHint": "Kelaa tämän vaiheen loppuun (N)",
   "hud.orbitNote": "Rataliike näytetään havainnollistavalla nopeudella, ei yllä olevassa aikaskaalassa.",
   "hud.timeline.lasts": "{stage}: kestää {time}",
   "hud.timeline.forever": "{stage}: tästä eteenpäin ikuisesti",
@@ -155,5 +155,7 @@
   "hud.pausedPast": "Pysäytetty · menneisyydessä",
   "hud.rewinding": "◀◀ Kelataan",
   "hud.replaying": "▶ Toisto — kurotaan kiinni",
-  "hud.rewindHint": "R — taaksepäin koko ajon läpi; napsauta aikajanan mennyttä vaihetta hypätäksesi siihen"
+  "hud.rewindHint": "Kelaa taaksepäin koko ajon läpi (R). Voit myös napsauttaa aikajanan vaihetta hypätäksesi siihen.",
+  "hud.group.playback": "Toisto",
+  "hud.group.view": "Näkymä"
 }

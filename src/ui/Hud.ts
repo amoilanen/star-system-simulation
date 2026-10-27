@@ -89,6 +89,19 @@ export interface HudOptions {
   onSeekStage?: (stage: LifecycleStage) => void;
 }
 
+/**
+ * Transport glyphs, drawn by CSS (`::before { content: attr(data-icon) }`) so
+ * the buttons' text stays the plain translated label. U+FE0E asks for the
+ * monochrome text presentation rather than a colour emoji.
+ */
+const ICONS = {
+  rewind: '\u23EA\uFE0E',
+  play: '\u25B6\uFE0E',
+  pause: '\u23F8\uFE0E',
+  skip: '\u23ED\uFE0E',
+  stop: '\u23F9\uFE0E',
+} as const;
+
 /** Focus values always present regardless of the current bodies. */
 export const FOCUS_STAR = 'star';
 export const FOCUS_NONE = 'none';
@@ -103,6 +116,8 @@ export class Hud {
   private readonly i18n: I18n;
   private locale: Locale;
   private readonly root: HTMLDivElement;
+  /** Where the control helpers (`button`, `field`, `checkbox`) append to. */
+  private mount: HTMLElement;
 
   private readonly pauseButton: HTMLButtonElement;
   /** Big, unmissable "PAUSED" badge shown while the simulation is frozen. */
@@ -156,6 +171,7 @@ export class Hud {
 
     this.root = document.createElement('div');
     this.root.className = 'hud';
+    this.mount = this.root;
 
     // Pause indicator. The pause CONTROL existed before, but nothing on screen
     // confirmed the state, so a paused run was indistinguishable from a stalled
@@ -192,7 +208,10 @@ export class Hud {
     this.bodyCountLabel.className = 'hud-body-count';
     this.elapsedLabel = document.createElement('div');
     this.elapsedLabel.className = 'hud-elapsed';
-    this.root.append(this.stageLabel, this.bodyCountLabel, this.elapsedLabel);
+    const status = document.createElement('div');
+    status.className = 'hud-status';
+    status.append(this.stageLabel, this.bodyCountLabel, this.elapsedLabel);
+    this.root.appendChild(status);
 
     // Timeline: where the system is in its whole life, and how long the stage
     // it is in REALLY lasts (the on-screen time is compressed; this says by how
@@ -242,7 +261,55 @@ export class Hud {
     timeline.append(this.timelineStrip, this.legend, this.timelineCaption, orbitNote);
     this.root.appendChild(timeline);
 
-    // Time-scale slider.
+    // Reset leaves the run for the setup screen, so it lives with the status
+    // readouts — well away from the transport buttons it used to sit between.
+    this.mount = status;
+    const reset = this.button('hud.reset', options.onReset);
+    reset.className = 'hud-reset';
+
+    const controls = document.createElement('div');
+    controls.className = 'hud-controls';
+    this.root.appendChild(controls);
+
+    // ---- Playback: everything that controls TIME, in one group. ------------
+    // Transport buttons first (rewind · play/pause · skip, the media-player
+    // order), the speed controls right under them.
+    const playback = this.group(controls, 'hud.group.playback');
+    const transport = document.createElement('div');
+    transport.className = 'hud-transport';
+    playback.appendChild(transport);
+    this.mount = transport;
+
+    // Rewind toggle: scrub backwards through recorded history, then resume.
+    const onToggleRewind = options.onToggleRewind;
+    if (onToggleRewind !== undefined) {
+      this.rewindButton = this.button('hud.rewind', () => {
+        this.setRewinding(!this.rewinding);
+        onToggleRewind(this.rewinding);
+      });
+      this.rewindButton.dataset.icon = ICONS.rewind;
+      this.titles.set(this.rewindButton, 'hud.rewindHint');
+    }
+    // Play/pause: the primary control, so the largest and most prominent.
+    this.pauseButton = this.button('hud.pause', options.onTogglePause);
+    this.pauseButton.classList.add('hud-play');
+    this.pauseButton.dataset.icon = ICONS.pause;
+    this.titles.set(this.pauseButton, 'hud.pauseHint');
+    const onSkipStage = options.onSkipStage;
+    if (onSkipStage !== undefined) {
+      this.skipButton = this.button('hud.skip', onSkipStage);
+      this.skipButton.classList.add('hud-skip');
+      this.skipButton.dataset.icon = ICONS.skip;
+      this.skipButton.disabled = true;
+      this.titles.set(this.skipButton, 'hud.skipHint');
+    }
+
+    const speedRow = document.createElement('div');
+    speedRow.className = 'hud-group__row';
+    playback.appendChild(speedRow);
+    this.mount = speedRow;
+
+    // Speed slider + the rate it currently gives (sim years per real second).
     const paceField = this.field('hud.timeScale');
     this.paceInput = document.createElement('input');
     this.paceInput.type = 'range';
@@ -254,8 +321,6 @@ export class Hud {
       options.onPaceChange(Number(this.paceInput.value));
     });
     paceField.appendChild(this.paceInput);
-
-    // Current-speed readout (years of sim time per real second).
     this.speedLabel = document.createElement('span');
     this.speedLabel.className = 'hud-speed';
     paceField.appendChild(this.speedLabel);
@@ -272,27 +337,13 @@ export class Hud {
         this.titles.set(wrapper, 'hud.autoWarpHint');
       }
     }
-    const onSkipStage = options.onSkipStage;
-    if (onSkipStage !== undefined) {
-      this.skipButton = this.button('hud.skip', onSkipStage);
-      this.skipButton.className = 'hud-skip';
-      this.skipButton.disabled = true;
-      this.titles.set(this.skipButton, 'hud.skipHint');
-    }
 
-    // Transport + zoom buttons. The pause button also advertises its shortcut.
-    this.pauseButton = this.button('hud.pause', options.onTogglePause);
-    this.pauseButton.title = this.t('hud.pauseHint');
-    // Rewind toggle: scrub backwards through recorded history, then resume.
-    const onToggleRewind = options.onToggleRewind;
-    if (onToggleRewind !== undefined) {
-      this.rewindButton = this.button('hud.rewind', () => {
-        this.setRewinding(!this.rewinding);
-        onToggleRewind(this.rewinding);
-      });
-      this.titles.set(this.rewindButton, 'hud.rewindHint');
-    }
-    this.button('hud.reset', options.onReset);
+    // ---- View: what is drawn and where the camera looks. -------------------
+    const view = this.group(controls, 'hud.group.view');
+    const viewRow = document.createElement('div');
+    viewRow.className = 'hud-group__row';
+    view.appendChild(viewRow);
+    this.mount = viewRow;
 
     // Orbit-path overlay toggle (planets, asteroids and comets).
     const onToggleOrbits = options.onToggleOrbits;
@@ -320,6 +371,7 @@ export class Hud {
       options.onFocusChange(this.focusSelect.value);
     });
     focusField.appendChild(this.focusSelect);
+    this.mount = this.root;
 
     this.renderFocusOptions();
     this.applyTranslations();
@@ -350,6 +402,7 @@ export class Hud {
     this.translatables.set(this.pauseButton, paused ? 'hud.resume' : 'hud.pause');
     this.pauseButton.textContent = this.t(paused ? 'hud.resume' : 'hud.pause');
     this.pauseButton.classList.toggle('hud-button--active', paused);
+    this.pauseButton.dataset.icon = paused ? ICONS.play : ICONS.pause;
     this.renderBadge();
   }
 
@@ -398,6 +451,7 @@ export class Hud {
     this.translatables.set(button, id);
     button.textContent = this.t(id);
     button.classList.toggle('hud-button--active', rewinding);
+    button.dataset.icon = rewinding ? ICONS.stop : ICONS.rewind;
     this.renderBadge();
   }
 
@@ -639,7 +693,6 @@ export class Hud {
     if (this.timeline !== null) {
       this.setTimeline(this.timeline);
     }
-    this.pauseButton.title = this.t('hud.pauseHint');
     this.setPaused(this.paused);
     this.setStage(this.stage);
     this.setBodyCount(this.bodyCount);
@@ -652,6 +705,21 @@ export class Hud {
     return this.i18n.translate(this.locale, messageId, params ?? {});
   }
 
+  /** A captioned, boxed group of related controls (e.g. "Playback"). */
+  private group(parent: HTMLElement, captionId: string): HTMLElement {
+    const group = document.createElement('div');
+    group.className = 'hud-group';
+    group.setAttribute('role', 'group');
+    const caption = document.createElement('div');
+    caption.className = 'hud-group__caption';
+    caption.id = `hud-group-${Math.random().toString(36).slice(2, 9)}`;
+    this.translatables.set(caption, captionId);
+    group.setAttribute('aria-labelledby', caption.id);
+    group.appendChild(caption);
+    parent.appendChild(group);
+    return group;
+  }
+
   private field(labelId: string): HTMLElement {
     const wrapper = document.createElement('label');
     wrapper.className = 'hud-field';
@@ -659,7 +727,7 @@ export class Hud {
     label.className = 'hud-field__label';
     this.translatables.set(label, labelId);
     wrapper.appendChild(label);
-    this.root.appendChild(wrapper);
+    this.mount.appendChild(wrapper);
     return wrapper;
   }
 
@@ -683,7 +751,7 @@ export class Hud {
     caption.className = 'hud-field__label';
     this.translatables.set(caption, labelId);
     wrapper.append(input, caption);
-    this.root.appendChild(wrapper);
+    this.mount.appendChild(wrapper);
     return input;
   }
 
@@ -692,7 +760,7 @@ export class Hud {
     button.type = 'button';
     this.translatables.set(button, labelId);
     button.addEventListener('click', onClick);
-    this.root.appendChild(button);
+    this.mount.appendChild(button);
     return button;
   }
 

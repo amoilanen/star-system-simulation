@@ -25,8 +25,8 @@
   "hud.resume": "Resume",
   "hud.rewind": "Rewind",
   "hud.rewindStop": "Stop rewind",
-  "hud.reset": "Reset",
-  "hud.timeScale": "Time scale",
+  "hud.reset": "New system",
+  "hud.timeScale": "Speed",
   "hud.zoomIn": "Zoom in",
   "hud.zoomOut": "Zoom out",
   "hud.focus": "Focus",
@@ -114,7 +114,7 @@
   "info.blackHole.title": "Black hole",
   "info.blackHole.desc": "The collapsed core of a very massive star, so dense that not even light escapes. What you see is the glowing accretion disc around its event horizon, not the object itself.",
   "hud.paused": "PAUSED",
-  "hud.pauseHint": "Space",
+  "hud.pauseHint": "Pause or resume (Space)",
   "event.supernova": "The core collapses and the star tears itself apart in a supernova — brighter, for a moment, than the whole galaxy.",
   "event.planetaryNebula": "The star gently sheds its outer layers into a glowing planetary nebula, laying its searing core bare.",
   "remnant.brownDwarf": "brown dwarf",
@@ -133,7 +133,7 @@
   "hud.autoWarp": "Auto time-warp",
   "hud.autoWarpHint": "Each stage is compressed to a watchable length — a main sequence takes about 45 s whether it really lasts 3 million or 3 trillion years. The time-scale slider speeds that up or slows it down. Untick for one fixed rate for the whole run.",
   "hud.skip": "Skip to next stage",
-  "hud.skipHint": "N",
+  "hud.skipHint": "Fast-forward through the rest of this stage (N)",
   "hud.orbitNote": "Orbital motion is shown at an illustrative speed, not on the time scale above.",
   "hud.timeline.lasts": "{stage}: lasts {time}",
   "hud.timeline.forever": "{stage}: from now on, forever",
@@ -155,5 +155,7 @@
   "hud.pausedPast": "Paused · viewing the past",
   "hud.rewinding": "◀◀ Rewinding",
   "hud.replaying": "▶ Replay — catching up",
-  "hud.rewindHint": "R — back through the whole run; click a past phase on the timeline to jump to it"
+  "hud.rewindHint": "Rewind through the whole run (R). You can also click a phase on the timeline to jump to it.",
+  "hud.group.playback": "Playback",
+  "hud.group.view": "View"
 }

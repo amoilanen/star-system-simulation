@@ -220,6 +220,93 @@ body::after {
   font-size: 14px;
 }
 
+/* Status row: stage · bodies · elapsed, with "New system" pushed to the end. */
+.hud-status {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+}
+
+.hud-reset {
+  margin-left: auto;
+  padding: 4px 12px;
+  font-size: 13px;
+  background: transparent;
+}
+
+/* The control groups (Playback, View), side by side, wrapping when narrow. */
+.hud-controls {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.hud-group {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 12px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.hud-group__caption {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.hud-group__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+/* Transport: rewind · play/pause · skip, media-player style. */
+.hud-transport {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.hud-transport button::before {
+  content: attr(data-icon);
+  margin-right: 6px;
+  font-variant-emoji: text;
+}
+
+/* Play/pause is THE control: bigger and in the accent colour. */
+.hud-transport button.hud-play {
+  min-width: 112px;
+  padding: 8px 18px;
+  font-weight: 650;
+  background: rgba(110, 168, 255, 0.32);
+  border-color: var(--accent);
+}
+
+.hud-transport button.hud-play:hover {
+  background: rgba(110, 168, 255, 0.45);
+}
+
+.hud-transport button.hud-play.hud-button--active {
+  background: rgba(255, 176, 90, 0.36);
+  border-color: var(--accent-strong, #ffb05a);
+}
+
+.hud-group .hud-field input[type='range'] {
+  width: 140px;
+}
+
 .hud-stage {
   font-size: 15px;
   font-weight: 650;
